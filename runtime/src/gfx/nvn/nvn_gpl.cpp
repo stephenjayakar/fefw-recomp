@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -599,7 +600,8 @@ void init_once() {
     }
     g_rasters.assign(1, RasterKey{});
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const int64_t want = config_get_int("nvn", "gpl_threads", std::clamp<int64_t>(hw / 6, 1, 4));
+    // a quarter of the hardware threads, 1 to 6 (was a sixth, 1 to 4: 2 threads on an 8-core / 16-thread CPU); they run below normal priority
+    const int64_t want = config_get_int("nvn", "gpl_threads", std::clamp<int64_t>(hw / 4, 1, 6));
     for (int64_t i = 0; i < want; ++i) g_workers.emplace_back(worker_main);
     if (g_up_mode != UpMode::Off) {
         const int64_t nup = config_get_int("nvn", "gpl_upgrade_threads", 1);
@@ -628,6 +630,34 @@ void learn_raster(const RasterKey& r) {
 
 }  // namespace
 
+#if defined(_WIN32)
+namespace {
+// A CPU with cores of more than one efficiency class (Intel P and E cores): where EcoQoS moves work to the slow cores. On the others it only
+// lowers the clock of the thread, which makes the background builds slower without freeing a core for the game.
+bool cpu_is_hybrid() {
+    static const bool hybrid = [] {
+        ULONG len = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
+        if (len == 0) return false;
+        std::vector<uint8_t> buf(len);
+        if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()), len, &len, GetCurrentProcess(), 0)) return false;
+        int lo = 256, hi = -1;
+        for (ULONG off = 0; off + sizeof(DWORD) * 2 <= len;) {
+            const auto* e = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buf.data() + off);
+            if (e->Size == 0) break;
+            if (e->Type == CpuSetInformation) {
+                lo = std::min<int>(lo, e->CpuSet.EfficiencyClass);
+                hi = std::max<int>(hi, e->CpuSet.EfficiencyClass);
+            }
+            off += e->Size;
+        }
+        return hi > lo;
+    }();
+    return hybrid;
+}
+}  // namespace
+#endif
+
 void set_compile_thread_priority(bool background) {
 #if defined(_WIN32)
     static const std::string mode = config_get_str("nvn", "compile_priority", "below");
@@ -637,7 +667,17 @@ void set_compile_thread_priority(bool background) {
     SetThreadPriority(GetCurrentThread(), p);
     // Efficiency mode (EcoQoS): Windows runs the thread on the efficiency cores of a hybrid CPU and at a lower clock elsewhere, so a burst of
     // shader compiles does not take the fast cores from the game's own threads. Not for the shader preparation, which wants all the speed.
-    static const bool eco = config_get_bool("nvn", "compile_eco", true);
+    // [nvn] compile_eco: auto (default) = on only for a hybrid CPU; true / false force it.
+    static const bool eco = [] {
+        std::string v = config_get_str("nvn", "compile_eco", "auto");
+        for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (v.empty() || v == "auto") {
+            const bool h = cpu_is_hybrid();
+            NXLOG_I(kTag, "[nvn] compile_eco = auto: background pipeline builds %s (%s CPU)", h ? "in efficiency mode" : "at full speed", h ? "hybrid" : "not a hybrid");
+            return h;
+        }
+        return !(v == "false" || v == "0" || v == "off" || v == "no");
+    }();
     if (background && eco) {
         THREAD_POWER_THROTTLING_STATE st = {};
         st.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;

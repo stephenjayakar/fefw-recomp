@@ -318,7 +318,7 @@ void prewarm_init() {
         }
         g_stats.queued = boot ? g_recs.size() : 0;
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const int64_t want = config_get_int("nvn", "prewarm_threads", std::clamp<int64_t>(hw / 6, 1, 4));
+        const int64_t want = config_get_int("nvn", "prewarm_threads", std::clamp<int64_t>(hw / 4, 1, 6));   // was hw / 6, 1 to 4 (2 on 16 threads)
         for (int64_t i = 0; i < want; ++i) g_workers.emplace_back(worker_main);
         g_saver = std::thread(saver_main);
         NXLOG_I(kTag, "prewarm: %zu recorded pipelines from %s, %zu worker threads; %s", g_recs.size(), g_path.c_str(), g_workers.size(),
