@@ -12,10 +12,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include <nxrt/config.h>
 #include <nxrt/diag.h>
+#include <nxrt/gauge.h>
 #include <nxrt/log.h>
 
 #include "astc2bc7.h"
@@ -117,6 +120,39 @@ uint64_t get64(const uint8_t* p) { return static_cast<uint64_t>(get32(p)) | (sta
 
 std::string cache_dir() { return config_get_str("nvn", "bc7_cache", "bc7_cache"); }
 
+// Formats of the cache entries this process has looked at or written (any thread). The render thread asks it instead of the disk with
+// [nvn] tex_async = standin: only an entry that is not BC7 changes the image format, and those are rare (setup-tool entries), so while none
+// has been seen the answer is "BC7" without hashing the storage or opening a file.
+std::mutex g_learned_mu;
+std::unordered_map<uint64_t, VkFormat> g_learned;   // key -> format of its valid entry
+std::atomic<uint32_t> g_learned_non_bc7{0};
+
+// The hitch line (nxrt/gauge.h): BC7 cache files read on the render thread during a slow frame, and the milliseconds that took. Each one is a
+// file open and read in the middle of a frame (on a hard disk 30 ms to over a second); [nvn] tex_async = standin should keep both at 0.
+std::atomic<uint64_t> g_rt_cache_reads{0}, g_rt_cache_read_us{0};
+const bool g_rt_cache_hitch = (nxrt::hitch_add_counter("bc7_cache_reads_render", []() -> uint64_t { return g_rt_cache_reads.load(std::memory_order_relaxed); }),
+                               nxrt::hitch_add_counter("bc7_cache_read_ms_render", []() -> uint64_t { return g_rt_cache_read_us.load(std::memory_order_relaxed) / 1000; }), true);
+
+void learn_entry_format(uint64_t key, VkFormat f) {
+    if (f == VK_FORMAT_UNDEFINED) return;
+    std::lock_guard<std::mutex> lk(g_learned_mu);
+    auto [it, fresh] = g_learned.try_emplace(key, f);
+    const bool bc7 = f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+    if (!fresh) {
+        if (it->second == f) return;
+        const bool was_bc7 = it->second == VK_FORMAT_BC7_UNORM_BLOCK || it->second == VK_FORMAT_BC7_SRGB_BLOCK;
+        if (!was_bc7) g_learned_non_bc7.fetch_sub(1, std::memory_order_relaxed);
+        it->second = f;
+    }
+    if (!bc7) g_learned_non_bc7.fetch_add(1, std::memory_order_relaxed);
+}
+
+VkFormat learned_entry_format(uint64_t key) {
+    std::lock_guard<std::mutex> lk(g_learned_mu);
+    auto it = g_learned.find(key);
+    return it == g_learned.end() ? VK_FORMAT_UNDEFINED : it->second;
+}
+
 int bc7_quality() {
     const int def = slow_encoder() ? 1 : 3;
     const int64_t q = config_get_int("nvn", "bc7_quality", def);
@@ -185,6 +221,7 @@ bool cache_write(const std::string& path, uint64_t key, const PreparedTexture& o
         fs::remove(tmp, ignore);
         return false;
     }
+    learn_entry_format(key, out.format);
     return true;
 }
 
@@ -211,6 +248,8 @@ bool cache_read(const std::string& path, uint64_t key, PreparedTexture& out) {
     std::vector<uint8_t> head(head_bytes);
     if (!f.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head_bytes))) return false;
     const uint8_t* p = head.data();
+    if (std::memcmp(p, kCacheMagic, 4) == 0 && get32(p + 4) == kCacheVersion && get64(p + 8) == key)
+        learn_entry_format(key, static_cast<VkFormat>(get32(p + 16)));   // also when it is not the format wanted here: the next image is made in it
     bool ok = std::memcmp(p, kCacheMagic, 4) == 0 && get32(p + 4) == kCacheVersion && get64(p + 8) == key &&
               get32(p + 16) == static_cast<uint32_t>(out.format) && get32(p + 20) == out.level.size() &&
               get32(p + 24) == out.layers;
@@ -417,7 +456,9 @@ VkFormat cache_peek_format(const std::string& path, uint64_t key) {
     uint8_t head[kCacheHeadBytes];
     if (!f || !f.read(reinterpret_cast<char*>(head), sizeof head)) return VK_FORMAT_UNDEFINED;
     if (std::memcmp(head, kCacheMagic, 4) != 0 || get32(head + 4) != kCacheVersion || get64(head + 8) != key) return VK_FORMAT_UNDEFINED;
-    return static_cast<VkFormat>(get32(head + 16));
+    const VkFormat ef = static_cast<VkFormat>(get32(head + 16));
+    learn_entry_format(key, ef);
+    return ef;
 }
 
 }  // namespace
@@ -529,8 +570,10 @@ int entry_qualities(AstcQuality am, int q[2]) {
 }
 }  // namespace
 
-VkFormat cache_entry_format(const Texture& t) {
+VkFormat cache_entry_format(const Texture& t, bool no_disk) {
     if (!t.mem) return VK_FORMAT_UNDEFINED;
+    // no_disk: what this process learned only. No non-BC7 entry seen yet (the usual case): BC7, without hashing the storage.
+    if (no_disk && astc_quality() != AstcQuality::Uncompressed && g_learned_non_bc7.load(std::memory_order_relaxed) == 0) return VK_FORMAT_UNDEFINED;
     const TexLayout L = compute_texture_layout(t.b);
     if (!L.valid || !L.fmt || !L.fmt->astc || t.b.samples > 1 || t.storage_size < L.storage_size) return VK_FORMAT_UNDEFINED;
     const VkFormat rgba = L.fmt->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
@@ -543,7 +586,7 @@ VkFormat cache_entry_format(const Texture& t) {
     const int n = entry_qualities(am, q);
     for (int i = 0; i < n; ++i) {
         const uint64_t key = cache_key_of(t.storage_size, t.mem, L, geo, *L.fmt, q[i]);
-        const VkFormat f = cache_peek_format(bc7_cache_path(t, key), key);
+        const VkFormat f = no_disk ? learned_entry_format(key) : cache_peek_format(bc7_cache_path(t, key), key);
         if (f == VK_FORMAT_UNDEFINED) continue;
         return (f == rgba || (f == VK_FORMAT_BC5_UNORM_BLOCK && !L.fmt->srgb)) ? f : VK_FORMAT_UNDEFINED;   // the first valid entry decides
     }
@@ -736,7 +779,14 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     const int quality = bc7 ? bc7_quality() : 0;
     (void)quality;
     if (entry_applies && !edit_make) {
-        if (cache_read(cache_file, key, out)) {
+        const bool rt = nxrt::hitch_on_render_thread();
+        const auto tr0 = std::chrono::steady_clock::now();
+        const bool hit = cache_read(cache_file, key, out);
+        if (rt) {
+            g_rt_cache_reads.fetch_add(1, std::memory_order_relaxed);
+            g_rt_cache_read_us.fetch_add(static_cast<uint64_t>(ms_since(tr0) * 1000.0), std::memory_order_relaxed);
+        }
+        if (hit) {
             out.from_cache = true;
             NXLOG_I(kTag, "texture %u: %s data from cache %s", t.id, mode == Mode::Bc5 ? "BC5" : mode == Mode::Rgba8 ? "RGBA8" : "BC7", cache_file.c_str());
             if (upgrade_possible && !edit_make) schedule_upgrade(t, src_mem, upgrade_key, upgrade_quality, cache_dir());   // a fast entry served now; the high one is made behind

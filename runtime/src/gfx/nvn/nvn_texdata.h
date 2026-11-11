@@ -65,7 +65,9 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
 
 // The format the disk cache entry of an ASTC texture holds when that is not BC7: R8G8B8A8 (UNORM or SRGB as the texture) or BC5_UNORM (a
 // two-channel normal map). VK_FORMAT_UNDEFINED: no entry, or a BC7 entry. The GPU layer makes the image in this format (docs/S4f.md).
-VkFormat cache_entry_format(const Texture& t);
+// no_disk ([nvn] tex_async = standin, render thread): no file is opened; only the entries this process has already read, peeked or written count
+// (an unseen RGBA8 / BC5 entry then gets a BC7 image, and its texture a BC7 transcode in the background: a little less exact, never a stall).
+VkFormat cache_entry_format(const Texture& t, bool no_disk = false);
 // Texture content override (nxrt/tex_override.h). apply: when a hook is set and it answers for the texture, replaces bc7 (the tight
 // linear BC7 blocks of the w x h texture) with the encoded answer.
 bool texture_override_active();
