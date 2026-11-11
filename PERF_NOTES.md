@@ -126,8 +126,18 @@ copied but are rebuilt anyway, because 0.1.7 re-translates the shaders.
 | step | estimate |
 |---|---|
 | Set up for 0.1.7: lift and compile the game (`fefw.exe`) plus shader re-translation | 30-60+ min of full CPU (the user is running it now) |
-| `fefw_rt.dll` build from a cold folder (about 240 C++ files plus astcenc, bc7e, dav1d), `-Jobs 6` | about 10-15 min; incremental rebuilds after that take 1-2 min |
+| `fefw_rt.dll` build from a cold folder (566 objects with SDL3, zstd, astcenc, bc7e and dav1d), 6 jobs | measured 76 s (16:35-16:36, 11 Nov); configure about 40 s; light enough not to need coordination |
 | in-game tests below | about 20 min |
+
+### Build status (11 Nov)
+
+- `game-build/fefw/build/rtdll/fefw_rt.dll` built from `perf-stutter` with clang-cl 23.1.2 and VS 2022, `-DFEFW_RT_DLL=ON`, C++ bc7e (the
+  same encoder as the release).
+- Its export table is identical to the v0.1.7 release `fefw_rt.dll`: 16 exports, compared with `llvm-readobj --coff-exports`.
+- `nxrt_gfx_tests gfx_nvn_texdata`: 19 of 19 pass, including the new `standin_first_skips_the_cache_entry`.
+- `gfx_nvn_texgpu`: every functional check passes, including `texprep_background_upload`. The only failing check is
+  `validation_enabled()`, because the Vulkan validation layer is not installed on this machine.
+- The game itself has not been run.
 
 ## 4. Test plan
 
