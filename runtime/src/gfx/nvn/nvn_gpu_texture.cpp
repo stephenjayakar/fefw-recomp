@@ -1864,6 +1864,18 @@ bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why) {
 }
 }  // namespace
 
+// The caller copies or clears the image, so it needs the real content now: a stand-in would end up in the copy ([nvn] tex_async).
+void tex_ensure_exact(Texture* t, Frame& f) {
+    const bool was = texprep::set_exact_thread(true);
+    // the image holds a stand-in of the current content: the real data goes in first (not over what the GPU rendered into it since)
+    if (TexGpu* g = tex_or_null(t)) {
+        if (g->uploaded && !g->gpu_written && t->prep_prov.load(std::memory_order_acquire) == (t->prep_gen.load(std::memory_order_acquire) | 0x80000000u))
+            t->cpu_dirty.store(true);
+    }
+    tex_ensure_current(t, f);
+    texprep::set_exact_thread(was);
+}
+
 void tex_ensure_current(Texture* t, Frame& f) {
     NXFT_MIN("tex.ensure", 30000);
     TexGpu* g = tex_or_null(t);
@@ -1987,6 +1999,10 @@ void tex_ensure_current(Texture* t, Frame& f) {
         if (arm_later && !have_hash) have_hash = texprep::hash_storage(*t, content_hash);   // before the read the upload uses
         // ASTC without a cache entry, needed now: a quick stand-in (preset 0) instead of the full transcode; the background job makes the real data
         caps.provisional = texprep::wants_provisional(t);
+        // [nvn] tex_async = standin: no cache read or transcode here, also when an entry exists (on a hard disk each read stalled the frame for
+        // 30 ms to over a second, thousands of them on a first visit). Not for a copy or a clear, which would keep the stand-in's pixels.
+        // A sparse texture written tile by tile is only given one at its first upload: later uploads follow its writes and would flicker.
+        caps.standin_first = caps.provisional && !texprep::exact_thread() && (!t->vpool || !g->uploaded) && texprep::async_standin();
         ok = prepare_texture(*t, caps, prep);
     }
     be::tx_mark("tx.use", t);

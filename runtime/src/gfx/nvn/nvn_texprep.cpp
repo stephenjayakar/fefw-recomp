@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +84,29 @@ const bool g_hitch_registered = (nxrt::hitch_add_counter("texprep_staged_kb", []
 
 State& S() { return *g_state; }
 
+// [nvn] tex_async (nvn_texprep.h): standin (default) or off. Read once.
+bool async_standin_cfg() {
+    static const bool on = [] {
+        std::string v = config_get_str("nvn", "tex_async", "standin");
+        for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const bool off = v == "off" || v == "0" || v == "false" || v == "sync";
+        NXLOG_I(kTag, "[nvn] tex_async = %s: %s", off ? "off" : "standin",
+                off ? "a texture needed before its background job is done is prepared on the render thread (cache read or transcode)"
+                    : "a texture needed before its background job is done gets a quick stand-in; the render thread does not read the BC7 cache");
+        return !off;
+    }();
+    return on;
+}
+
+thread_local bool t_exact = false;   // set_exact_thread: the caller copies or clears the texture (no stand-in)
+
+// How long the render thread waits for a job that is already running on the texture it needs. [nvn] tex_prep_wait_ms; default 5000 (the
+// old behaviour) with tex_async = off, 2 ms with stand-ins (a running job is mostly a disk read: on a hard disk that is 30 ms to over a second).
+std::chrono::steady_clock::duration wait_cap() {
+    static const int64_t ms = config_get_int("nvn", "tex_prep_wait_ms", async_standin_cfg() ? 2 : 5000);
+    return std::chrono::milliseconds(std::clamp<int64_t>(ms, 0, 5000));
+}
+
 bool prepare_guarded(const Texture& t, const TexCaps& caps, PreparedTexture& out, bool& crashed) {
     __try {
         return prepare_texture(t, caps, out);
@@ -121,9 +146,10 @@ void log_summary_locked(bool force) {
     if (!force && n - s.last_log_ns < 10ull * 1000000000ull) return;
     if (s.st.scheduled == 0) return;
     s.last_log_ns = n;
-    NXLOG_I(kTag, "scheduled %llu, used %llu (waited for %llu), stale %llu, taken back by the render thread %llu, no job %llu, failed %llu, crashed %llu, over budget %llu, evicted %llu, held %.1f MB",
+    NXLOG_I(kTag, "scheduled %llu, used %llu (waited for %llu), stale %llu, taken back by the render thread %llu, stand-in while queued or running %llu, no job %llu, failed %llu, crashed %llu, over budget %llu, evicted %llu, held %.1f MB",
             static_cast<unsigned long long>(s.st.scheduled), static_cast<unsigned long long>(s.st.hits), static_cast<unsigned long long>(s.st.waited_hits),
-            static_cast<unsigned long long>(s.st.stale), static_cast<unsigned long long>(s.st.stolen), static_cast<unsigned long long>(s.st.none),
+            static_cast<unsigned long long>(s.st.stale), static_cast<unsigned long long>(s.st.stolen), static_cast<unsigned long long>(s.st.deferred),
+            static_cast<unsigned long long>(s.st.none),
             static_cast<unsigned long long>(s.st.failed), static_cast<unsigned long long>(s.st.crashes), static_cast<unsigned long long>(s.st.skipped_budget),
             static_cast<unsigned long long>(s.st.evicted), static_cast<double>(s.held_bytes) / 1048576.0);
     if (s.verify)
@@ -136,7 +162,9 @@ void leave_waiting_locked(Texture* t) {
 }
 
 // Caller holds mu. Queues a job for t unless one is waiting; a running job is asked to run again.
-void schedule_locked(Texture* t) {
+// front: the texture is on screen with a stand-in now: its job goes before the textures only registered ahead of use.
+// force: queued even over the budget (a stand-in waits for this job: dropping it left the stand-in in place until the next write).
+void schedule_locked(Texture* t, bool front = false, bool force = false) {
     State& s = S();
     Entry& e = s.map[t];
     if (e.st == Entry::Queued) return;                // the job reads the generation when it starts
@@ -157,7 +185,7 @@ void schedule_locked(Texture* t) {
         s.map.erase(victim);
         s.st.evicted++;
     }
-    if (s.held_bytes + est > s.budget) {
+    if (s.held_bytes + est > s.budget && !force) {
         s.st.skipped_budget++;
         e.keep = Ref<Texture>();
         s.map.erase(t);
@@ -168,7 +196,8 @@ void schedule_locked(Texture* t) {
     e.seq = ++s.seq;
     e.held = est;
     s.held_bytes += est;
-    s.q.push_back({e.keep, e.seq});
+    if (front) s.q.push_front({e.keep, e.seq});
+    else s.q.push_back({e.keep, e.seq});
     s.st.scheduled++;
     s.cv_work.notify_one();
 }
@@ -311,8 +340,10 @@ void worker_main() {
             Ref<Texture> keep = std::move(e2.keep);
             s.map.erase(t);
             if (again && !t->destroyed.load()) {
+                // a stand-in of the current content is on screen: its job goes first and is never dropped for the budget
+                const bool standin = t->prep_prov.load(std::memory_order_acquire) == (t->prep_gen.load(std::memory_order_acquire) | 0x80000000u);
                 if (t->vpool) debounce_locked(t);
-                else schedule_locked(t);
+                else schedule_locked(t, standin, standin);
             }
             lk.unlock();
             keep = Ref<Texture>();     // the texture may be destroyed here; ~Texture takes no lock of ours
@@ -410,6 +441,16 @@ bool is_entry_format(VkFormat f) {
 
 }  // namespace
 
+bool async_standin() { return enabled() && async_standin_cfg(); }
+
+bool set_exact_thread(bool on) {
+    const bool was = t_exact;
+    t_exact = on;
+    return was;
+}
+
+bool exact_thread() { return t_exact; }
+
 bool enabled() {
     int v = g_enabled.load(std::memory_order_acquire);
     if (v < 0) {
@@ -457,7 +498,7 @@ bool peek_entry_format(Texture* t, VkFormat& entry) {
     if (!enabled() || !t) return false;
     State& s = S();
     std::unique_lock<std::mutex> lk(s.mu);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + wait_cap();
     for (;;) {
         auto it = s.map.find(t);
         if (it == s.map.end()) return false;
@@ -477,9 +518,12 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
     if (!enabled() || !t) return false;
     State& s = S();
     const uint64_t t_enter = now_ns();
+    // tex_async = standin and t can get a stand-in for this content: a job not done yet is neither waited for long nor done here; the caller
+    // uploads the stand-in and the job's result replaces it (the job moves to the front of the queue). wants_provisional takes no lock of ours.
+    const bool defer = async_standin_cfg() && !t_exact && wants_provisional(t);
     std::unique_lock<std::mutex> lk(s.mu);
     bool waited = false;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + (defer ? wait_cap() : std::chrono::steady_clock::duration(std::chrono::seconds(5)));
     for (;;) {
         auto it = s.map.find(t);
         if (it == s.map.end()) {
@@ -490,6 +534,19 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
         if (e.st == Entry::Idle) {
             s.map.erase(it);
             s.st.none++;
+            return false;
+        }
+        if (defer && (e.st == Entry::Waiting || e.st == Entry::Queued)) {   // not started: to the front of the queue, a stand-in meanwhile
+            if (e.st == Entry::Waiting) {
+                leave_waiting_locked(t);
+                e.st = Entry::Idle;
+                schedule_locked(t, true, true);
+            } else {
+                e.seq = ++s.seq;                          // the copy further back in the queue is skipped when a worker pops it
+                s.q.push_front({e.keep, e.seq});
+                s.cv_work.notify_one();
+            }
+            s.st.deferred++;
             return false;
         }
         if (e.st == Entry::Waiting || e.st == Entry::Queued) {   // not started: cheaper to do it here than to wait for a free worker or for the writes to stop
@@ -516,7 +573,10 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
             const uint64_t tw = nxrt::hitch_ticks();
             const bool timed_out = s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout;
             if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tw);
-            if (timed_out) return false;
+            if (timed_out) {
+                if (defer) s.st.deferred++;
+                return false;
+            }
             continue;
         }
         // Done: usable when nothing was written since (generation) and the storage still holds the bytes the job read (content hash)
@@ -602,7 +662,8 @@ void provisional_uploaded(Texture* t) {
         if (e.st == Entry::Running && e.job_gen == gen) return;                             // the worker marks the texture when it is done
         if (e.st == Entry::Queued || e.st == Entry::Waiting) return;
     }
-    if (!t->destroyed.load()) schedule_locked(t);
+    // the stand-in stays until this job is done: it goes first and is not dropped for the budget
+    if (!t->destroyed.load()) schedule_locked(t, true, true);
 }
 
 void final_uploaded(Texture* t) {

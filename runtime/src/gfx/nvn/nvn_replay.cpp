@@ -1081,7 +1081,7 @@ void feedback_prepare(const ProgLayout& pl) {
         Texture* c = feedback_clone(r.tex);
         if (!c) continue;
         end_pass();
-        tex_ensure_current(r.tex, *F);                                    // storage the game wrote since the image was made reaches the copy too
+        tex_ensure_exact(r.tex, *F);                                      // storage the game wrote since the image was made reaches the copy too
         tex_transition(r.tex, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);   // the next pass moves it back to the attachment layout and loads it
         tex_transition(c, *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         std::vector<VkImageCopy> regions;
@@ -1169,7 +1169,7 @@ void vol3d_prepare(const ProgLayout& pl) {
         if (e.copied != serial || r.tex->cpu_dirty.load()) {
             out_texture_read(r.tex);
             end_pass();
-            tex_ensure_current(r.tex, *F);
+            tex_ensure_exact(r.tex, *F);
             tex_transition(r.tex, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             tex_transition(c.get(), *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             std::vector<VkImageCopy> regions;
@@ -3493,7 +3493,7 @@ void do_clear_texture(const P_ClearTexture& p) {
     if (!t || !tex_gpu(t)) return;
     end_pass();
     SubRes s = sub_of(p.view, p.has_view);
-    tex_ensure_current(t, *F);
+    tex_ensure_exact(t, *F);
     tex_transition(t, *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     tex_mark_gpu_written(t);
     if (p.has_region) {
@@ -3565,14 +3565,14 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
     BufRef br = to_texture ? held_or_pool(p.address, buf_bytes, kOutBufferRead, true) : resolve_buffer(p.address, buf_bytes);
     c.bufferOffset = br.offset;
     if (to_texture) {
-        tex_ensure_current(t, *F);
+        tex_ensure_exact(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         tev(t, "copy_buffer_to_texture", p.address, p.has_view ? 1 : 0);
         for (uint32_t i = 0; i < c.imageSubresource.layerCount; ++i) tex_sparse_before_copy(t, c.imageSubresource.baseArrayLayer + i, s.level);
         tex_mark_gpu_written(t);
         vkCmdCopyBufferToImage(F->cb, br.buffer, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     } else {
-        tex_ensure_current(t, *F);
+        tex_ensure_exact(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vkCmdCopyImageToBuffer(F->cb, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, br.buffer, 1, &c);
         gpu_wrote(p.address, stride * ((rh + bh - 1) / bh) * rd, kWriteImageCopy);
@@ -3611,8 +3611,8 @@ void do_copy_texture_texture(const P_CopyTexTex& p) {
     ss.level -= tex_level_drop(s);   // image levels from here on
     ds.level -= tex_level_drop(d);
     if (sr.w <= 0 || sr.h <= 0 || dr.w <= 0 || dr.h <= 0) return;
-    tex_ensure_current(s, *F);
-    if (s != d) tex_ensure_current(d, *F);
+    tex_ensure_exact(s, *F);
+    if (s != d) tex_ensure_exact(d, *F);
     const bool same = s == d;
     tex_transition(s, *F, same ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if (!same) tex_transition(d, *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
