@@ -591,11 +591,15 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     bool upgrade_possible = false;
     uint64_t upgrade_key = 0;
     int upgrade_quality = 0;
+    // [nvn] tex_async = standin: a BC7 image whose data is not ready gets a stand-in at once. No cache key, no file lookup, no read: the disk
+    // is only touched by the background job. Host pixel edits keep the synchronous path (their data never comes from the cache).
+    const bool standin_now = caps.standin_first && caps.provisional && fmt.astc && !caps.astc && caps.bc7_transcode && !uncompressed &&
+                             caps.image_format == bc7_format && !tex_edit_active();
     if (fmt.astc) {
         if (caps.astc) mode = Mode::Passthrough;
         else if (caps.bc7_transcode && !uncompressed) mode = Mode::Bc7;
         else mode = Mode::Rgba8;
-        if (!caps.astc && !uncompressed && !cache_dir().empty()) {
+        if (!caps.astc && !uncompressed && !cache_dir().empty() && !standin_now) {
             // A cache entry may hold the texture as BC7 (the default), as RGBA8 (a texture BC7 cannot reproduce well) or as BC5 (a two-channel
             // normal map: blue 0 and alpha 1 on sampling). The image the data goes into is made in the entry's format (caps.image_format).
             const VkFormat bc5_format = VK_FORMAT_BC5_UNORM_BLOCK;
@@ -749,15 +753,39 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     if (!bc7 || (entry_format != VK_FORMAT_UNDEFINED && entry_format != out.format)) cache_file.clear();
     if (edit_make) cache_file.clear();   // edited data stays out of the shared cache
     // needed this frame and no entry: the quickest preset now (not cached, no upgrade); the background job makes the entry and the real data
-    const bool provisional = caps.provisional && bc7 && !edit_make && quality > 0;
+    const bool provisional = caps.provisional && bc7 && !edit_make && (quality > 0 || standin_now);
     if (provisional) {
         cache_file.clear();
         out.provisional = true;
     }
 
+    // A stand-in only has to look right for the half second until the background job lands: the big levels are filled with
+    // solid BC7 blocks taken from a small level (decoded once per layer) instead of being encoded, so it costs about 1 ms, not 50-150.
+    size_t solid_src = geo.size();
+    if (provisional && geo[0].d == 1 && geo.size() > 1) {
+        // [nvn] standin_full_px: levels up to this size are encoded (preset 0), the bigger ones are solid blocks taken from the first of them. 256 cost
+        // 5-10 s of render thread per Dagsion load (580 stand-ins at 10-40 ms, mostly the 256 level's encode); 64 costs 0.5 s.
+        static const uint32_t solid_max = static_cast<uint32_t>(std::max<int64_t>(16, config_get_int("nvn", "standin_full_px", 64)));
+        for (size_t i = 0; i < geo.size(); ++i)
+            if (std::max(geo[i].w, geo[i].h) <= solid_max) { solid_src = i; break; }
+        if (solid_src == 0 || solid_src >= geo.size()) solid_src = geo.size();
+    }
+
     // ---- the source image: tight linear buffer --------------------------------------------------------------------------
+    // A stand-in reads only the small levels it encodes (solid_src and after): untiling the big ones, which it never looks at, was most of its cost.
     std::vector<uint8_t> lin;
-    if (!make_linear(L, geo, fmt, src_mem, lin)) return fail("untile failed");
+    if (solid_src < geo.size() && L.block_linear) {
+        const LevelGeom& last = geo.back();
+        lin.assign(static_cast<size_t>(last.lin_off + last.slice * L.layers), 0);
+        for (size_t i = solid_src; i < L.layout.levels.size(); ++i) {
+            const tegra::LevelLayout& lv = L.layout.levels[i];
+            for (uint32_t layer = 0; layer < L.layers; ++layer)
+                tegra::untile_level(L.desc, lv, src_mem + layer * L.layout.tiled_layer_stride + lv.tiled_offset,
+                                    lin.data() + lv.linear_offset + layer * lv.linear_slice_size);
+        }
+    } else if (!make_linear(L, geo, fmt, src_mem, lin)) {
+        return fail("untile failed");
+    }
 
     if (mode == Mode::Passthrough) {
         // button prompt icons and the like: a host hook may replace the pixels of a small single-level BC7 sRGB texture
@@ -819,17 +847,6 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
         NXLOG_I(kTag, "texture %u: edited by the host (id %016llx), %s %ux%u, %u levels: %.1f ms", t.id, static_cast<unsigned long long>(edit.id),
                 bc7 ? "BC7" : "RGBA8", geo[0].w, geo[0].h, L.levels, ms);
         return true;
-    }
-    // A stand-in only has to look right for the half second until the background job lands: the big levels are filled with
-    // solid BC7 blocks taken from a small level (decoded once per layer) instead of being encoded, so it costs about 1 ms, not 50-150.
-    size_t solid_src = geo.size();
-    if (provisional && geo[0].d == 1 && geo.size() > 1) {
-        // [nvn] standin_full_px: levels up to this size are encoded (preset 0), the bigger ones are solid blocks taken from the first of them. 256 cost
-        // 5-10 s of render thread per Dagsion load (580 stand-ins at 10-40 ms, mostly the 256 level's encode); 64 costs 0.5 s.
-        static const uint32_t solid_max = static_cast<uint32_t>(std::max<int64_t>(16, config_get_int("nvn", "standin_full_px", 64)));
-        for (size_t i = 0; i < geo.size(); ++i)
-            if (std::max(geo[i].w, geo[i].h) <= solid_max) { solid_src = i; break; }
-        if (solid_src == 0 || solid_src >= geo.size()) solid_src = geo.size();
     }
     std::vector<uint8_t> solid_rgba;
     uint32_t solid_layer = ~0u;
