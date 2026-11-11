@@ -411,11 +411,12 @@ void init_once() {
 
 // Block-compressed textures only: they are the game's assets (ASTC, BCn). Uncompressed ones are mostly render targets and small UI data whose
 // storage is not final when the texture is initialized.
-bool eligible(const Texture* t) {
+// any_size: also under [nvn] tex_prep_min_kb (stand-ins of tex_async: a small texture's cache read is still a disk seek on the render thread).
+bool eligible(const Texture* t, bool any_size = false) {
     if (!t || t->destroyed.load() || !t->fmt || t->is_display || (!t->mem && !t->vpool)) return false;
     if (!(t->fmt->astc || t->fmt->bc)) return false;
     if (t->b.samples > 1 || t->fmt->aspect != kAspectColor) return false;
-    if (t->storage_size < S().min_bytes || t->storage_size > (256ull << 20)) return false;
+    if ((!any_size && t->storage_size < S().min_bytes) || t->storage_size > (256ull << 20)) return false;
     return true;
 }
 
@@ -643,7 +644,7 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged, uint64_t* src_h
 bool hash_storage(const Texture& t, uint64_t& h) { return hash_guarded(t, h); }
 
 bool wants_provisional(Texture* t) {
-    if (!t || !enabled() || !gpu::active() || !eligible(t) || !t->fmt->astc) return false;
+    if (!t || !enabled() || !gpu::active() || !eligible(t, async_standin_cfg()) || !t->fmt->astc) return false;
     const uint32_t mark = t->prep_gen.load(std::memory_order_acquire) | 0x80000000u;
     return t->prep_prov.load(std::memory_order_acquire) != mark;
 }
