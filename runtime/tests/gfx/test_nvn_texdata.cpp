@@ -554,6 +554,64 @@ NXTEST(bc7_disk_cache_hit_and_truncated_file) {
     no_cache();
 }
 
+// [nvn] tex_async = standin (TexCaps::standin_first): with a valid cache entry on disk the render thread still gets the quick stand-in, never the
+// entry, and the stand-in is the same data as the one made when there is no entry (it untiles only the levels it encodes).
+NXTEST(standin_first_skips_the_cache_entry) {
+    const fs::path dir = fs::temp_directory_path() /
+                         ("nxrt_texdata_si_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    set_env("NXRT_NVN_BC7_CACHE", dir.string().c_str());
+
+    const TextureBuilderInfo info = make_info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 4, NVN_FORMAT_RGBA_ASTC_5x4_SRGB);
+    Built bt;
+    CHECK_MSG(begin_block_linear(bt, info), "layout");
+    std::vector<uint16_t> scratch;
+    for (uint32_t i = 0; i < 4; ++i) fill_astc_void_level(bt, i, 0, scratch, 700 + i);
+    finish_block_linear(bt, info);
+
+    PreparedTexture full;   // writes the entry
+    CHECK_MSG(prepare_texture(*bt.tex, TexCaps(), full), full.error);
+    CHECK_EQ(cache_files(dir).size(), 1u);
+    PreparedTexture hit;
+    CHECK_MSG(prepare_texture(*bt.tex, TexCaps(), hit), hit.error);
+    CHECK(hit.from_cache);
+
+    TexCaps si;
+    si.provisional = true;
+    si.standin_first = true;
+    si.image_format = VK_FORMAT_BC7_SRGB_BLOCK;
+    PreparedTexture a;
+    CHECK_MSG(prepare_texture(*bt.tex, si, a), a.error);
+    CHECK(a.provisional);
+    CHECK(!a.from_cache);
+    CHECK_EQ(a.format, VK_FORMAT_BC7_SRGB_BLOCK);
+    CHECK_EQ(a.data.size(), full.data.size());
+    CHECK_EQ(a.level.size(), full.level.size());
+
+    // an image that is not BC7 (an RGBA8 entry made it) is not given a BC7 stand-in
+    TexCaps rgba = si;
+    rgba.image_format = VK_FORMAT_R8G8B8A8_SRGB;
+    PreparedTexture c;
+    CHECK_MSG(prepare_texture(*bt.tex, rgba, c), c.error);
+    CHECK(!c.provisional);
+    CHECK_EQ(c.format, VK_FORMAT_R8G8B8A8_SRGB);
+
+    // the stand-in of a texture without an entry (the old path, whole untile) is byte for byte the same
+    set_env("NXRT_NVN_BC7_CACHE", "");
+    config_set("nvn", "bc7_cache", "");
+    TexCaps prov;
+    prov.provisional = true;
+    prov.image_format = VK_FORMAT_BC7_SRGB_BLOCK;
+    PreparedTexture b;
+    CHECK_MSG(prepare_texture(*bt.tex, prov, b), b.error);
+    CHECK(b.provisional);
+    CHECK(a.data == b.data);
+
+    fs::remove_all(dir, ec);
+    no_cache();
+}
+
 // ---- disk cache entries of other formats ------------------------------------------------------------------------------------
 // An entry the setup tool makes has the layout of the runtime's BC7 entry, with another VkFormat (nvn_texdata.cpp). These tests
 // replace the BC7 entry of a texture with a hand-made one and check which entries prepare_texture uses.
