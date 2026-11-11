@@ -391,9 +391,11 @@ void init_once() {
         }
         s.budget = static_cast<uint64_t>(std::max<int64_t>(16, config_get_int("nvn", "tex_prep_mb", 512))) << 20;
         s.min_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_min_kb", 8))) << 10;
-        // 256 KB (was 1024): with stand-ins ([nvn] tex_async) a texture whose job has not run is drawn blurry for a moment; starting the jobs of the
-        // middle-sized textures at registration (long before their first draw) leaves fewer of those. Over the budget a job is simply not started.
-        s.early_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_early_kb", 256))) << 10;
+        // 64 KB (was 1024): with stand-ins ([nvn] tex_async) a texture whose job has not run is drawn blurry for a moment; starting the jobs of the
+        // middle-sized textures at registration (long before their first draw) leaves fewer of those. In a 1.7 h session 70% of the BC7 cache files
+        // the render thread read itself were 256 KB to 1 MB (ASTC 8x8 storage of 64 to 256 KB): under the old threshold. Over the budget a job is
+        // simply not started.
+        s.early_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_early_kb", 64))) << 10;
         s.stage_bytes = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "tex_prep_stage_kb", 1024))) << 10;
         s.verify = config_get_bool("nvn", "tex_prep_verify", false);
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
