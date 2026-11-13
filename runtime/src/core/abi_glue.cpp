@@ -32,7 +32,8 @@ void call_indirect(Ctx* c, uint64_t addr) { nxrt::dispatch_call(c, addr); }
 // module. The registry (nxmodule.cpp) names the import and finds its target: a function another lifted module defines, else the HLE
 // handler or logging stub of that name.
 void host_import(Ctx* c, uint32_t import_id) {
-    const uint64_t target = nxrt::import_resolve(import_id);
+    const char* name = nullptr;
+    const uint64_t target = nxrt::import_resolve_named(import_id, &name);
     if (!target) {
         char what[96];
         snprintf(what, sizeof what, "host_import with an unknown import id (module %u, symbol %u)", NX_IMPORT_MODULE(import_id), NX_IMPORT_SYM(import_id));
@@ -41,7 +42,7 @@ void host_import(Ctx* c, uint32_t import_id) {
     nxrt::detail::count_import();
     const char* saved_name = c->in_import;
     const uint64_t saved_from = c->import_from;
-    c->in_import = nxrt::import_name(import_id);
+    c->in_import = name;
     c->import_from = c->x[30] - 4;
     nxrt::dispatch_call(c, target);
     c->in_import = saved_name;

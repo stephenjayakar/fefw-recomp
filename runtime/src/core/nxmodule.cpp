@@ -242,6 +242,22 @@ const char* import_name(uint32_t import_id) {
     return nx && sym < static_cast<uint32_t>(nx->nsyms) && nx->syms[sym].name ? nx->syms[sym].name : "";
 }
 
+uint64_t import_resolve_named(uint32_t import_id, const char** name_out) {
+    Entry* e = by_index(NX_IMPORT_MODULE(import_id));
+    const uint32_t sym = NX_IMPORT_SYM(import_id);
+    if (e && sym < e->ncache) {
+        const char* name = e->nx->syms[sym].name;
+        if (name) {
+            if (const uint64_t hit = e->cache[sym].load(std::memory_order_acquire)) {
+                *name_out = name;
+                return hit;
+            }
+        }
+    }
+    *name_out = import_name(import_id);
+    return import_resolve(import_id);
+}
+
 uint64_t import_resolve(uint32_t import_id) {
     Entry* e = by_index(NX_IMPORT_MODULE(import_id));
     uint32_t sym = NX_IMPORT_SYM(import_id);

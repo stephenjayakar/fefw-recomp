@@ -60,6 +60,8 @@ const char* import_name(uint32_t import_id);
 // Guest address host_import(c, import_id) dispatches to: a lifted function of another module or an HLE thunk. 0 for an unknown id.
 // The answer is cached per (module, symbol); registering a module or overriding a symbol invalidates the cache.
 uint64_t import_resolve(uint32_t import_id);
+// import_resolve and import_name in one lookup (host_import's path: every cross-module call of the game goes through it).
+uint64_t import_resolve_named(uint32_t import_id, const char** name);
 // Guest address of a DynSym of a registered module (ABI 3: DynSym.value as is), 0 if it is not defined.
 uint64_t nxmodule_symbol_address(const NxModule* nx, int sym);
 // The typeinfo address behind filter `filter` (> 0) of an FDE of module `nx`: types[fde.type_first + filter - 1], or, when that slot
