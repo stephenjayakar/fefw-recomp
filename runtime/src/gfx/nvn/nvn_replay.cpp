@@ -1370,7 +1370,10 @@ void prepare_textures(const ProgLayout& pl) {
     // is enough: the load-in frame starts the burst early (s5-default's, with 256, made 426 uploads in 361 ms; s4's, with 64, 173 in 295)
     static const int64_t loadin_frames = config_get_int("nvn", "pool_upload_loadin_frames", 30);
     const uint64_t on_at = g_pacing_on_present.load(std::memory_order_relaxed);
-    const bool loadin = on_at && now_p >= on_at && now_p - on_at < static_cast<uint64_t>(std::max<int64_t>(0, loadin_frames));
+    // The load-in frame itself is the present at which pacing comes back on: note_frame_for_pacing() runs at that present, after this
+    // frame's prepare_textures(), so frames while pacing is still off (a loading screen and its last frame) count as load-in too.
+    const bool loadin = (loadin_frames > 0 && nxrt::frame_limiter_unpaced()) ||
+                        (on_at && now_p >= on_at && now_p - on_at < static_cast<uint64_t>(std::max<int64_t>(0, loadin_frames)));
     if (pool_ms > 0 && !burst) {
         const size_t lim = static_cast<size_t>(std::max<int64_t>(0, loadin ? std::min(firsts_n, backlog_n) : firsts_n));
         for (Texture* t : need)
