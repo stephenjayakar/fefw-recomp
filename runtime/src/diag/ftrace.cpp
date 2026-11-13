@@ -85,11 +85,56 @@ void flush_locked() {
     std::fflush(g_file);
 }
 
+// The writer thread's flush: the new zone and thread names are taken under the lock, the events (appended lock-free) are formatted and
+// written outside it. Holding the lock while fprintf wrote a second of events (tens of thousands of lines) stalled every zone_id() / mark()
+// caller for that long, the render thread among them: a 30-45 ms frame once a second in every traced run.
+void flush_unlocked() {
+    std::string head;
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_file) return;
+        char b[320];
+        for (; g_zones_written < g_zone_names.size(); ++g_zones_written) {
+            std::snprintf(b, sizeof b, "# zone %zu %s\n", g_zones_written, g_zone_names[g_zones_written].c_str());
+            head += b;
+        }
+        n = std::min(g_n.load(std::memory_order_acquire), g_cap);
+        const size_t nt = std::min<size_t>(g_next_thread.load(), kMaxThreads);
+        for (; g_threads_written < nt; ++g_threads_written) {
+            const char* nm = g_thread_names[g_threads_written].empty() ? "-" : g_thread_names[g_threads_written].c_str();
+            std::snprintf(b, sizeof b, "# thread %zu %u %s\n", g_threads_written, g_thread_tids[g_threads_written], nm);
+            head += b;
+        }
+    }
+    if (!head.empty()) std::fwrite(head.data(), 1, head.size(), g_file);
+    std::string out;
+    out.reserve(1 << 20);
+    char b[96];
+    for (; g_written < n; ++g_written) {
+        const Ev& e = g_ev[g_written];
+        const int k = std::snprintf(b, sizeof b, "%llu %u %u %u %u\n", static_cast<unsigned long long>(e.t0), e.dur, e.thread, e.zone, e.arg);
+        if (k > 0) out.append(b, static_cast<size_t>(k));
+        if (out.size() >= (1u << 20)) {
+            std::fwrite(out.data(), 1, out.size(), g_file);
+            out.clear();
+        }
+    }
+    if (!out.empty()) std::fwrite(out.data(), 1, out.size(), g_file);
+    std::fflush(g_file);
+}
+
 void writer_main() {
+    // [prof] trace_flush_locked = true: the old flush under the names lock (to compare)
+    static const bool locked = config_get_bool("prof", "trace_flush_locked", false);
     while (!g_stop.load()) {
         for (int i = 0; i < 10 && !g_stop.load(); ++i) Sleep(100);
-        std::lock_guard<std::mutex> lk(g_mu);
-        flush_locked();
+        if (locked) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            flush_locked();
+        } else {
+            flush_unlocked();
+        }
     }
 }
 
