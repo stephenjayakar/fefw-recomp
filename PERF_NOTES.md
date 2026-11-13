@@ -202,3 +202,43 @@ A/B toggles, one at a time against the default:
 3. `controls.ini` `[display] astc_quality = fast`: one cache lookup per texture instead of two, and no background re-encode writing to
    the disk. Textures are slightly less sharp (bc7e preset 1 instead of 3).
 4. Keep RAM free while playing (the session had 1.5 GB free): the OS file cache is what makes revisits cheap.
+
+## Stutter track (perf/stutter, 13 Nov)
+
+Goal: native 4K60 with no gameplay frame over 100 ms after warm-up, first visits to big areas under about 250 ms, no recurring 33 ms+ spikes.
+
+### Diagnosis (`tools/perf/hitch_detail.py`)
+
+U = the user's 0.1.7 session (11-12 17:05, 61 min, BC7 cache on the E: HDD); W = tester run w1a (perf-stutter, NVMe cache, 1440p);
+X = tester run x2-explore (perf-stutter, NVMe, 4K). Gameplay frames >= 100 ms: count / total s / worst ms.
+
+| cause | U | W | X | status |
+|---|---|---|---|---|
+| render thread reads BC7 cache files | 124 / 198.3 / 38280 | 0 | 1 / 8.0 / 7991 (1243 reads) | U: fixed by perf-stutter + NVMe. X: evicted results, fixed by 523706b |
+| render: first-visit uploads without disk (stand-ins, CPU untile, staging) | 3 / 0.5 / 227 | 3 / 1.6 / 996 | 2 / 0.46 / 277 (+ the 8 s load-in frame: 4378 uploads, 3.8 GB) | 19f219b, 575c10f, 1726755 |
+| render: replay outside uploads with 3-4 big ASTC transcodes (upstream waits up to 5 s for the running job) | 13 / 8.4 / 1320 | 0 | 0 | perf-stutter (2 ms wait) |
+| game thread busy, render idle, nothing tracked | 34 / 7.4 / 442 (+78 at 50-100 ms) | 1 / 0.17 / 169 | 1 / 0.47 / 472 | open: profiler in stutter-1 |
+| game thread waits on another guest thread (svc waits 95-225 ms) | 9 / 1.9 / 257 | loading only | 0 | open: profiler |
+| write-watch arming + fault handler (~180 ms, around memory pool imports of ~300 ms) | 0 | 1 / 0.18 / 180 | 3 / 0.65 / 234 | open |
+| game: GPU sync waits | 13 / 2.5 / 390 | 0 | 1 / 0.40 / 397 | next to big upload frames |
+| pipelines building in the background (no draw-time compiles) | 5 / 0.8 / 233 | 1 / 0.2 / 196 | loading | not shader stutter |
+| memory pool import (vkAllocateMemory over game memory) | boot | boot 3.1 s | loading 0.35-0.64 s | boot/loading |
+| BAR-heap allocation failures, movie, audio, save writes, romfs IPC | - | - | - | not seen (1 allocation failure at boot; fixed upstream) |
+
+The x2-explore load-in frame: early (registration) jobs filled the 512 MB texprep budget and evicted 3623 finished results; textures that
+already showed a stand-in found no result at their next upload and, the stand-in having been made for that content, were prepared on the
+render thread (1243 cache reads, 3.4 s). The same frame uploaded every registered pool texture (4378) before the first draw.
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| 9ce4703 | slow-frame profiler `[prof] hitch_ms` (folded stacks per slow frame, `tools/perf/prof_hitch.py`), finer hitch line (uploads split take / prepare / staging, image creation, render-thread prepared bytes, game thread CPU time, page faults) | `[prof] hitch_ms = 0` |
+| ba83adb | stand-in solid blocks encoded once per source texel and copied (byte-identical) | `[nvn] standin_copy = true` |
+| 19f219b | persistent staging ring for render-thread uploads | `[nvn] staging_ring_mb = 256` |
+| 575c10f | compact stand-ins: solid levels as distinct block rows, copied row by row (4096^2: 2 MB in 1.7 ms instead of 22 MB in 12-15 ms) | `[nvn] standin_rows = true` |
+| 523706b | stand-in kept until its job's result exists; promised results never evicted; registration jobs never evict; budget 1024 MB | `[nvn] standin_keep`, `tex_prep_keep_promised = true`, `tex_prep_mb = 1024` |
+| 1726755 | first uploads of pool-only asset textures limited to 24 ms of render thread per frame (pool dummy meanwhile) | `[nvn] pool_upload_ms = 24` |
+| 8f3df04 | within that budget, textures with a ready background result first | with the above |
+
+Test request `queue/stutter-1` (DLL a1ed3bd9).
