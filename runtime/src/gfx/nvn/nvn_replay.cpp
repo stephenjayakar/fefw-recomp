@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -4757,6 +4758,17 @@ void replay_begin_submit(Frame& f) {
         if (trace_sec > 0 && !trace_sec_done && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= trace_sec) {
             trace_sec_done = true;
             g_trace_frame = static_cast<int64_t>(counters().presents.load());
+        }
+    }
+    {   // [nvn] trace_trigger = <file>: when the file appears (checked every 32 submissions), it is deleted and the next frame is traced
+        static const std::string trig = nxrt::config_get_str("nvn", "trace_trigger", "");
+        static uint32_t n = 0;
+        if (!trig.empty() && (++n & 31) == 0) {
+            std::error_code ec;
+            if (std::filesystem::exists(trig, ec) && std::filesystem::remove(trig, ec)) {
+                g_trace_req.store(true);
+                NXLOG_I("nvn.trace", "trace trigger %s found: the next frame is traced", trig.c_str());
+            }
         }
     }
     if (g_trace_req.exchange(false)) g_trace_frame = static_cast<int64_t>(counters().presents.load()) + 1;   // armed from a script (@shot nvntrace_*)
