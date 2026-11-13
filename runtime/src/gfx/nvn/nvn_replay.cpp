@@ -2573,6 +2573,9 @@ const ShaderInfo* tcs_now() { return S.stage[kTessCtl] ? S.stage[kTessCtl] : g_g
 // open pass whose depth attachment is read-only, instead of ending it for a writable one. The transparent and particle draws of a frame
 // (depth test on, depth writes off) where only some of them sample the depth (soft particles) then stay in one pass, without a layout
 // change of the full-size depth buffer back and forth at each switch.
+void cs_check_draw(const ProgLayout& pl);                 // dispatch barriers (do_dispatch, further down)
+void cs_draw_index_range(uint64_t addr, uint64_t size);
+
 bool depth_ro_for_draw() {
     if (g_want_depth_ro) return true;
     static const bool sticky = nxrt::config_get_bool("nvn", "depth_ro_sticky", false);
@@ -2620,6 +2623,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     const ProgLayout* pl = g_pl;
     if (!pl) return false;
     MemoScope memo(*pl);
+    cs_check_draw(*pl);     // before this draw records anything (uploads, layout changes, feedback copies)
     if (pl->has_set[kPoolSet] && pool_state_moved(S.tpool.get(), S.spool.get())) g_dirty |= kDesc;   // registrations or layout moves since
     if (extras::temporal_wanted()) temporal_gbuffer_note();
     rs_mark(kRsHead);
@@ -3037,7 +3041,10 @@ void do_draw_arrays(const P_DrawArrays& p) {
 void do_draw_elements(const P_DrawElements& p) {
     count_primitives(p.mode, p.count, p.instance_count);
     VkPrimitiveTopology topo;
-    if (!begin_draw(static_cast<int>(p.mode), true, static_cast<int>(p.type), &topo)) { counters().draws_skipped.fetch_add(1); return; }
+    cs_draw_index_range(p.index_address, static_cast<uint64_t>(p.count) * index_size_bytes(static_cast<int>(p.type)));
+    const bool began = begin_draw(static_cast<int>(p.mode), true, static_cast<int>(p.type), &topo);
+    cs_draw_index_range(0, 0);
+    if (!began) { counters().draws_skipped.fetch_add(1); return; }
     draw_log(p.count, p.instance_count, true);
     if (g_trace) {   // the indices and the first attributes of the first vertices
         const uint32_t isz0 = index_size_bytes(static_cast<int>(p.type));
@@ -3327,10 +3334,22 @@ VkCommandBuffer g_cs_cb = VK_NULL_HANDLE;
 uint64_t g_cs_mark = 0;                                    // memory_barrier_count(g_cs_cb) when the barrier was left open
 uint64_t g_cs_n = 0, g_cs_skipped = 0, g_cs_conflicts = 0, g_cs_untracked = 0;
 
-bool cs_tracked_on() {
-    static const bool on = nxrt::config_get_str("nvn", "dispatch_barriers", "full") == "tracked";
-    return on;
+// `tracked_draws`: as `tracked`, and draws stay outside the check too: a draw (DrawArrays / DrawElements) that binds nothing an open
+// dispatch may write, and renders to no image one writes, runs without the barrier, so the dispatch overlaps the graphics work after it
+// (the probe-filter dispatches of Fortune's Weave sit between unrelated passes). At most 32 draws are checked per dispatch; then, or at a
+// draw that depends on an open dispatch, the pass ends and the barrier is recorded.
+int cs_mode() {
+    static const int m = [] {
+        const std::string v = nxrt::config_get_str("nvn", "dispatch_barriers", "full");
+        return v == "tracked_draws" ? 2 : v == "tracked" ? 1 : 0;
+    }();
+    return m;
 }
+bool cs_tracked_on() { return cs_mode() >= 1; }
+bool cs_draws_on() { return cs_mode() >= 2; }
+uint32_t g_cs_draws_checked = 0;
+uint64_t g_cs_draw_overlaps = 0, g_cs_draw_conflicts = 0;
+std::vector<CsRange> g_draw_extra_rd;                      // the draw being set up: its index range (do_draw_elements)
 
 const void* cs_img_key(Texture* t) { return t->gpu ? static_cast<const void*>(t->gpu) : static_cast<const void*>(t); }
 
@@ -3436,9 +3455,11 @@ void cs_before_dispatch(const ProgLayout& pl, uint64_t indirect) {
 void cs_after_dispatch() {
     if (!cs_tracked_on()) { memory_barrier(F->cb); return; }
     if (++g_cs_n % 20000 == 0)
-        NXLOG_I("nvn.replay", "dispatch barriers (tracked): %llu dispatches, %llu barriers left out, %llu kept for a dependency, %llu dispatches not tracked",
+        NXLOG_I("nvn.replay", "dispatch barriers (tracked): %llu dispatches, %llu barriers left out, %llu kept for a dependency, %llu dispatches not tracked; "
+                "draws after open dispatches: %llu ran without the barrier, %llu got it",
                 static_cast<unsigned long long>(g_cs_n), static_cast<unsigned long long>(g_cs_skipped), static_cast<unsigned long long>(g_cs_conflicts),
-                static_cast<unsigned long long>(g_cs_untracked));
+                static_cast<unsigned long long>(g_cs_untracked), static_cast<unsigned long long>(g_cs_draw_overlaps),
+                static_cast<unsigned long long>(g_cs_draw_conflicts));
     if (!g_cs_known || g_cs_open_set.size() + g_cs_new.size() > 256) {
         if (!g_cs_known) ++g_cs_untracked;
         memory_barrier(F->cb);
@@ -3454,6 +3475,7 @@ void cs_after_dispatch() {
     o.img_wr.insert(o.img_wr.end(), g_cs_new.img_wr.begin(), g_cs_new.img_wr.end());
     o.pool = o.pool || g_cs_new.pool;
     g_cs_open = true;
+    g_cs_draws_checked = 0;
     g_cs_cb = F->cb;
     g_cs_mark = memory_barrier_count(F->cb);
 }
@@ -3461,11 +3483,48 @@ void cs_after_dispatch() {
 // Ops that record no GPU work (state and bindings) or that check the open dispatches themselves keep them open.
 bool cs_keeps_open(Op op) {
     if (op < Op::DrawArrays) return true;
+    if ((op == Op::DrawArrays || op == Op::DrawElements) && cs_draws_on()) return true;    // begin_draw checks (cs_check_draw)
     switch (op) {
         case Op::Dispatch: case Op::DispatchIndirect: case Op::FenceSync: case Op::WaitSync: case Op::CallCommands: case Op::PushDebugGroup:
         case Op::PopDebugGroup: case Op::PushConstants: case Op::DiscardColor: case Op::DiscardDepthStencil:
             return true;
         default: return false;
+    }
+}
+
+void cs_draw_index_range(uint64_t addr, uint64_t size) {
+    g_draw_extra_rd.clear();
+    if (addr) g_draw_extra_rd.push_back({addr, size ? addr + size : UINT64_MAX});
+}
+
+// A draw with dispatches open (dispatch_barriers = tracked_draws): the barrier now (ending the pass) if the draw depends on one of them.
+void cs_check_draw(const ProgLayout& pl) {
+    if (!g_cs_open) return;
+    if (F->cb != g_cs_cb || memory_barrier_count(F->cb) != g_cs_mark) {      // a full barrier lies between
+        g_cs_open = false;
+        g_cs_open_set.clear();
+        return;
+    }
+    bool dep = !cs_draws_on() || ++g_cs_draws_checked > 32 || g_xfb_active;
+    if (!dep) {
+        CsSet& d = g_cs_new;
+        dep = !cs_collect(pl, 0, d);
+        if (!dep) {
+            for (const GState::Bind& v : S.vtx)
+                if (v.addr) d.rd.push_back({v.addr, v.size ? v.addr + v.size : UINT64_MAX});
+            d.rd.insert(d.rd.end(), g_draw_extra_rd.begin(), g_draw_extra_rd.end());
+            for (uint32_t i = 0; i < S.ncolor && i < 8; ++i)
+                if (S.color_tex[i]) d.img_wr.push_back(cs_img_key(S.color_tex[i].get()));
+            if (S.depth_tex) d.img_wr.push_back(cs_img_key(S.depth_tex.get()));
+            dep = cs_conflict(g_cs_open_set, d);
+        }
+    }
+    if (dep) {
+        ++g_cs_draw_conflicts;
+        end_pass();
+        cs_close();
+    } else {
+        ++g_cs_draw_overlaps;
     }
 }
 
