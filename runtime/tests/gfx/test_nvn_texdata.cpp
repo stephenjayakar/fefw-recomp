@@ -612,6 +612,52 @@ NXTEST(standin_first_skips_the_cache_entry) {
     no_cache();
 }
 
+// [nvn] standin_copy: the stand-in's solid blocks are encoded once per source texel and copied into the big levels (rows that map to the same
+// source row copied whole). The result must be byte for byte the block-by-block one, for big, odd-sized and layered textures; the times of both
+// are printed (a 4096x4096 stand-in is the case that costs the render thread on a first visit).
+NXTEST(standin_copy_equals_block_by_block) {
+    no_cache();
+    struct Case { int target, w, h, depth, levels, format; };
+    const Case cases[] = {
+        {NVN_TEXTURE_TARGET_2D, 4096, 4096, 1, 13, NVN_FORMAT_RGBA_ASTC_8x8_SRGB},
+        {NVN_TEXTURE_TARGET_2D, 1000, 600, 1, 10, NVN_FORMAT_RGBA_ASTC_8x8},
+        {NVN_TEXTURE_TARGET_2D_ARRAY, 300, 200, 3, 6, NVN_FORMAT_RGBA_ASTC_4x4},
+        {NVN_TEXTURE_TARGET_2D, 2048, 512, 1, 12, NVN_FORMAT_RGBA_ASTC_5x4_SRGB},
+    };
+    for (const Case& c : cases) {
+        const TextureBuilderInfo info = make_info(c.target, c.w, c.h, c.depth, c.levels, c.format);
+        Built bt;
+        CHECK_MSG(begin_block_linear(bt, info), "layout");
+        std::vector<uint16_t> scratch;
+        for (uint32_t layer = 0; layer < bt.L.layers; ++layer)
+            for (uint32_t i = 0; i < bt.L.layout.levels.size(); ++i) fill_astc_void_level(bt, i, layer, scratch, 1300 + layer * 31 + i);
+        finish_block_linear(bt, info);
+        TexCaps si;
+        si.provisional = true;
+        si.standin_first = true;
+        si.image_format = bt.L.fmt->srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        PreparedTexture fast, slow;
+        double ms_fast = 1e9, ms_slow = 1e9;
+        for (int rep = 0; rep < 3; ++rep) {   // the best of three of each, alternating (the first call pays for fresh memory)
+            config_set("nvn", "standin_copy", "1");
+            auto t0 = std::chrono::steady_clock::now();
+            CHECK_MSG(prepare_texture(*bt.tex, si, fast), fast.error);
+            ms_fast = std::min(ms_fast, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            config_set("nvn", "standin_copy", "0");
+            t0 = std::chrono::steady_clock::now();
+            CHECK_MSG(prepare_texture(*bt.tex, si, slow), slow.error);
+            ms_slow = std::min(ms_slow, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        config_set("nvn", "standin_copy", "1");
+        std::printf("texdata: stand-in %dx%d x%d, %d levels (%zu KB): %.2f ms copied, %.2f ms block by block\n", c.w, c.h, c.depth, c.levels,
+                    fast.data.size() >> 10, ms_fast, ms_slow);
+        CHECK(fast.provisional);
+        CHECK(slow.provisional);
+        CHECK_EQ(fast.data.size(), slow.data.size());
+        CHECK(fast.data == slow.data);
+    }
+}
+
 // ---- disk cache entries of other formats ------------------------------------------------------------------------------------
 // An entry the setup tool makes has the layout of the runtime's BC7 entry, with another VkFormat (nvn_texdata.cpp). These tests
 // replace the BC7 entry of a texture with a hand-made one and check which entries prepare_texture uses.

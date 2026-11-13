@@ -898,8 +898,13 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                 bc7 ? "BC7" : "RGBA8", geo[0].w, geo[0].h, L.levels, ms);
         return true;
     }
-    std::vector<uint8_t> solid_rgba;
+    std::vector<uint8_t> solid_rgba, solid_enc;
+    std::vector<uint32_t> solid_xs;
     uint32_t solid_layer = ~0u;
+    // [nvn] standin_copy (default on): the solid blocks of the source level are encoded once per layer and copied into the big levels, a row of
+    // blocks that maps to the same source row as the one before is copied whole (a 4096x4096 stand-in wrote a million blocks one by one, with
+    // two 64-bit divisions each). Byte for byte the old result. false: each block computed as before (A/B).
+    const bool solid_copy = solid_src < geo.size() && config_get_bool("nvn", "standin_copy", true);
     for (size_t i = 0; i < geo.size(); ++i) {
         const LevelGeom& g = geo[i];
         const PreparedLevel& pl = out.level[i];
@@ -918,8 +923,31 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                                                                 static_cast<size_t>(sg.slice), 1, solid_rgba.data(), nullptr);
                     if (st != A2B_OK) return fail(std::string("ASTC decode for the stand-in failed: ") + a2b_status_string(st));
                     solid_layer = layer;
+                    if (solid_copy) {   // every source texel's block, once
+                        solid_enc.resize(static_cast<size_t>(sg.w) * sg.h * 16);
+                        for (size_t px = 0; px < static_cast<size_t>(sg.w) * sg.h; ++px) bc7_solid_block(solid_rgba.data() + px * 4, solid_enc.data() + px * 16);
+                    }
                 }
                 uint8_t* dst = out.data.data() + pl.offset + static_cast<uint64_t>(layer) * out_slice;
+                if (solid_copy) {
+                    solid_xs.resize(bw);
+                    for (uint32_t bx = 0; bx < bw; ++bx)
+                        solid_xs[bx] = std::min(sg.w - 1, static_cast<uint32_t>((static_cast<uint64_t>(bx) * 4 + 2) * sg.w / g.w));
+                    const size_t row_bytes = static_cast<size_t>(bw) * 16;
+                    uint32_t prev_sy = ~0u;
+                    for (uint32_t by = 0; by < bh; ++by) {
+                        const uint32_t sy = std::min(sg.h - 1, static_cast<uint32_t>((static_cast<uint64_t>(by) * 4 + 2) * sg.h / g.h));
+                        uint8_t* row = dst + static_cast<size_t>(by) * row_bytes;
+                        if (sy == prev_sy) {
+                            std::memcpy(row, row - row_bytes, row_bytes);
+                            continue;
+                        }
+                        prev_sy = sy;
+                        const uint8_t* src = solid_enc.data() + static_cast<size_t>(sy) * sg.w * 16;
+                        for (uint32_t bx = 0; bx < bw; ++bx) std::memcpy(row + static_cast<size_t>(bx) * 16, src + static_cast<size_t>(solid_xs[bx]) * 16, 16);
+                    }
+                    continue;
+                }
                 for (uint32_t by = 0; by < bh; ++by) {
                     const uint32_t sy = std::min(sg.h - 1, static_cast<uint32_t>((static_cast<uint64_t>(by) * 4 + 2) * sg.h / g.h));
                     for (uint32_t bx = 0; bx < bw; ++bx) {
