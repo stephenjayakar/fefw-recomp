@@ -1240,12 +1240,18 @@ void prepare_textures(const ProgLayout& pl) {
         pool_from = from;
         pool_textures_to_prepare(S.tpool.get(), need);
         need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(from), need.end(),
-                                  [&](Texture* t) { return shares_image(t, S.depth_tex.get()) || (!compute && is_color_feedback(t)); }),
+                                  [&](Texture* t) {
+                                      if (!t->gpu && tex_first_upload_deferrable(t)) return false;   // an asset with no image yet: not an attachment
+                                      return shares_image(t, S.depth_tex.get()) || (!compute && is_color_feedback(t));
+                                  }),
                    need.end());
     }
     // an image this op also writes (an NVN2 compute shader sampling its own image) stays in GENERAL, the layout both descriptors name
     need.erase(std::remove_if(need.begin(), need.end(),
-                              [&](Texture* t) { return std::any_of(storage_bound.begin(), storage_bound.end(), [&](Texture* s) { return shares_image(t, s); }); }),
+                              [&](Texture* t) {
+                                  if (!t->gpu && tex_first_upload_deferrable(t)) return false;
+                                  return std::any_of(storage_bound.begin(), storage_bound.end(), [&](Texture* s) { return shares_image(t, s); });
+                              }),
                need.end());
     // [nvn] pool_upload_ms (default 24; 0 = no limit): the first uploads of asset textures that a draw needs only because a texture pool holds
     // them (not bound by the draw itself) take at most this much render-thread time per presented frame; the rest stay not ready (their pool

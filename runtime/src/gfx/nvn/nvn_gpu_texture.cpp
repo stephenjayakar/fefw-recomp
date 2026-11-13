@@ -2167,9 +2167,15 @@ uint32_t tex_layers(Texture* t) { return t->layers; }
 bool tex_is_depth(Texture* t) { return t->fmt && t->fmt->aspect != kAspectColor; }
 
 bool tex_first_upload_deferrable(Texture* t) {
-    const TexGpu* g = t ? t->gpu : nullptr;
-    return g && !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f && t->fmt && (t->fmt->astc || t->fmt->bc) &&
-           (t->mem || t->vpool) && t->cpu_dirty.load(std::memory_order_relaxed);
+    if (!t || !t->fmt || !(t->fmt->astc || t->fmt->bc) || !(t->mem || t->vpool) || !t->cpu_dirty.load(std::memory_order_relaxed)) return false;
+    const TexGpu* g = t->gpu;
+    if (!g) {
+        // no image yet ([nvn] pool_image_lazy): it is made when the upload's turn comes, not at the pool scan (a load-in made 3093 images in one
+        // frame, 151 ms). Not when another texture's image over the same storage would be shared, and not for a texture already finalized.
+        static const bool lazy = nxrt::config_get_bool("nvn", "pool_image_lazy", true);
+        return lazy && active() && !t->destroyed.load(std::memory_order_relaxed) && t->fmt->aspect == kAspectColor && t->b.samples <= 1 && !texture_registry_find_alias(t);
+    }
+    return !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f;
 }
 
 bool tex_pool_preparation_pending(Texture* t) {

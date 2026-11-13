@@ -1015,6 +1015,10 @@ VkDescriptorImageInfo pool_image(const TexturePool::Entry& e, VkImageViewType ty
     const bool flat = target == NVN_TEXTURE_TARGET_2D || target == NVN_TEXTURE_TARGET_2D_ARRAY || target == NVN_TEXTURE_TARGET_RECTANGLE ||
                       target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
     if (type == VK_IMAGE_VIEW_TYPE_CUBE ? !cube : !flat) return ii;
+    if (!t->gpu && !g_held.empty() && g_held.count(t)) {       // held back for a later frame, no image yet (pool_hold): the dummy meanwhile
+        *not_ready = true;
+        return ii;
+    }
     if (!tex_gpu(t)) return ii;
     if (tex_layout(t) != tex_sampled_layout(t)) {
         *not_ready = true;
@@ -1548,6 +1552,10 @@ void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out) {
     static const bool depth_readiness = config_get_bool("nvn", "depth_pool_readiness", true);
     auto look = [&](Texture* t) {
         if (!g_held.empty() && g_held.count(t)) return;            // held back for this frame (pool_hold)
+        if (!t->gpu && tex_first_upload_deferrable(t)) {             // pending, its image made when its upload's turn comes
+            out.push_back(t);
+            return;
+        }
         if ((t->destroyed.load(std::memory_order_relaxed) && !t->gpu && !texture_registry_find_alias(t)) || !tex_gpu(t)) return;
         const bool pending = depth_readiness ? tex_pool_preparation_pending(t)
             : t->cpu_dirty.load(std::memory_order_relaxed) || tex_layout(t) != tex_sampled_layout(t);
