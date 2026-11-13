@@ -655,6 +655,43 @@ NXTEST(standin_copy_equals_block_by_block) {
         CHECK(slow.provisional);
         CHECK_EQ(fast.data.size(), slow.data.size());
         CHECK(fast.data == slow.data);
+
+        // TexCaps::compact_standin: the solid levels as their distinct block rows. Expanded row by row (as the GPU copy does) it is the same image.
+        TexCaps cs = si;
+        cs.compact_standin = true;
+        PreparedTexture compact;
+        double ms_compact = 1e9;
+        for (int rep = 0; rep < 3; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK_MSG(prepare_texture(*bt.tex, cs, compact), compact.error);
+            ms_compact = std::min(ms_compact, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        std::printf("texdata: compact stand-in %dx%d: %zu KB in %.2f ms (whole: %zu KB)\n", c.w, c.h, compact.data.size() >> 10, ms_compact,
+                    fast.data.size() >> 10);
+        CHECK(compact.provisional);
+        CHECK(compact.compact);
+        CHECK_EQ(compact.level.size(), fast.level.size());
+        CHECK(compact.data.size() < fast.data.size());
+        bool same = compact.level.size() == fast.level.size();
+        for (size_t i = 0; same && i < fast.level.size(); ++i) {
+            const PreparedLevel& f = fast.level[i];
+            const PreparedLevel& k = compact.level[i];
+            const uint64_t row_bytes = static_cast<uint64_t>(f.row_blocks) * 16;
+            const uint32_t bh = (f.height + 3) / 4;
+            if (k.rows.empty()) {
+                same = k.size == f.size && std::memcmp(compact.data.data() + k.offset, fast.data.data() + f.offset, static_cast<size_t>(f.size)) == 0;
+                continue;
+            }
+            same = k.rows.size() == static_cast<size_t>(bh) * bt.L.layers;
+            for (uint32_t layer = 0; same && layer < bt.L.layers; ++layer)
+                for (uint32_t by = 0; same && by < bh; ++by) {
+                    const uint64_t want = f.offset + (static_cast<uint64_t>(layer) * bh + by) * row_bytes;
+                    const uint64_t got = k.rows[static_cast<size_t>(layer) * bh + by];
+                    same = got + row_bytes <= compact.data.size() && got % 16 == 0 &&
+                           std::memcmp(compact.data.data() + got, fast.data.data() + want, static_cast<size_t>(row_bytes)) == 0;
+                }
+        }
+        CHECK_MSG(same, "the compact stand-in expands to the whole one");
     }
 }
 

@@ -2031,6 +2031,9 @@ void tex_ensure_current(Texture* t, Frame& f) {
         // 30 ms to over a second, thousands of them on a first visit). Not for a copy or a clear, which would keep the stand-in's pixels.
         // A sparse texture written tile by tile is only given one at its first upload: later uploads follow its writes and would flicker.
         caps.standin_first = caps.provisional && !texprep::exact_thread() && (!t->vpool || !g->uploaded) && texprep::async_standin();
+        // [nvn] standin_rows (default on): the stand-in's big solid levels come as their distinct block rows, copied into the image row by row
+        static const bool standin_rows = nxrt::config_get_bool("nvn", "standin_rows", true);
+        caps.compact_standin = caps.standin_first && standin_rows && !g->sparse;
         nxrt::HitchTimer ht_prep(nxrt::kHpRenderTexPrep);
         ok = prepare_texture(*t, caps, prep);
         g_rt_prep_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
@@ -2074,6 +2077,19 @@ void tex_ensure_current(Texture* t, Frame& f) {
     regions.reserve(prep.level.size());
     for (uint32_t i = g->drop; i < prep.level.size() && i - g->drop < g->levels; ++i) {   // the levels the image has ([gfx] texture_detail)
         const PreparedLevel& pl = prep.level[i];
+        if (!pl.rows.empty()) {                  // a compact stand-in level: each block row from its (shared) row of blocks
+            const uint32_t bh = (pl.height + 3) / 4;
+            for (uint32_t layer = 0; layer < g->layers && static_cast<size_t>(layer + 1) * bh <= pl.rows.size(); ++layer)
+                for (uint32_t by = 0; by < bh; ++by) {
+                    VkBufferImageCopy r = {};
+                    r.bufferOffset = st.offset + pl.rows[static_cast<size_t>(layer) * bh + by];
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->drop, layer, 1};
+                    r.imageOffset = {0, static_cast<int32_t>(by * 4), 0};
+                    r.imageExtent = {pl.width, std::min<uint32_t>(4, pl.height - by * 4), 1};
+                    regions.push_back(r);
+                }
+            continue;
+        }
         VkBufferImageCopy r = {};
         r.bufferOffset = st.offset + pl.offset;
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->drop, 0, g->layers};

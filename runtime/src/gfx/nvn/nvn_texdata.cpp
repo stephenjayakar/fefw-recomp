@@ -823,15 +823,18 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
 
     // ---- the source image: tight linear buffer --------------------------------------------------------------------------
     // A stand-in reads only the small levels it encodes (solid_src and after): untiling the big ones, which it never looks at, was most of its cost.
+    // The buffer then starts at the first of those levels (lin_base): the big levels' space was allocated and zeroed for nothing.
     std::vector<uint8_t> lin;
+    uint64_t lin_base = 0;
     if (solid_src < geo.size() && L.block_linear) {
         const LevelGeom& last = geo.back();
-        lin.assign(static_cast<size_t>(last.lin_off + last.slice * L.layers), 0);
+        lin_base = geo[solid_src].lin_off;
+        lin.assign(static_cast<size_t>(last.lin_off + last.slice * L.layers - lin_base), 0);
         for (size_t i = solid_src; i < L.layout.levels.size(); ++i) {
             const tegra::LevelLayout& lv = L.layout.levels[i];
             for (uint32_t layer = 0; layer < L.layers; ++layer)
                 tegra::untile_level(L.desc, lv, src_mem + layer * L.layout.tiled_layer_stride + lv.tiled_offset,
-                                    lin.data() + lv.linear_offset + layer * lv.linear_slice_size);
+                                    lin.data() + lv.linear_offset - lin_base + layer * lv.linear_slice_size);
         }
     } else if (!make_linear(L, geo, fmt, src_mem, lin)) {
         return fail("untile failed");
@@ -853,7 +856,32 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
         a2b_bc7_encoder(&name);
         NXLOG_I(kTag, "ASTC transcoder: %s; [nvn] bc7_quality %d, [gfx] astc_quality %s", name, bc7_quality(), astc_quality_name(aq));
     }
-    out.data.assign(static_cast<size_t>(out_total), 0);
+    // Compact stand-in (TexCaps::compact_standin): the solid levels keep only their distinct block rows (the source row of block row y only
+    // moves forward with y); every level is then laid out again, back to back.
+    uint64_t data_total = out_total;
+    if (provisional && caps.compact_standin && bc7 && solid_src < geo.size() && !edit_make) {
+        const LevelGeom& sg = geo[solid_src];
+        uint64_t off = 0;
+        for (size_t i = 0; i < geo.size(); ++i) {
+            PreparedLevel& pl = out.level[i];
+            pl.offset = off;
+            if (i < solid_src) {
+                const LevelGeom& g = geo[i];
+                const uint32_t bh = (g.h + 3) / 4;
+                uint32_t prev = ~0u, n = 0;
+                for (uint32_t by = 0; by < bh; ++by) {
+                    const uint32_t sy = std::min(sg.h - 1, static_cast<uint32_t>((static_cast<uint64_t>(by) * 4 + 2) * sg.h / g.h));
+                    if (sy != prev) { ++n; prev = sy; }
+                }
+                pl.size = static_cast<uint64_t>(n) * pl.row_blocks * 16 * L.layers;
+                pl.rows.resize(static_cast<size_t>(bh) * L.layers);
+            }
+            off += pl.size;
+        }
+        data_total = off;
+        out.compact = true;
+    }
+    out.data.assign(static_cast<size_t>(data_total), 0);
     a2b_options opt{};
     opt.quality = provisional ? 0 : quality;
     opt.threads = provisional ? 1 : caps.encode_threads;   // 0: all hardware threads; a stand-in is small work: thread start-up per level cost more than the encode
@@ -912,14 +940,14 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
             const LevelGeom& sg = geo[solid_src];
             const uint64_t out_slice = pl.size / L.layers;
             const uint32_t bw = (g.w + 3) / 4, bh = (g.h + 3) / 4;
-            if (out_slice != static_cast<uint64_t>(bw) * bh * 16) return fail("internal: BC7 stand-in size mismatch");
+            if (!out.compact && out_slice != static_cast<uint64_t>(bw) * bh * 16) return fail("internal: BC7 stand-in size mismatch");
             for (uint32_t layer = 0; layer < L.layers; ++layer) {
                 if (solid_layer != layer) {
                     a2b_input sin = in;
                     sin.width = sg.w;
                     sin.height = sg.h;
                     solid_rgba.resize(static_cast<size_t>(sg.w) * sg.h * 4);
-                    const a2b_status st = a2b_decode_astc_rgba8(&sin, lin.data() + sg.lin_off + static_cast<uint64_t>(layer) * sg.slice,
+                    const a2b_status st = a2b_decode_astc_rgba8(&sin, lin.data() + sg.lin_off - lin_base + static_cast<uint64_t>(layer) * sg.slice,
                                                                 static_cast<size_t>(sg.slice), 1, solid_rgba.data(), nullptr);
                     if (st != A2B_OK) return fail(std::string("ASTC decode for the stand-in failed: ") + a2b_status_string(st));
                     solid_layer = layer;
@@ -929,6 +957,28 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                     }
                 }
                 uint8_t* dst = out.data.data() + pl.offset + static_cast<uint64_t>(layer) * out_slice;
+                if (out.compact) {   // the distinct rows of this layer, each made once from the source row's blocks
+                    const size_t row_bytes = static_cast<size_t>(bw) * 16;
+                    std::vector<uint64_t>& rows = out.level[i].rows;
+                    uint32_t prev_sy = ~0u;
+                    uint64_t cur = 0;
+                    size_t k = 0;
+                    for (uint32_t by = 0; by < bh; ++by) {
+                        const uint32_t sy = std::min(sg.h - 1, static_cast<uint32_t>((static_cast<uint64_t>(by) * 4 + 2) * sg.h / g.h));
+                        if (sy != prev_sy) {
+                            prev_sy = sy;
+                            uint8_t* row = dst + k * row_bytes;
+                            cur = static_cast<uint64_t>(row - out.data.data());
+                            ++k;
+                            for (uint32_t bx = 0; bx < bw; ++bx) {
+                                const uint32_t sx = std::min(sg.w - 1, static_cast<uint32_t>((static_cast<uint64_t>(bx) * 4 + 2) * sg.w / g.w));
+                                bc7_solid_block(solid_rgba.data() + (static_cast<size_t>(sy) * sg.w + sx) * 4, row + static_cast<size_t>(bx) * 16);
+                            }
+                        }
+                        rows[static_cast<size_t>(layer) * bh + by] = cur;
+                    }
+                    continue;
+                }
                 if (solid_copy) {
                     solid_xs.resize(bw);
                     for (uint32_t bx = 0; bx < bw; ++bx)
@@ -965,7 +1015,7 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
         if (bc7 && a2b_output_size(&in) != out_slice) return fail("internal: BC7 slice size mismatch");
         for (uint32_t layer = 0; layer < L.layers; ++layer)
             for (uint32_t z = 0; z < g.d; ++z) {
-                const uint8_t* src = lin.data() + g.lin_off + static_cast<uint64_t>(layer) * g.slice + z * in_slice;
+                const uint8_t* src = lin.data() + g.lin_off - lin_base + static_cast<uint64_t>(layer) * g.slice + z * in_slice;
                 uint8_t* dst = out.data.data() + pl.offset + (static_cast<uint64_t>(layer) * g.d + z) * out_slice;
                 a2b_status st;
                 if (bc7) {
