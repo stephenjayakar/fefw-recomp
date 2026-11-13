@@ -3260,6 +3260,170 @@ void trace_snap_after_dispatch(const ShaderInfo& cs, const ProgLayout& pl) {
     }
 }
 
+// ---- dispatch barriers ([nvn] dispatch_barriers) ----------------------------------------------------------------------------
+// `full` (default): a full barrier after every dispatch, as before. `tracked`: a dispatch leaves its barrier open, and the next dispatch
+// gets one only when it touches what an open dispatch may write, or may write what one reads: buffers by their game address range (storage
+// buffers count as written), textures and storage images by their image. Any other command closes the open dispatches with the full
+// barrier first, and so does the end of the submission. Dispatches that share nothing (one per character, separate buffers) then overlap
+// on the GPU instead of each one draining it. A dispatch with a binding this cannot follow (texel buffers, an unknown source) keeps the
+// full barrier after it.
+struct CsRange { uint64_t a, b; };
+struct CsSet {
+    std::vector<CsRange> rd, wr;
+    std::vector<const void*> img_rd, img_wr;
+    bool pool = false;                                     // samples through the texture pool: any texture
+    void clear() { rd.clear(); wr.clear(); img_rd.clear(); img_wr.clear(); pool = false; }
+    size_t size() const { return rd.size() + wr.size() + img_rd.size() + img_wr.size(); }
+};
+CsSet g_cs_open_set, g_cs_new;
+bool g_cs_open = false;                                    // dispatches ended without their barrier
+bool g_cs_known = false;                                   // g_cs_new holds everything the current dispatch binds
+VkCommandBuffer g_cs_cb = VK_NULL_HANDLE;
+uint64_t g_cs_mark = 0;                                    // memory_barrier_count(g_cs_cb) when the barrier was left open
+uint64_t g_cs_n = 0, g_cs_skipped = 0, g_cs_conflicts = 0, g_cs_untracked = 0;
+
+bool cs_tracked_on() {
+    static const bool on = nxrt::config_get_str("nvn", "dispatch_barriers", "full") == "tracked";
+    return on;
+}
+
+const void* cs_img_key(Texture* t) { return t->gpu ? static_cast<const void*>(t->gpu) : static_cast<const void*>(t); }
+
+// Everything the dispatch about to run binds. False: a binding this does not follow.
+bool cs_collect(const ProgLayout& pl, uint64_t indirect, CsSet& o) {
+    o.clear();
+    o.pool = pl.has_set[kPoolSet];
+    if (indirect) o.rd.push_back({indirect, indirect + 12});
+    for (const BindingDesc& d : pl.bindings) {
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        const int st = d.nvn_stage;
+        if (st < 0 || st >= 6) return false;
+        switch (d.type) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                switch (b.nvn.source) {
+                    case NvnSource::SupportBuffer: case NvnSource::DriverConstants: case NvnSource::ConstantData: case NvnSource::PushConstants:
+                        break;                                     // written by the CPU (upload memory, constant data)
+                    case NvnSource::UniformBlock: case NvnSource::UniformAsStorage: {
+                        const int idx = b.nvn.index;
+                        if (idx >= 0 && idx < 16 && S.ubo[st][idx].addr) {
+                            const GState::Bind& bd = S.ubo[st][idx];
+                            o.rd.push_back({bd.addr, bd.addr + (bd.size ? bd.size : 65536)});
+                        }
+                        break;
+                    }
+                    case NvnSource::StorageBuffer: {
+                        const int slot = b.nvn.index >= 0 ? b.nvn.index : storage_slot_for(st, b.nvn.c0_offset);
+                        if (slot < 0 || slot >= 16) return false;
+                        if (S.ssbo[st][slot].addr) {
+                            const GState::Bind& bd = S.ssbo[st][slot];
+                            o.wr.push_back({bd.addr, bd.size ? bd.addr + bd.size : UINT64_MAX});
+                        }
+                        break;
+                    }
+                    default: return false;
+                }
+                break;
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
+                if (b.nvn.source == NvnSource::TexturePoolArray) { o.pool = true; break; }
+                if (b.nvn.source == NvnSource::SamplerPoolArray) break;
+                const TexResolved r = resolve_texture(d);
+                if (r.tex) o.img_rd.push_back(cs_img_key(r.tex));
+                break;
+            }
+            case VK_DESCRIPTOR_TYPE_SAMPLER: break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+                const TexResolved r = resolve_image(d);
+                if (r.tex) o.img_wr.push_back(cs_img_key(r.tex));
+                break;
+            }
+            default: return false;                                 // texel buffers (pool memory seen as texels) and anything else
+        }
+    }
+    return true;
+}
+
+bool cs_overlap(const std::vector<CsRange>& a, const std::vector<CsRange>& b) {
+    for (const CsRange& x : a)
+        for (const CsRange& y : b)
+            if (x.a < y.b && y.a < x.b) return true;
+    return false;
+}
+bool cs_has(const std::vector<const void*>& a, const std::vector<const void*>& b) {
+    for (const void* x : a)
+        if (std::find(b.begin(), b.end(), x) != b.end()) return true;
+    return false;
+}
+bool cs_conflict(const CsSet& open, const CsSet& n) {
+    return cs_overlap(n.wr, open.rd) || cs_overlap(n.wr, open.wr) || cs_overlap(n.rd, open.wr) || cs_has(n.img_wr, open.img_rd) ||
+           cs_has(n.img_wr, open.img_wr) || cs_has(n.img_rd, open.img_wr) || (n.pool && !open.img_wr.empty()) || (open.pool && !n.img_wr.empty());
+}
+
+// The open dispatches get their barrier now (unless one was recorded since).
+void cs_close() {
+    if (!g_cs_open) return;
+    g_cs_open = false;
+    if (F && F->cb == g_cs_cb && memory_barrier_count(F->cb) == g_cs_mark) memory_barrier(F->cb);
+    g_cs_open_set.clear();
+}
+
+// Right before the dispatch command: the barrier the open dispatches need, if the new one depends on them.
+void cs_before_dispatch(const ProgLayout& pl, uint64_t indirect) {
+    if (!cs_tracked_on()) return;
+    g_cs_known = cs_collect(pl, indirect, g_cs_new);
+    if (!g_cs_open) return;
+    if (F->cb != g_cs_cb || memory_barrier_count(F->cb) != g_cs_mark) {      // a full barrier lies between: nothing is open any more
+        g_cs_open = false;
+        g_cs_open_set.clear();
+    } else if (!g_cs_known || cs_conflict(g_cs_open_set, g_cs_new)) {
+        memory_barrier(F->cb);
+        ++g_cs_conflicts;
+        g_cs_open = false;
+        g_cs_open_set.clear();
+    } else {
+        ++g_cs_skipped;
+        counters().dispatch_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// After the dispatch (and its shadow copies): the barrier now, or left open.
+void cs_after_dispatch() {
+    if (!cs_tracked_on()) { memory_barrier(F->cb); return; }
+    if (++g_cs_n % 20000 == 0)
+        NXLOG_I("nvn.replay", "dispatch barriers (tracked): %llu dispatches, %llu barriers left out, %llu kept for a dependency, %llu dispatches not tracked",
+                static_cast<unsigned long long>(g_cs_n), static_cast<unsigned long long>(g_cs_skipped), static_cast<unsigned long long>(g_cs_conflicts),
+                static_cast<unsigned long long>(g_cs_untracked));
+    if (!g_cs_known || g_cs_open_set.size() + g_cs_new.size() > 256) {
+        if (!g_cs_known) ++g_cs_untracked;
+        memory_barrier(F->cb);
+        g_cs_open = false;
+        g_cs_open_set.clear();
+        return;
+    }
+    if (!g_cs_open) g_cs_open_set.clear();
+    CsSet& o = g_cs_open_set;
+    o.rd.insert(o.rd.end(), g_cs_new.rd.begin(), g_cs_new.rd.end());
+    o.wr.insert(o.wr.end(), g_cs_new.wr.begin(), g_cs_new.wr.end());
+    o.img_rd.insert(o.img_rd.end(), g_cs_new.img_rd.begin(), g_cs_new.img_rd.end());
+    o.img_wr.insert(o.img_wr.end(), g_cs_new.img_wr.begin(), g_cs_new.img_wr.end());
+    o.pool = o.pool || g_cs_new.pool;
+    g_cs_open = true;
+    g_cs_cb = F->cb;
+    g_cs_mark = memory_barrier_count(F->cb);
+}
+
+// Ops that record no GPU work (state and bindings) or that check the open dispatches themselves keep them open.
+bool cs_keeps_open(Op op) {
+    if (op < Op::DrawArrays) return true;
+    switch (op) {
+        case Op::Dispatch: case Op::DispatchIndirect: case Op::FenceSync: case Op::WaitSync: case Op::CallCommands: case Op::PushDebugGroup:
+        case Op::PopDebugGroup: case Op::PushConstants: case Op::DiscardColor: case Op::DiscardDepthStencil:
+            return true;
+        default: return false;
+    }
+}
+
 void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     const ShaderInfo* cs = S.stage[kCompute];
     TRACE("dispatch %u %u %u indirect %llx cs %s%s%s", x, y, z, static_cast<unsigned long long>(indirect), cs ? cs->hash.c_str() : "-",
@@ -3349,6 +3513,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
         memory_barrier(F->cb);     // the copies into the shadows before the dispatch reads them
         gstamp("shadow in");
     }
+    cs_before_dispatch(*pl, indirect);
     if (indirect) {
         vkCmdDispatchIndirect(F->cb, ind.buffer, ind.offset);
     } else {
@@ -3356,7 +3521,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
         if (gpass_on()) gstamp(("cs " + cs->hash.substr(0, 8)).c_str());
     }
     shadows_after_dispatch();
-    memory_barrier(F->cb);
+    cs_after_dispatch();
     if (g_trace) trace_snap_after_dispatch(*cs, *pl);
     g_cs_c0 = UploadAlloc();
     g_dirty = kAllDirty;
@@ -3860,6 +4025,7 @@ void run_list(const CmdList& list, int depth) {
     counters().lists_replayed.fetch_add(1, std::memory_order_relaxed);
     for (RecordReader r(list); r.next();) {
         mark_dirty(r);
+        if (g_cs_open && !cs_keeps_open(r.op())) cs_close();
         {
             RsScope rs(kRsOut);
             if (out_lazy()) out_before_op(r);                                               // compute shadows: results back to the pool first
@@ -4167,7 +4333,7 @@ void run_list(const CmdList& list, int depth) {
                 }
                 break;
             }
-            case Op::Barrier: end_pass(); memory_barrier(F->cb); break;
+            case Op::Barrier: end_pass(); memory_barrier(F->cb); counters().game_barriers.fetch_add(1, std::memory_order_relaxed); break;
             case Op::FenceSync: {
                 const auto& p = r.payload<P_Sync>();
                 if (p.sync) { p.sync->serial.store(F->serial); p.sync->armed.store(true); }
@@ -4344,6 +4510,8 @@ void replay_begin_submit(Frame& f) {
         set_narrow_barriers(g_tracked);
         g_pending.clear();
         g_pass_unsafe = false;
+        g_cs_open = false;
+        g_cs_open_set.clear();
         mirror_begin_submit(f, on);
     }
     S.window_origin = window_origin_mode();
@@ -4417,6 +4585,7 @@ void fb_sweep(uint64_t serial) {
 
 void replay_end_submit(Frame& f) {
     F = &f;
+    cs_close();
     if (out_any()) {         // every compute result is in game memory, or held and guarded, before the submission's serial signals
         end_pass();
         out_end_submit(F->cb, F->serial);
@@ -4446,6 +4615,8 @@ void replay_end_submit(Frame& f) {
 // submission end a pass, query or label it never began is cleared.
 void replay_abort_submit() {
     P.open = false;
+    g_cs_open = false;
+    g_cs_open_set.clear();
     g_xfb_began = false;
     g_pending.clear();
     g_occ_active = -1;
