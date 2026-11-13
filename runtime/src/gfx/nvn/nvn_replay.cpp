@@ -1267,17 +1267,25 @@ void prepare_textures(const ProgLayout& pl) {
     static const int64_t backlog_n = config_get_int("nvn", "pool_upload_backlog", 64);
     static uint64_t budget_present = ~0ull;
     static std::chrono::steady_clock::duration spent{}, cap{};
+    static bool burst = false;
     const uint64_t now_p = counters().presents.load(std::memory_order_relaxed);
     if (now_p != budget_present) {
         budget_present = now_p;
         spent = std::chrono::steady_clock::duration::zero();
-        cap = std::chrono::milliseconds(std::max<int64_t>(0, static_cast<int64_t>(pool_held_backlog()) > backlog_n ? std::max(pool_ms, burst_ms) : pool_ms));
+        burst = static_cast<int64_t>(pool_held_backlog()) > backlog_n;
+        cap = std::chrono::milliseconds(std::max<int64_t>(0, burst ? std::max(pool_ms, burst_ms) : pool_ms));
     }
     // What the budget covers: the first uploads of pool-only asset textures (held for later frames, pool_hold), and the swaps of a stand-in
     // on screen for its finished result ([nvn] pool_swap_budget, default on), bound or pool: the image already holds valid (approximate) data,
     // so a swap can wait a frame anywhere; at a load-in a thousand results land within a second or two and their copies piled into one frame.
     static const bool swap_budget = config_get_bool("nvn", "pool_swap_budget", true);
-    auto budgeted = [&](Texture* t, size_t i) { return pool_ms > 0 && ((i >= pool_from && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t))); };
+    // [nvn] bound_upload_defer (default on): while a backlog streams in (burst), first uploads of asset textures a draw binds itself wait too;
+    // the draw samples the dummy texture until theirs is in (descriptor resolution below). A load-in's first frame still made 583 uploads, most
+    // of them bound, in 582 ms (s2-default). Outside a burst bound textures always go at once.
+    static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", true);
+    auto budgeted = [&](Texture* t, size_t i) {
+        return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)));
+    };
     if (pool_ms > 0 && !need.empty()) {
         if (spent >= cap) {
             // the frame's budget is spent: what it covers leaves the list before the pass is ended for it (each draw that indexes the pools
@@ -1975,7 +1983,9 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
             }
             // a compute dispatch is never inside the graphics pass: a colour attachment of the last pass is an ordinary texture to it
             const bool feedback = r.tex && d.nvn_stage != kCompute && is_color_feedback(r.tex);
-            if (r.tex && tex_gpu(r.tex) && !feedback) {
+            // a first upload held back for a later frame ([nvn] bound_upload_defer): its image holds nothing yet, the dummy stands in
+            const bool waiting = r.tex && tex_layout(r.tex) == VK_IMAGE_LAYOUT_UNDEFINED && tex_first_upload_deferrable(r.tex);
+            if (r.tex && !waiting && tex_gpu(r.tex) && !feedback) {
                 ViewRequest q = make_request(b, r);
                 if (int_comp) q.component = int_comp;
                 VkImageView v = tex_sampled_view(r.tex, q);
