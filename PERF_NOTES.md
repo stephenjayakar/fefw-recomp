@@ -310,3 +310,20 @@ stays at 64.
 street_cold clean again: 12 frames over 33 ms (stutter-4 531, stutter-3 20); hub_cold 542 frames over 20 ms, worst 40 ms; the load-in
 upload frame 361 ms (426 uploads; stutter-4 295 ms / 173 uploads): the 256 trigger starts the burst later. stutter-6 (ea6cb89): the
 in-frame trigger is 64 for 30 presents after a loading screen ends, 256 otherwise.
+
+### Stutter track: where it stands (13 Nov, 16:00)
+
+Merged into perf-stutter by the tester: stutter-1 (7d72d56, deployed live), stutter-3 (10cf072, live as fc93a41), stutter-5 (309d84a, in
+bdd8f2f). Queued: stutter-6 (ea6cb89, the early load-in burst).
+
+| 4K hub scenario, gameplay frames | upstream 0.1.7 (b3) | perf-stutter 58b8c8c (b2) | stutter-5 (s5) |
+|---|---|---|---|
+| menu_to_world worst load-in upload frame | 3828 ms | 17942 ms | 361 ms (s4: 295) |
+| hub_cold frames > 100 ms / worst | 1 / 192 ms | 1 / 216 ms | 0 / 40 ms |
+| hub_cold frames > 20 ms | 415 | 531 | 542 |
+| street_cold frames > 33 ms | 15 | 24 | 12 |
+| render-thread BC7 cache reads | thousands | 1365 | 0 |
+
+Not met, and not runtime work: the area-transition / fast-travel arrival frames of 400-500 ms (the game's main thread in game code,
+85-95% of the samples in lifted guest functions, zstd-like decompression under romfs reads), and loading-screen frames of 300-500 ms
+("stall while pipelines build": also game code). The battle scenario holds 60 fps with 1% lows of 58+ (bt-s4).
