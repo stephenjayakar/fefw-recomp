@@ -103,7 +103,14 @@ void loop() {
         if (s.hitch_ms > 0) {           // slow frames only: the frame in progress must be at least hitch_ms old
             uint64_t frames = 0;
             double age = 0;
-            if (!hitch_frame_age(&frames, &age) || age < s.hitch_ms) continue;
+            if (!hitch_frame_age(&frames, &age) || age < s.hitch_ms) {
+                // written out between slow frames too: a run that is closed without a normal shutdown keeps its last slow frames
+                if (!s.agg.empty() && std::chrono::steady_clock::now() - last_flush > std::chrono::seconds(1)) {
+                    flush_samples(s);
+                    last_flush = std::chrono::steady_clock::now();
+                }
+                continue;
+            }
             char nm[32];
             std::snprintf(nm, sizeof nm, "f%llu", static_cast<unsigned long long>(frames + 1));
             std::lock_guard<std::mutex> lk(s.lm);
