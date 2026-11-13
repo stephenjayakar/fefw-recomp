@@ -314,4 +314,8 @@ cube and write their own level; the texture binding of the written cube is used 
 |---|---|---|
 | gpu-1 | baseline + toggles (62a508e) | g1 failed (my trace list: each traced frame stalls ~25 s); g2 (all toggles): real GPU 13.7-16.0 ms/frame hub/street, ~550 full barriers/frame, 170-185 dispatches; `tracked_draws` never engaged (game barrier after every dispatch closed them) |
 | gpu-1 result | g1b (baseline) vs g2 (five toggles) | GPU hub_cold 15.02 -> 14.28 ms, street_cold 15.31 -> 14.88 ms, full barriers 768 -> 541/frame; no visual differences (PSNR as between any two runs); fps unchanged (game-thread bound); nvn-render CPU +0.4 ms/frame |
-| gpu-2 | clean A/B + probe concurrency + trace_trigger (ff4bbb3) | queued 13 Nov |
+| gpu-2 | A (stats) vs B (five toggles), a7df953 | GPU hub_cold 15.11 -> 10.88 ms/frame, street_cold 15.02 -> 10.85 (-28%); busiest crowd windows avg 16.6 -> 12.4, p99 19.1 -> 15.0; full barriers 768 -> 378/frame; 1.95M of 2.94M dispatch barriers left out; render CPU unchanged; no visual differences. fps unchanged (game thread 16.7-20.7 ms) |
+| gpu-3 | soak of the recommended set (battle map, long run) + pass profile, 622901f | queued 13 Nov |
+
+Recommended set (after the gpu-3 soak, then as defaults): `dispatch_barriers = tracked` (`tracked_draws` never met a draw after an open
+dispatch), `game_barriers = tracked`, `batch_ubo_updates = true`, `feedback_levels = true`, `depth_ro_sticky = true`.
