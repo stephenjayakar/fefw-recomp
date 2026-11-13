@@ -48,7 +48,8 @@ ZIG = os.path.join(HERE, 'zig', 'zig.exe' if WINDOWS else 'zig')
 FORMAT = 2          # bump when the build layout or the stamp changes: older builds (partial or done) are then started over
 # the lifter as game-build/scripts/make-release.ps1 ships it: paths under RECOMP, the same in the zip (tools/build/recomp/...)
 # and in the repo (recomp/...)
-LIFTER = ['nxrecomp', 'include/nxrecomp', 'games/fefw/CMakeLists.txt', 'games/fefw/config.py', 'games/fefw/hot.txt']
+LIFTER = ['nxrecomp', 'include/nxrecomp', 'games/fefw/CMakeLists.txt', 'games/fefw/config.py', 'games/fefw/hot.txt',
+          'games/fefw/inline.txt']
 SITES = 'games/fefw/main.sites'
 # what the link takes from sdk/ besides the lifted objects and fefw_rt.lib (stamped on its own, as 'runtime')
 SDK_FILES = ['fefw_stub.cpp', 'fefw_rt_api.h', 'fefw_fma.c', 'fefw.rc', 'fefw.manifest', 'fefw.ico']
@@ -87,9 +88,20 @@ CXXFLAGS_COMMON = ['-std=c++20', '-O1', '-g0', '-fomit-frame-pointer', '-w', '-f
                    '-fno-threadsafe-statics', '-DNX_INLINE_INDIRECT']
 
 
+# Profile-guided builds (developer option, perf/codegen): --pgo-gen <profile runtime .a> builds an instrumented fefw.exe (IR PGO; its
+# stub writes the counters to LLVM_PROFILE_FILE every 15 s, since the game ends with TerminateProcess); --pgo-use <.profdata> builds
+# with that profile. The lifted sources must be the same in both builds (same package). --mcpu overrides the variant's -mcpu.
+PGO = {'gen': None, 'use': None, 'mcpu': None}
+
+
 def cxxflags(variant):
     """The compile flags of the lifted code for a CPU_VARIANTS key ('fma': the flags every release before 0.1.7 used)."""
-    return ['-target', 'x86_64-windows-gnu', '-mcpu=' + CPU_VARIANTS[variant]['mcpu']] + CXXFLAGS_COMMON
+    extra = []
+    if PGO['gen']:
+        extra.append('-fprofile-generate')
+    if PGO['use']:
+        extra += ['-fprofile-use=' + PGO['use'], '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled']
+    return ['-target', 'x86_64-windows-gnu', '-mcpu=' + (PGO['mcpu'] or CPU_VARIANTS[variant]['mcpu'])] + CXXFLAGS_COMMON + extra
 CREATE_NO_WINDOW = 0x08000000
 BELOW_NORMAL = 0x00004000
 
@@ -507,8 +519,10 @@ def link(runner, obj, game, env, variant):
         extra.append(o)
     tmp = os.path.join(obj, 'fefw.exe')
     # FEFW_CPU_NEEDS: what fefw_rt.dll checks the processor for before the game starts (fefw_rt_api.h)
-    cmd = [ZIG, 'c++', '-target', 'x86_64-windows-gnu', '-mcpu=x86_64+cx16', '-O1', '-fno-exceptions', '-fno-rtti', '-I', SDK,
-           '-DFEFW_CPU_NEEDS=' + CPU_VARIANTS[variant]['needs'], os.path.join(SDK, 'fefw_stub.cpp'), os.path.join(SDK, 'fefw.rc')] +         extra + libs + [os.path.join(SDK, 'fefw_rt.lib'), '-o', tmp, '-Wl,--stack,134217728', '-Wl,--subsystem,windows']
+    cmd = ([ZIG, 'c++', '-target', 'x86_64-windows-gnu', '-mcpu=x86_64+cx16', '-O1', '-fno-exceptions', '-fno-rtti', '-I', SDK,
+            '-DFEFW_CPU_NEEDS=' + CPU_VARIANTS[variant]['needs']] + (['-DFEFW_PGO_GEN'] if PGO['gen'] else []) +
+           [os.path.join(SDK, 'fefw_stub.cpp'), os.path.join(SDK, 'fefw.rc')] + extra + libs + ([PGO['gen']] if PGO['gen'] else []) +
+           [os.path.join(SDK, 'fefw_rt.lib'), '-o', tmp, '-Wl,--stack,134217728', '-Wl,--subsystem,windows'])
     rc, tail = runner.run(cmd, env=env, cwd=SDK)
     if rc != 0:
         raise Fail('Linking fefw.exe failed (exit %d):\n%s' % (rc, tail))
@@ -527,8 +541,14 @@ def main():
     ap.add_argument('--keep', action='store_true', help='keep the generated sources and objects')
     ap.add_argument('--check', action='store_true', help='only say whether <game>/build/done.json matches these tools')
     ap.add_argument('--cpu', default='auto', help='the build for the processor: fma, compat or auto (CPU_VARIANTS)')
+    ap.add_argument('--pgo-gen', help='developer: build instrumented for a profile, linking this profile runtime library (.a)')
+    ap.add_argument('--pgo-use', help='developer: build with this profile (.profdata)')
+    ap.add_argument('--mcpu', help='developer: -mcpu for the lifted code instead of the variant one (e.g. znver2: this PC only)')
     ap.add_argument('--lift-one', help=argparse.SUPPRESS)
     a = ap.parse_args()
+    PGO['gen'] = os.path.abspath(a.pgo_gen) if a.pgo_gen else None
+    PGO['use'] = os.path.abspath(a.pgo_use) if a.pgo_use else None
+    PGO['mcpu'] = a.mcpu
     if a.lift_one:                       # child process: one lifter run (keeps the lifter's own pool out of this process)
         sys.path.insert(0, RECOMP)
         from nxrecomp.__main__ import main as nx_main

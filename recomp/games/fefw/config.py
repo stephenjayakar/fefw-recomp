@@ -47,6 +47,8 @@ class Config(GameConfig):
     }
     # hot code packed together (guest entries from the perf push's profiles, hottest first; see hot.txt's header)
     hot_order = 'hot.txt'
+    # small hot callees copied into their hot callers' translation units (inline.txt's header)
+    inline_edges = 'inline.txt'
     # rtld's process entry (0x0): this rtld has an FDE there, Pokopia's has none; listed so discovery roots it either way
     extra_entries = {'rtld': [0x0]}
     patches = None

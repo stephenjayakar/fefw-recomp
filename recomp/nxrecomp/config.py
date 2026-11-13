@@ -50,6 +50,10 @@ class GameConfig:
     # `.text$nxh<rank>` section, which the linker places together in rank order (hot code packed for the instruction cache and TLB)
     hot_order = None
 
+    # file (relative to recomp/games/<name>/) of `<caller> <callee>` guest entries: the callee gets a `static` copy (fi_<callee>) in
+    # the caller's translation unit and the caller calls that, so the host compiler can inline it across shards. Same code.
+    inline_edges = None
+
     # function-level optimisation of the generated C++ (nxrecomp/opt.py), a tuple of: 'flags' (NZCV in locals and never stored
     # across calls and returns, which the AAPCS64 leaves undefined; 'flagsafe': in locals but kept in the context too), 'vstore'
     # (a scalar result into a V register as one whole-register store), 'xregs' / 'vregs' (X / V registers in locals, loaded at the

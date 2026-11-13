@@ -104,7 +104,7 @@ Put "$root\tools\nso\nso_unpack.py" 'tools\build\nso_unpack.py'
 Put "$root\recomp\LICENSE" 'tools\build\recomp\LICENSE'
 Mirror "$root\recomp\nxrecomp" 'tools\build\recomp\nxrecomp' @('*__pycache__*', '*.pyc')
 Mirror "$root\recomp\include\nxrecomp" 'tools\build\recomp\include\nxrecomp'
-foreach ($f in 'CMakeLists.txt', 'config.py', 'main.sites', 'hot.txt') { Put "$root\recomp\games\fefw\$f" "tools\build\recomp\games\fefw\$f" }
+foreach ($f in 'CMakeLists.txt', 'config.py', 'main.sites', 'hot.txt', 'inline.txt') { Put "$root\recomp\games\fefw\$f" "tools\build\recomp\games\fefw\$f" }
 Put "$root\tools\shaders\ampere\extract_corpus.py" 'tools\shaders\extract_corpus.py'
 (Get-Content -Raw "$root\game-build\release\README.txt").Replace('@VERSION@', $Version) | Set-Content -NoNewline (Join-Path $pkg 'README.txt')
 Put "$root\LICENSE" 'LICENSE.txt'

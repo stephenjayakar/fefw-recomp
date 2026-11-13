@@ -17,6 +17,7 @@ import bisect
 import collections
 import multiprocessing
 import os
+import re
 import struct
 import sys
 import time
@@ -152,6 +153,14 @@ class Env:
         self.replace_mismatch = []    # GameConfig.inline_replace entries whose words did not match (lifted as usual)
         # hot code layout (GameConfig.hot_order): guest entry -> rank
         self.hot_rank = {}
+        # cross-shard inlining (GameConfig.inline_edges): caller -> [callees] that get a static copy in the caller's shard
+        self.inline_edges = {}
+        if self.cfg.inline_edges and getattr(self.cfg, 'dir', None):
+            with open(os.path.join(self.cfg.dir, self.cfg.inline_edges)) as f:
+                for line in f:
+                    t = line.split('#', 1)[0].split()
+                    if len(t) == 2:
+                        self.inline_edges.setdefault(int(t[0], 16), []).append(int(t[1], 16))
         if self.cfg.hot_order and getattr(self.cfg, 'dir', None):
             with open(os.path.join(self.cfg.dir, self.cfg.hot_order)) as f:
                 for line in f:
@@ -312,9 +321,10 @@ def lift_function(env, entry):
         if shndx:                                    # symbol defined inside this module
             tgt = env.base + value
             env.wanted.setdefault(tgt, None)
-            return 'void f_%x(Ctx *__restrict c) { f_%x(c); }' % (entry, tgt), 0, [], []
+            return '%svoid f_%x(Ctx *__restrict c) { f_%x(c); }' % (env.section_attr(entry), entry, tgt), 0, [], []
         env.imports.add(env.plt_symbol(entry))
-        return 'void f_%x(Ctx *__restrict c) { host_import(c, NX_IMPORT_ID(%d, %d)); }' % (entry, env.module_index, sym), 0, [], []
+        return ('%svoid f_%x(Ctx *__restrict c) { host_import(c, NX_IMPORT_ID(%d, %d)); }'
+                % (env.section_attr(entry), entry, env.module_index, sym), 0, [], [])
     rep = env.cfg.inline_replace.get(entry)
     if rep is not None:
         body, words = rep
@@ -467,12 +477,38 @@ def _worker_text(entries):
     texts, resume, insns = [], [], 0
     env.opt_flag_notes = []
     env.replace_mismatch = []
+    copies = {}                       # callee -> its static copy for this shard (GameConfig.inline_edges)
     for a in entries:
         t, n, _, r = lift_function(env, a)
+        for callee in env.inline_edges.get(a, ()):
+            if callee not in copies:
+                copies[callee] = inline_copy(env, callee)
+            if copies[callee]:
+                t = re.sub(r'\bf_%x\(c\);' % callee, 'fi_%x(c);' % callee, t)
         texts.append(t)
         resume += r
         insns += n
-    return '\n\n'.join(texts), resume, insns, (env.opt_flag_notes, env.replace_mismatch)
+    pre = [c for c in copies.values() if c]
+    return '\n\n'.join(pre + texts), resume, insns, (env.opt_flag_notes, env.replace_mismatch)
+
+
+def inline_copy(env, callee):
+    """A `static` copy fi_<callee> of a lifted function for the callers in this shard (GameConfig.inline_edges), so the host compiler
+    can inline it there: the same text under another name. None for what is not a plain single-entry function of this module."""
+    if not (env.text_lo <= callee < env.text_hi) or callee not in env.ends or callee in env.cfg.inline_replace:
+        return None
+    if env.plt_entry(callee) or callee in env.sites['entryhook'] or callee in env.sites['noinline'] or callee in env.sites['midhook']:
+        return None
+    saved = env.wanted, env.opt_flag_notes, env.replace_mismatch
+    env.wanted, env.opt_flag_notes, env.replace_mismatch = collections.OrderedDict(), [], []
+    t, n, _, r = lift_function(env, callee)
+    env.wanted, env.opt_flag_notes, env.replace_mismatch = saved
+    head = 'void f_%x(Ctx *__restrict c) {' % callee
+    if t.startswith('__attribute__((section('):
+        t = t[t.index(')))') + 4:]
+    if r or n > 400 or not t.startswith(head) or t.count('\nvoid ') or 'L_dispatch' in t:
+        return None
+    return 'static inline void fi_%x(Ctx *__restrict c) {' % callee + t[len(head):]
 
 
 def _write_if_changed(path, content):
