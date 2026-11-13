@@ -66,6 +66,11 @@ bool take(Texture* t, PreparedTexture& out, gfx::Buffer* staged = nullptr, uint6
 bool wants_provisional(Texture* t);
 void provisional_uploaded(Texture* t);
 void final_uploaded(Texture* t);
+// Render thread. standin_on_screen: the image holds a stand-in of the texture's current content (tex_async = standin). standin_kept: an upload of
+// such a texture found no result of its job; the stand-in stays and the job is queued again at the front unless one is queued, running or done
+// for this content (its end marks the texture dirty, and the next use uploads the result). Nothing is prepared on the render thread for it.
+bool standin_on_screen(Texture* t);
+void standin_kept(Texture* t);
 // Any thread: hash of the texture's storage as take checks it (false: no storage or a page is gone).
 bool hash_storage(const Texture& t, uint64_t& h);
 // The GPU layer is going away (gpu::tex_shutdown): finished results give their upload buffers back and no new ones are made until reopen_staging.

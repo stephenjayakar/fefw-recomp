@@ -2021,6 +2021,15 @@ void tex_ensure_current(Texture* t, Frame& f) {
             staged = gfx::Buffer{};
         }
     }
+    // The image already holds a stand-in of this content and its job has no result yet (still queued or running, or its result was lost): the
+    // stand-in stays and the job goes (again) to the front of the queue; its end marks the texture dirty. Before, this prepared the texture here
+    // (a cache read or a transcode on the render thread, 3.4 s of them in one frame of a 4K first visit). Not for a copy or a clear (exact).
+    // [nvn] standin_keep = false: prepared here as before.
+    static const bool standin_keep = nxrt::config_get_bool("nvn", "standin_keep", true);
+    if (!ok && standin_keep && g->uploaded && !g->gpu_written && !texprep::exact_thread() && texprep::standin_on_screen(t)) {
+        texprep::standin_kept(t);
+        return;
+    }
     if (!ok) {
         static const uint16_t zid = ft::zone_id("tex.prepare");
         ft::Scope zs(zid, 30000, t->id);
