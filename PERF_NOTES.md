@@ -265,4 +265,5 @@ cube and write their own level; the texture binding of the written cube is used 
 | request | what | result |
 |---|---|---|
 | gpu-1 | baseline + toggles (62a508e) | g1 failed (my trace list: each traced frame stalls ~25 s); g2 (all toggles): real GPU 13.7-16.0 ms/frame hub/street, ~550 full barriers/frame, 170-185 dispatches; `tracked_draws` never engaged (game barrier after every dispatch closed them) |
-| gpu-2 | clean A/B + probe concurrency (a7df953) | queued 13 Nov |
+| gpu-1 result | g1b (baseline) vs g2 (five toggles) | GPU hub_cold 15.02 -> 14.28 ms, street_cold 15.31 -> 14.88 ms, full barriers 768 -> 541/frame; no visual differences (PSNR as between any two runs); fps unchanged (game-thread bound); nvn-render CPU +0.4 ms/frame |
+| gpu-2 | clean A/B + probe concurrency + trace_trigger (ff4bbb3) | queued 13 Nov |
