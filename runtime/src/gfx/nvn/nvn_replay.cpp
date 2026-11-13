@@ -1294,6 +1294,10 @@ void prepare_textures(const ProgLayout& pl) {
         if (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform && b.nvn.source != NvnSource::ImageBinding) continue;
         TexResolved r = resolve_texture(d);
         if (!r.tex) continue;
+        if (!r.tex->gpu && tex_first_upload_deferrable(r.tex)) {   // an asset with no image yet: made when its upload runs (it may wait)
+            need.push_back(r.tex);
+            continue;
+        }
         if (!tex_gpu(r.tex)) continue;
         // owned by the pass; a compute dispatch runs outside every pass, so the graphics attachments do not own what it samples
         if (shares_image(r.tex, S.depth_tex.get()) || (d.nvn_stage != kCompute && is_color_feedback(r.tex))) continue;
@@ -1339,10 +1343,12 @@ void prepare_textures(const ProgLayout& pl) {
     static uint64_t budget_present = ~0ull;
     static std::chrono::steady_clock::duration spent{}, cap{};
     static bool burst = false;
+    static std::unordered_set<Texture*> firsts_frame;   // distinct textures whose first upload the draws of this frame needed
     const uint64_t now_p = counters().presents.load(std::memory_order_relaxed);
     if (now_p != budget_present) {
         budget_present = now_p;
         spent = std::chrono::steady_clock::duration::zero();
+        firsts_frame.clear();
         burst = static_cast<int64_t>(pool_held_backlog()) > backlog_n;
         cap = std::chrono::milliseconds(std::max<int64_t>(0, burst ? std::max(pool_ms, burst_ms) : pool_ms));
     }
@@ -1354,18 +1360,29 @@ void prepare_textures(const ProgLayout& pl) {
     // the draw samples the dummy texture until theirs is in (descriptor resolution below). A load-in's first frame still made 583 uploads, most
     // of them bound, in 582 ms (s2-default). Outside a burst bound textures always go at once.
     static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", true);
-    // a draw that needs more than pool_upload_backlog first uploads (the first frame after a loading screen) starts the burst at once
-    if (pool_ms > 0 && !burst && need.size() > static_cast<size_t>(std::max<int64_t>(0, backlog_n))) {
-        size_t firsts = 0;
+    // more than pool_upload_burst_firsts first uploads needed by this frame's draws so far (the first frame after a loading screen, spread
+    // over many draws) start the burst at once; s3-default's load-in frame still made 576 uploads with a per-draw count
+    // [nvn] pool_upload_burst_firsts (default 256): the threshold of this count. 64 also fired while walking into a cold street (s4-default:
+    // a minute of 24 ms upload frames, 531 frames over 33 ms); a load-in needs several hundred at once.
+    static const int64_t firsts_n = config_get_int("nvn", "pool_upload_burst_firsts", 256);
+    if (pool_ms > 0 && !burst) {
+        const size_t lim = static_cast<size_t>(std::max<int64_t>(0, firsts_n));
         for (Texture* t : need)
-            if (tex_first_upload_deferrable(t) && ++firsts > static_cast<size_t>(backlog_n)) break;
-        if (firsts > static_cast<size_t>(backlog_n)) {
+            if (tex_first_upload_deferrable(t)) {
+                firsts_frame.insert(t);
+                if (firsts_frame.size() > lim) break;
+            }
+        if (firsts_frame.size() > lim) {
             burst = true;
             cap = std::chrono::milliseconds(std::max(pool_ms, burst_ms));
         }
     }
+    // [nvn] burst_defer_uncompressed (default off): during a burst, pool-only first uploads of uncompressed textures (UI images, look-up
+    // tables: their pool element is the dummy meanwhile, which can show as a wrong colour for a few frames) wait as well
+    static const bool burst_uncompressed = config_get_bool("nvn", "burst_defer_uncompressed", false);
     auto budgeted = [&](Texture* t, size_t i) {
-        return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)));
+        return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)) ||
+                               (burst && burst_uncompressed && i >= pool_from && tex_first_upload_uncompressed_deferrable(t)));
     };
     if (pool_ms > 0 && !need.empty()) {
         if (spent >= cap) {

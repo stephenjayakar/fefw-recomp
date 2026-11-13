@@ -282,6 +282,29 @@ went from 729 to 452 ms. street_cold / hub_warm / street_warm worst frames 457 /
 stutter-3 (58d4987): during a burst, first uploads of textures the draws bind themselves wait too (the dummy is sampled meanwhile), and a
 draw needing more than 64 first uploads starts the burst at once.
 
+stutter-3 also has: 14be59c (the render thread's prepared data reuses one buffer: load-in frames showed 190k-540k page faults) and
+10cf072 (a 64 MiB pool-copy chunk made ahead on a worker; the 277 ms street_warm arrival frame spent ~54 ms making one).
+
+What is left after stutter-2, by the profile: the area-transition frames (street_cold 457 ms at the hub -> street change, hub_warm 278,
+street_warm 421 + loading-screen frames of 436-695 ms) are the game's main thread on the CPU in game code, 85-95% of the samples in lifted
+guest functions (f_71000cd800 / f_71000d3ee0 under romfs reads in several of them, which look like zstd decompression; zstd is statically
+linked into `main`). A runtime-only fix would need an entry hook site at those functions, i.e. a relift of fefw.exe: out of scope for a
+drop-in DLL.
+
+#### stutter-3 result (s3-default, 10cf072)
+
+menu_to_world load-in frame 397 ms (stutter-2 583, stutter-1 892, upstream 3828); hub_cold 56.3 / 35.3 fps, 591 frames over 20 ms, worst
+37 ms; area-transition frames 414-499 ms (game code). The load-in frame still made 576 uploads: its first uploads were spread over many
+draws, none above the per-draw trigger. stutter-4 (da103d3): the burst starts once the frame's draws needed more than 64 distinct first
+uploads.
+
+#### stutter-4 result (s4-default, a121890) and stutter-5
+
+The menu_to_world load-in upload frame 295 ms (stutter-3 397), but street_cold regressed: 531 frames over 33 ms in the first minute of the
+street (stutter-3: 20), render thread 14.4 ms/frame (11.5): the in-frame burst trigger at 64 distinct first uploads also fired while
+walking into the cold street. stutter-5 (afc5697): that trigger at 256 (`pool_upload_burst_firsts`); the previous-frame backlog trigger
+stays at 64.
+
 ## 6. GPU track (branch `perf/gpu`)
 
 Goal: GPU time per frame comfortably under 16.6 ms at native 3840x2160 (render ratio 1.0, no upscaler) on the RTX 3080 10 GB, in
