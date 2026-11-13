@@ -269,6 +269,9 @@ bool tex_pool_preparation_pending(Texture* t);
 // (ASTC or BCn from the game's memory) whose image never held content, is not rendered to, and is not a depth image. Its pool element is the dummy
 // until then. Render thread.
 bool tex_first_upload_deferrable(Texture* t);
+// The image holds a stand-in of the texture's current content and the texture is waiting for its upload (its job's result is there, or the
+// render thread will keep the stand-in): the swap may wait a frame (the pool upload budget). Render thread.
+bool tex_standin_swap_pending(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
 // A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the

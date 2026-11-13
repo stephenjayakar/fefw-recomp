@@ -1273,19 +1273,29 @@ void prepare_textures(const ProgLayout& pl) {
         spent = std::chrono::steady_clock::duration::zero();
         cap = std::chrono::milliseconds(std::max<int64_t>(0, static_cast<int64_t>(pool_held_backlog()) > backlog_n ? std::max(pool_ms, burst_ms) : pool_ms));
     }
-    if (pool_ms > 0 && pool_from < need.size()) {
+    // What the budget covers: the first uploads of pool-only asset textures (held for later frames, pool_hold), and the swaps of a stand-in
+    // on screen for its finished result ([nvn] pool_swap_budget, default on), bound or pool: the image already holds valid (approximate) data,
+    // so a swap can wait a frame anywhere; at a load-in a thousand results land within a second or two and their copies piled into one frame.
+    static const bool swap_budget = config_get_bool("nvn", "pool_swap_budget", true);
+    auto budgeted = [&](Texture* t, size_t i) { return pool_ms > 0 && ((i >= pool_from && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t))); };
+    if (pool_ms > 0 && !need.empty()) {
         if (spent >= cap) {
-            // the frame's budget is spent: the held-back textures leave the list before the pass is ended for them (each draw that indexes
-            // the pools would otherwise break the render pass for uploads it then skips)
-            const size_t before = need.size();
-            need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(),
-                                      [](Texture* t) {
-                                          if (!tex_first_upload_deferrable(t)) return false;
-                                          pool_hold(t);   // out of the lists the next draws of this frame look through
-                                          return true;
-                                      }),
-                       need.end());
-            g_pool_uploads_deferred.fetch_add(before - need.size(), std::memory_order_relaxed);
+            // the frame's budget is spent: what it covers leaves the list before the pass is ended for it (each draw that indexes the pools
+            // would otherwise break the render pass for uploads it then skips); pool-only first uploads are held until the frame ends
+            size_t kept = 0, kept_before_pool = 0, dropped = 0;
+            for (size_t i = 0; i < need.size(); ++i) {
+                Texture* t = need[i];
+                if (budgeted(t, i)) {
+                    if (i >= pool_from) pool_hold(t);   // out of the lists the next draws of this frame look through
+                    ++dropped;
+                    continue;
+                }
+                if (i < pool_from) ++kept_before_pool;
+                need[kept++] = t;
+            }
+            need.resize(kept);
+            pool_from = kept_before_pool;
+            g_pool_uploads_deferred.fetch_add(dropped, std::memory_order_relaxed);
         } else if (pool_from + 1 < need.size()) {
             // the textures whose background result is ready go first: an upload buffer to adopt costs far less than a stand-in or a CPU untile,
             // and the others get more time for their jobs
@@ -1299,10 +1309,10 @@ void prepare_textures(const ProgLayout& pl) {
     counters().pass_breaks.fetch_add(1, std::memory_order_relaxed);
     for (size_t i = 0; i < need.size(); ++i) {
         Texture* t = need[i];
-        const bool slice = pool_ms > 0 && i >= pool_from && tex_first_upload_deferrable(t);
+        const bool slice = budgeted(t, i);
         if (slice && spent >= cap) {
             g_pool_uploads_deferred.fetch_add(1, std::memory_order_relaxed);
-            pool_hold(t);
+            if (i >= pool_from) pool_hold(t);
             continue;
         }
         const auto t0 = slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
