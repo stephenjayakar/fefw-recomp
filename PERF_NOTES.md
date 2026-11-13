@@ -236,6 +236,7 @@ pacing. Test requests go to `tmp/fefw-perf/queue/cpu-<n>/`.
 | `core: import, HLE thunk and SVC call counters per thread ...` + `core: host_import resolves target and name in one lookup` + `d50e1ac` (import counter as a plain per-thread block) | Every cross-module call, HLE thunk call and SVC bumped a shared atomic; now each thread counts into its own block (`include/nxrt/tl_counts.h`), summed on read, and host_import resolves target and name in one lookup. | always on (same counts in reports) |
 | `nvn: command lists reserve their last size up front ...` | A command buffer's next list reserves the bytes and held objects of its last one (decaying hint, capped), so a big list is not grown and copied a dozen times while main records it. | always on |
 | `nvn: tex_sampled_view remembers the last sampled-format check ...` | The per-image `std::map<VkFormat,bool>` lookup per descriptor is skipped when the format is the last one checked. | always on |
+| `nvn: [nvn] out_memo_dirty ...` | A draw checks only the buffer slots bound since the last draw against held compute results (every slot after a program bind, a change of the held set, or an unmemoised slot). `[nvn] rt_check = 1` verifies the skipped slots. | `[nvn] out_memo_dirty = true` |
 
 Tools: `tmp/fefw-perf/cpu/prof_fold.py <folded> <fefw_rt.map>` resolves sampled `fefw_rt.dll` offsets and prints per-thread self and
 inclusive tables.
@@ -267,3 +268,40 @@ inclusive tables.
   size as 0.1.7's. The game code is already -O2. Remaining compiler levers for the game thread: a profile-guided build (instrumented
   exe, a profiling run of the real scenes, rebuild with the profile; typical 10-20 % on branchy code; several hours of build and
   test time), or a native-ISA variant (`-mcpu=znver2`: LZCNT for the guest's CLZ, BMI2 shifts; a few % at most).
+
+- cpu-3 (tester window 5, DLL 0c04e18): A3b (all the small savings) vs cpu-1 A2: neutral (street render work 12.7 -> 12.3 ms, game
+  work the same, stills fine). C (`render_priority = highest`, `tex_prep_priority = below`, clean): hub_cold 56.2 / 1 % low 36.4,
+  about the clean merged baseline; neutral to a slight plus in one run (confirmation queued as cpu-4). F (`split_submit_ms = 2`):
+  void (SWBG builds loaded the machine 30-72 %); it did split 2-5 times a frame and cut main's GPU sync waits p99 from 7-9 to ~3 ms;
+  re-run queued (cpu-4).
+- cpu-3 O (`[kernel] occupancy`, street): main is blocked 13-20 % of the time: job waits on the Basic workers (~1.5 ms/frame of
+  real work), ~100 short address waits a frame on GFX_Worker0 (~40 us each), ~25 mutex waits a frame on Basic workers (~20 us),
+  SND_Update's mutex (~150 us each, ~0.15 ms/frame). Wake-up latency is a few tenths of a ms a frame at most.
+
+### Where the CPU budget stands (4K native, Ryzen 7 3700X)
+
+| scene | game thread work p50 | of it on-core CPU | render thread work p50 | verdict |
+|---|---:|---:|---:|---|
+| battle (tester) | 7.6-9 ms | | | fits with headroom: 60 fps, 1 % low 58+ |
+| hub (Arena Plaza) | 16.2-16.6 ms | 13.2-13.5 ms | 9.2 ms | game thread at the budget |
+| street (City Streets) | 19.0-19.8 ms | 14.3-15.0 ms | 12.1-12.7 ms | game thread over it (about 51 fps) |
+| warm plaza (fast-travel point) | 17 ms | 13 ms | 10 ms | game thread at the budget |
+
+The render thread fits (9-13 ms, 16 ms in the street's worst windows). The game thread does not fit in the towns, and 86 % of its
+busy time is the game's own lifted code (run B), already compiled at clang -O2. The runtime's share of it (NVN recording, imports,
+SVCs, ~10 %) has been trimmed where the profile pointed; none of the trims moves fps beyond the run-to-run noise (about 3 fps).
+The rest needs the game code itself to get faster: the codegen track (hot functions, PGO).
+
+Pacing at 60: the limiter leaves presents at p50 16.667 / p95 16.669 / p99 16.714 ms when the game keeps up (w1a), and pacing is
+on the render thread right before acquire and present. The user plays borderless with vsync off (immediate), so the 240 Hz grid does
+not quantise presents; slow frames in the towns are the game thread's (budget "waiting for the game"), not the limiter's. No 60/30
+alternation exists in this pipeline (the present interval only follows the game's target). Nothing to fix there.
+
+### Verdicts of the knobs (all default off unless said)
+
+- `[diag] budget` (on): keep; it is how every number above was taken.
+- per-thread call counters, one-lookup imports, command list reserve, sampled-format memo, `out_memo_dirty` (on): neutral in fps,
+  no regressions seen; kept (cheaper paths, less load-time contention).
+- `[sched] render_place = reserve`: no win. `[kernel] spin_us = 40`: loss. `[sched] render_priority = highest` +
+  `[nvn] tex_prep_priority = below`: neutral to slight plus, awaiting cpu-4. `[nvn] split_submit_ms = 2`: awaiting a clean run (cpu-4).
+- An `-O2` fefw.exe: void (Zig already compiles the game code at clang -O2).
