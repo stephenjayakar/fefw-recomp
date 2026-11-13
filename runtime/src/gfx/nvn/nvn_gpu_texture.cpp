@@ -2003,7 +2003,14 @@ void tex_ensure_current(Texture* t, Frame& f) {
     caps.bc7_transcode = true;
     caps.upgrade = true;
     caps.image_format = g->format;
-    PreparedTexture prep;
+    // Reused from upload to upload (render thread): prepare_texture writes into the data buffer it already has, so a first visit's hundreds
+    // of megabytes of untiles and stand-ins stop paging in fresh memory per texture (page faults and zeroing on the render thread). A buffer
+    // grown past 64 MiB is given back.
+    static thread_local PreparedTexture tl_prep;
+    if (tl_prep.data.capacity() > (64ull << 20)) std::vector<uint8_t>().swap(tl_prep.data);
+    PreparedTexture& prep = tl_prep;
+    prep.provisional = false;
+    prep.compact = false;
     bool ok = false;
     bool from_job = false;
     const uint64_t t_prep0 = ft::now_ns();
