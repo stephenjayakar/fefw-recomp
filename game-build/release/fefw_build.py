@@ -102,7 +102,8 @@ def cxxflags(variant):
     if PGO['gen']:
         extra += ['-fprofile-generate', '-mllvm', '-enable-name-compression=false']   # (the LLVM 22 llvm-profdata release has no zlib)
     if PGO['use']:
-        extra += ['-fprofile-use=' + PGO['use'], '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled']
+        extra += ['-fprofile-use=' + PGO['use'], '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled',
+                  '-mllvm', '-enable-ext-tsp-block-placement']   # profile-driven block order (ext-TSP) for the instruction cache
     return ['-target', 'x86_64-windows-gnu', '-mcpu=' + (PGO['mcpu'] or CPU_VARIANTS[variant]['mcpu'])] + CXXFLAGS_COMMON + extra
 CREATE_NO_WINDOW = 0x08000000
 BELOW_NORMAL = 0x00004000
