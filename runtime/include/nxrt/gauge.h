@@ -85,6 +85,10 @@ enum HitchPhase : int {
     kHpGameSvc,             // the game's presenting thread: inside system calls (the rest of its time between presents is guest code)
     kHpGameIpc,             //   of it: IPC requests (service calls, file reads)
     kHpGameWait,            //   of it: waits (SleepThread, WaitSynchronization, ArbitrateLock, WaitProcessWideKeyAtomic, WaitForAddress)
+    kHpRenderTexTake,       // render thread, of the uploads: texprep::take (finding a background result, waits for a running job included)
+    kHpRenderTexPrep,       // render thread, of the uploads: prepare_texture run there (stand-ins, CPU untile, cache reads, transcodes)
+    kHpRenderTexStaging,    // render thread, of the uploads: the upload buffer (allocation and the copy of the prepared data into it)
+    kHpRenderImage,         // render thread: image creation (create_texture_gpu: format checks, vmaCreateImage), inside or outside the uploads
     kHpCount
 };
 uint64_t hitch_ticks();                                  // QueryPerformanceCounter
@@ -110,5 +114,8 @@ std::string frame_times_summary(double window_s = 30.0);
 size_t frame_times_recent(float* ms, size_t n);
 // A phase timer's running total (HitchPhase), in ms since start: the difference of two reads is the time spent in it between them.
 double hitch_phase_total_ms(int phase);
+// Frames presented so far and the ms since the last one (the frame in progress is number *frames + 1, as the hitch line counts). Lock-free.
+// False before the first frame.
+bool hitch_frame_age(uint64_t* frames, double* age_ms);
 
 }  // namespace nxrt

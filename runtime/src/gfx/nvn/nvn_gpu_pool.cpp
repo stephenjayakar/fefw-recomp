@@ -138,6 +138,11 @@ std::atomic<uint32_t> g_log_import_fail{0}, g_log_headroom{0}, g_log_fallback{0}
 
 // Only batch committed pages. Pinning SEC_RESERVE gaps is invalid on AMD.
 bool committed_slab(uint64_t start) {
+    // The heap's page table answers "every page committed" without VirtualQuery, which on the section view walks the whole run of identical
+    // pages after the address (up to 85 ms) under g_slabs_mu, which a render-thread import of a small pool waits for. A slab is imported through
+    // a private view, so the primary view's protection does not matter here, only the commit. [memory] freeze_table = false: always the walk.
+    static const bool use_table = config_get_bool("memory", "freeze_table", true);
+    if (use_table && mem::heap_rw_pages(start, kSlab) == 1 && !mem::ww::any_guarded(start, start + kSlab)) return true;
     const uint64_t end = start + kSlab;
     while (start < end) {
         MEMORY_BASIC_INFORMATION m{};

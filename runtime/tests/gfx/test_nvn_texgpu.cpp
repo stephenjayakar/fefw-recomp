@@ -1290,6 +1290,76 @@ NXTEST(texprep_background_upload) {
     teardown(r);
 }
 
+// [nvn] tex_async = standin with standin_rows: a texture with no background result gets a compact stand-in (its big levels copied in block row by
+// block row from their distinct rows); the image must hold exactly the whole stand-in. Its job's result then replaces it; an upload asked for while
+// the job is not done keeps the stand-in (standin_keep) instead of preparing the texture on the render thread.
+NXTEST(compact_standin_upload_and_replacement) {
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr) {
+        nxtest::skip("needs BC and no native ASTC (the stand-in path)");
+        teardown(r);
+        return;
+    }
+    no_cache();
+    namespace tp = nxrt::nvn::be::texprep;
+    for (int target : {NVN_TEXTURE_TARGET_2D, NVN_TEXTURE_TARGET_2D_ARRAY}) {
+        const bool arr = target == NVN_TEXTURE_TARGET_2D_ARRAY;
+        Tex x;
+        CHECK(make_tex(x, info(target, arr ? 300 : 1024, arr ? 200 : 512, arr ? 2 : 1, arr ? 7 : 11, NVN_FORMAT_RGBA_ASTC_8x8)));
+        std::mt19937 rng(arr ? 77 : 78);
+        for (uint32_t l = 0; l < x.L.layout.levels.size(); ++l) {
+            const tegra::LevelLayout& lv = x.L.layout.levels[l];
+            for (uint32_t layer = 0; layer < x.L.layers; ++layer)
+                for (uint32_t y = 0; y < lv.blocks_y; ++y)
+                    for (uint32_t bx = 0; bx < lv.blocks_x; ++bx) {
+                        uint8_t* blk = x.lin.data() + lv.linear_offset + layer * lv.linear_slice_size + y * lv.linear_row_stride + bx * 16;
+                        blk[0] = 0xFC;
+                        blk[1] = 0xFD;
+                        std::memset(blk + 2, 0xFF, 6);
+                        uint16_t c[4];
+                        for (uint16_t& v : c) v = static_cast<uint16_t>(rng());
+                        std::memcpy(blk + 8, c, 8);
+                    }
+        }
+        tile_into_storage(x);
+        Texture* t = x.t.get();
+        // what the image must hold: the whole stand-in, and later the full transcode
+        be::TexCaps si;
+        si.provisional = true;
+        si.standin_first = true;
+        si.image_format = VK_FORMAT_BC7_UNORM_BLOCK;
+        be::PreparedTexture want_si, want_full;
+        CHECK_MSG(be::prepare_texture(*t, si, want_si), want_si.error);
+        CHECK_MSG(be::prepare_texture(*t, be::TexCaps(), want_full), want_full.error);
+        uint64_t up0 = 0, up1 = 0, up2 = 0;
+        gpu::run_on_render_thread([&] { up0 = gpu::tex_stats().uploads; });
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(t, f); });
+        gpu::run_on_render_thread([&] { up1 = gpu::tex_stats().uploads; });
+        CHECK_EQ(up1 - up0, 1ull);
+        CHECK(tp::standin_on_screen(t));
+        std::vector<uint8_t> got;
+        CHECK_MSG(read_back_tight(*r.dev, t, want_si.level, x.L.layers, got), "stand-in readback failed");
+        const long d0 = first_diff(got, want_si.data);
+        CHECK_MSG(d0 < 0, (std::string(arr ? "array" : "2D") + ": the image differs from the whole stand-in at byte " + std::to_string(d0)).c_str());
+        // asked again before the job is done (cpu_dirty without a write): the stand-in stays, or the job's result is already there
+        t->cpu_dirty.store(true);
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(t, f); });
+        gpu::run_on_render_thread([&] { up2 = gpu::tex_stats().uploads; });
+        std::printf("    %s: second upload %s\n", arr ? "array" : "2D", up2 == up1 ? "kept the stand-in" : "took the job's result");
+        tp::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(t, f); });
+        CHECK(!tp::standin_on_screen(t));
+        CHECK_MSG(read_back_tight(*r.dev, t, want_full.level, x.L.layers, got), "final readback failed");
+        const long d1 = first_diff(got, want_full.data);
+        CHECK_MSG(d1 < 0, (std::string(arr ? "array" : "2D") + ": the image differs from the full transcode at byte " + std::to_string(d1)).c_str());
+    }
+    teardown(r);
+}
+
 // ---- sparse texture helpers used by the background preparation (nvn_texture_registry.cpp) ----------------------------------------------
 // gather copies the mapped tiles (unmapped bytes are zero), direct hands out a pointer when the range is one piece of one physical pool, and
 // the hash follows both the bytes and where they sit.

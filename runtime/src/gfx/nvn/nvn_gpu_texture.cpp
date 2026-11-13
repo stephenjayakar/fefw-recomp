@@ -128,6 +128,25 @@ std::atomic<uint64_t> g_live_images{0};
 nxrt::GaugeCounter g_gauge_textures_live("nvn.textures_live");               // TexGpu objects alive (g_live_set)
 nxrt::GaugeCounter g_gauge_texture_snapshots("nvn.texture_snapshots");       // debug snapshots kept (g_snaps; the list never shrinks)
 
+// The hitch line: where the render thread's upload time goes (bytes it prepared itself, of them stand-ins; images it made; GPU untiles).
+std::atomic<uint64_t> g_rt_prep_bytes{0}, g_rt_standin_bytes{0}, g_rt_untile_bytes{0}, g_rt_images{0}, g_rt_gpu_untiles{0};
+const bool g_rt_hitch_registered =
+    (nxrt::hitch_add_counter("rt_prep_kb", []() -> uint64_t { return g_rt_prep_bytes.load(std::memory_order_relaxed) >> 10; }),
+     nxrt::hitch_add_counter("rt_standin_kb", []() -> uint64_t { return g_rt_standin_bytes.load(std::memory_order_relaxed) >> 10; }),
+     nxrt::hitch_add_counter("rt_untile_kb", []() -> uint64_t { return g_rt_untile_bytes.load(std::memory_order_relaxed) >> 10; }),
+     nxrt::hitch_add_counter("rt_images", []() -> uint64_t { return g_rt_images.load(std::memory_order_relaxed); }),
+     nxrt::hitch_add_counter("gpu_untiles", []() -> uint64_t { return g_rt_gpu_untiles.load(std::memory_order_relaxed); }), true);
+// A phase timer of the hitch line that counts only on the render thread.
+struct RtPhase {
+    int phase;
+    bool on;
+    uint64_t t0;
+    explicit RtPhase(int p) : phase(p), on(nxrt::hitch_on_render_thread()), t0(on ? nxrt::hitch_ticks() : 0) {}
+    ~RtPhase() { if (on) nxrt::hitch_phase_add(phase, nxrt::hitch_ticks() - t0); }
+    RtPhase(const RtPhase&) = delete;
+    RtPhase& operator=(const RtPhase&) = delete;
+};
+
 // Logs a message only the first time its key is seen (render thread only).
 bool first_time(const std::string& key) {
     static std::set<std::string> seen;
@@ -637,6 +656,8 @@ TexCensusGauges g_tex_census_gauges;
 constexpr uint32_t kTexRetryPresents = 300;   // a texture whose image failed for want of memory is made again after this many presents (doubling, up to 16 times)
 
 TexGpu* create_texture_gpu(Texture* t, float want_scale) {
+    RtPhase ht_image(nxrt::kHpRenderImage);
+    if (ht_image.on) g_rt_images.fetch_add(1, std::memory_order_relaxed);
     auto* g = new TexGpu();
     { std::lock_guard<std::mutex> lk(g_live_mu); g_live_set.insert(g); }
     g_gauge_textures_live.add(1);
@@ -1959,6 +1980,7 @@ void tex_ensure_current(Texture* t, Frame& f) {
     if (arm_later && t->levels == 1 && t->layers == 1 && t->storage_size >= (64u << 10) && !g->transcoded && g->fmt && g->format == g->fmt->vk)
         have_hash = texprep::hash_storage(*t, content_hash);
     if (gpu_untile(t, *g, f)) {
+        g_rt_gpu_untiles.fetch_add(1, std::memory_order_relaxed);
         if (arm_later) tex_ww_arm_later(t, *g, have_hash, content_hash);
         g->untiled = true;
         ft::mark("tex.untile", t->id);
@@ -1983,7 +2005,12 @@ void tex_ensure_current(Texture* t, Frame& f) {
     const uint64_t t_prep0 = ft::now_ns();
     gfx::Buffer staged;                        // a big background result comes with its upload buffer already filled
     uint64_t take_hash = 0;
-    if (texprep::take(t, prep, &staged, &take_hash)) {     // prepared in the background from the current storage content (nvn_texprep.h)
+    bool took = false;
+    {
+        nxrt::HitchTimer ht_take(nxrt::kHpRenderTexTake);
+        took = texprep::take(t, prep, &staged, &take_hash);
+    }
+    if (took) {     // prepared in the background from the current storage content (nvn_texprep.h)
         if (prep.format == g->format) {
             content_hash = take_hash;
             have_hash = true;
@@ -1993,6 +2020,15 @@ void tex_ensure_current(Texture* t, Frame& f) {
             if (staged) device().destroy_buffer(staged);
             staged = gfx::Buffer{};
         }
+    }
+    // The image already holds a stand-in of this content and its job has no result yet (still queued or running, or its result was lost): the
+    // stand-in stays and the job goes (again) to the front of the queue; its end marks the texture dirty. Before, this prepared the texture here
+    // (a cache read or a transcode on the render thread, 3.4 s of them in one frame of a 4K first visit). Not for a copy or a clear (exact).
+    // [nvn] standin_keep = false: prepared here as before.
+    static const bool standin_keep = nxrt::config_get_bool("nvn", "standin_keep", true);
+    if (!ok && standin_keep && g->uploaded && !g->gpu_written && !texprep::exact_thread() && texprep::standin_on_screen(t)) {
+        texprep::standin_kept(t);
+        return;
     }
     if (!ok) {
         static const uint16_t zid = ft::zone_id("tex.prepare");
@@ -2004,7 +2040,14 @@ void tex_ensure_current(Texture* t, Frame& f) {
         // 30 ms to over a second, thousands of them on a first visit). Not for a copy or a clear, which would keep the stand-in's pixels.
         // A sparse texture written tile by tile is only given one at its first upload: later uploads follow its writes and would flicker.
         caps.standin_first = caps.provisional && !texprep::exact_thread() && (!t->vpool || !g->uploaded) && texprep::async_standin();
+        // [nvn] standin_rows (default on): the stand-in's big solid levels come as their distinct block rows, copied into the image row by row
+        static const bool standin_rows = nxrt::config_get_bool("nvn", "standin_rows", true);
+        caps.compact_standin = caps.standin_first && standin_rows && !g->sparse;
+        nxrt::HitchTimer ht_prep(nxrt::kHpRenderTexPrep);
         ok = prepare_texture(*t, caps, prep);
+        g_rt_prep_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
+        if (prep.provisional) g_rt_standin_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);
+        else if (ok && !prep.transcoded) g_rt_untile_bytes.fetch_add(prep.data.size(), std::memory_order_relaxed);   // BCn / uncompressed: a CPU untile
     }
     be::tx_mark("tx.use", t);
     {
@@ -2031,16 +2074,31 @@ void tex_ensure_current(Texture* t, Frame& f) {
         tev(t, "upload", w0, dirty ? 1 : 0);
     }
     const uint64_t bytes = staged ? staged.size : prep.data.size();
+    const uint64_t t_stage0 = nxrt::hitch_ticks();
     UploadAlloc st = staged ? f.adopt_staging(staged) : f.staging(bytes);
     if (!st) {
         t->cpu_dirty.store(true);                // try again next time
         return;
     }
     if (!staged) std::memcpy(st.ptr, prep.data.data(), static_cast<size_t>(bytes));
+    nxrt::hitch_phase_add(nxrt::kHpRenderTexStaging, nxrt::hitch_ticks() - t_stage0);
     std::vector<VkBufferImageCopy> regions;
     regions.reserve(prep.level.size());
     for (uint32_t i = g->drop; i < prep.level.size() && i - g->drop < g->levels; ++i) {   // the levels the image has ([gfx] texture_detail)
         const PreparedLevel& pl = prep.level[i];
+        if (!pl.rows.empty()) {                  // a compact stand-in level: each block row from its (shared) row of blocks
+            const uint32_t bh = (pl.height + 3) / 4;
+            for (uint32_t layer = 0; layer < g->layers && static_cast<size_t>(layer + 1) * bh <= pl.rows.size(); ++layer)
+                for (uint32_t by = 0; by < bh; ++by) {
+                    VkBufferImageCopy r = {};
+                    r.bufferOffset = st.offset + pl.rows[static_cast<size_t>(layer) * bh + by];
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->drop, layer, 1};
+                    r.imageOffset = {0, static_cast<int32_t>(by * 4), 0};
+                    r.imageExtent = {pl.width, std::min<uint32_t>(4, pl.height - by * 4), 1};
+                    regions.push_back(r);
+                }
+            continue;
+        }
         VkBufferImageCopy r = {};
         r.bufferOffset = st.offset + pl.offset;
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->drop, 0, g->layers};
@@ -2103,6 +2161,12 @@ uint32_t tex_levels(Texture* t) { return t->levels; }
 uint32_t tex_layers(Texture* t) { return t->layers; }
 
 bool tex_is_depth(Texture* t) { return t->fmt && t->fmt->aspect != kAspectColor; }
+
+bool tex_first_upload_deferrable(Texture* t) {
+    const TexGpu* g = t ? t->gpu : nullptr;
+    return g && !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f && t->fmt && (t->fmt->astc || t->fmt->bc) &&
+           (t->mem || t->vpool) && t->cpu_dirty.load(std::memory_order_relaxed);
+}
 
 bool tex_pool_preparation_pending(Texture* t) {
     const TexGpu* g = t ? t->gpu : nullptr;

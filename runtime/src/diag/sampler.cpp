@@ -10,6 +10,11 @@
 // The label is the scene a script marked with `@log SCENE start NAME` (empty when none). Frames in mpr.exe are named from the linker map
 // (lifted game functions are f_<guest address>); frames in other modules show as module!+0x<offset>. `prof_report.py` (local test script) turns the file
 // into tables. Cost: a few percent of one core per 100 Hz and 10 threads; each sampled thread is stopped for a few microseconds per sample.
+// Slow frames only: `[prof] hitch_ms` = N (env NXRT_PROF_HITCH_MS, default 0 = off) keeps only the samples taken while the frame in progress
+// is already N ms old, and labels them `f<frame>` with the frame number the hitch line gives that frame (`hitch: frame <frame> took ...`), so
+// each slow frame of the log has its own stacks. Nothing is suspended while frames come in time. sample_hz defaults to 500 then, frames of
+// modules without a linker map are written with their exact offset (fefw_rt.dll: resolve against its map) and lifted game code as
+// f_<guest address> of the function. `hitch_report.py`'s companion `prof_hitch.py` (tools/perf) prints the top frames per slow frame.
 #include <windows.h>
 
 #include <algorithm>
@@ -25,6 +30,8 @@
 
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
+#include "nxrt/dispatch.h"
+#include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/symbols.h"
 #include "stackwalk.h"
@@ -55,6 +62,7 @@ struct State {
     std::vector<std::string> only;       // [prof] sample_threads: names to sample (empty = every registered thread)
     std::vector<std::string> offsets;    // [prof] sample_offsets: symbols whose frames are named symbol+0x<offset>
     double hz = 0;
+    double hitch_ms = 0;                 // [prof] hitch_ms: only samples of frames older than this, labelled by frame
     uint64_t total = 0, waiting = 0;
     FILE* f = nullptr;
     std::unordered_map<uint64_t, std::string> cache;
@@ -91,10 +99,20 @@ void loop() {
         std::this_thread::sleep_until(next);
         next += period;
         if (next < std::chrono::steady_clock::now()) next = std::chrono::steady_clock::now() + period;   // do not catch up after a stall
+        uint32_t label = s.label.load(std::memory_order_relaxed);
+        if (s.hitch_ms > 0) {           // slow frames only: the frame in progress must be at least hitch_ms old
+            uint64_t frames = 0;
+            double age = 0;
+            if (!hitch_frame_age(&frames, &age) || age < s.hitch_ms) continue;
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "f%llu", static_cast<unsigned long long>(frames + 1));
+            std::lock_guard<std::mutex> lk(s.lm);
+            if (s.labels.back() != nm) s.labels.push_back(nm);
+            label = static_cast<uint32_t>(s.labels.size() - 1);
+        }
         std::vector<ThreadRecord> recs = diag_threads_dup();   // private handles: a thread unregistering mid-sample cannot close ours
         batch.assign(recs.size(), Sample{});
         std::vector<char> ok(recs.size(), 0);
-        const uint32_t label = s.label.load(std::memory_order_relaxed);
         for (size_t i = 0; i < recs.size(); i++) {
             HANDLE h = static_cast<HANDLE>(recs[i].host_handle);
             if (!h || recs[i].host_tid == GetCurrentThreadId()) continue;
@@ -144,11 +162,16 @@ std::string frame_name(uint64_t addr, std::unordered_map<uint64_t, std::string>&
             std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(si.sym_offset));
             n += b;
         }
+    } else if (const uint64_t g = si.module.size() > 4 && _stricmp(si.module.c_str() + si.module.size() - 4, ".exe") == 0 ? guest_function_of(addr) : 0) {
+        // lifted game code (an exe without a linker map): the guest function
+        char b[32];
+        std::snprintf(b, sizeof b, "f_%llx", static_cast<unsigned long long>(g));
+        n = b;
     } else if (si.module != "?" && !si.module.empty()) {
         char b[32];
         // 4 KiB buckets: no symbols for other modules. [prof] sample_exact = true writes the exact offset (to resolve against that
-        // module's own linker map afterwards, e.g. fefw_rt.dll's).
-        static const bool exact = config_get_bool("prof", "sample_exact", false);
+        // module's own linker map afterwards, e.g. fefw_rt.dll's). On by default with [prof] hitch_ms.
+        static const bool exact = config_get_bool("prof", "sample_exact", config_get_double("prof", "hitch_ms", 0.0) > 0);
         std::snprintf(b, sizeof b, "!+0x%llx", static_cast<unsigned long long>(exact ? si.offset : si.offset & ~0xfffull));
         n = si.module + b;
     } else n = "unknown";
@@ -209,12 +232,14 @@ void prof_sampler_label(const char* label) {
 }
 
 void prof_sampler_start() {
-    const double hz = config_get_double("prof", "sample_hz", 0.0);
+    const double hitch_ms = config_get_double("prof", "hitch_ms", 0.0);
+    const double hz = config_get_double("prof", "sample_hz", hitch_ms > 0 ? 500.0 : 0.0);
     if (hz <= 0) return;
     State& s = st();
     std::lock_guard<std::mutex> g(s.ctl);
     if (s.th.joinable()) return;
     s.hz = std::min(hz, 2000.0);
+    s.hitch_ms = std::max(0.0, hitch_ms);
     s.out = config_get_str("prof", "sample_out", "prof_samples.folded");
     s.only.clear();
     s.offsets.clear();
@@ -234,7 +259,8 @@ void prof_sampler_start() {
     }
     s.stop = false;
     s.th = std::thread(loop);
-    NXLOG_I("prof", "sampling profiler: %.0f Hz, output %s", s.hz, s.out.c_str());
+    if (s.hitch_ms > 0) NXLOG_I("prof", "sampling profiler: %.0f Hz while a frame is over %.0f ms old (slow frames only, labelled f<frame>), output %s", s.hz, s.hitch_ms, s.out.c_str());
+    else NXLOG_I("prof", "sampling profiler: %.0f Hz, output %s", s.hz, s.out.c_str());
 }
 
 void prof_sampler_stop() {

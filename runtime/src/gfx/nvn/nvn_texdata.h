@@ -38,12 +38,18 @@ struct TexCaps {
     bool standin_first = false;  // with provisional, render thread ([nvn] tex_async = standin): an ASTC texture going into a BC7 image gets the quick stand-in
                                  // straight away, without looking at the disk cache (no file open or read: on a hard disk those cost 30 ms to over a
                                  // second each). The background job reads the entry (or transcodes) and its result replaces the stand-in.
+    bool compact_standin = false;   // with standin_first ([nvn] standin_rows): the stand-in's big levels, solid blocks copied from a small level, come
+                                    // as one row of blocks per distinct source row (PreparedLevel::rows) instead of whole: the caller copies each
+                                    // block row into the image from its row, a tenth of the bytes and none of the filling of a whole 2048x2048 level.
 };
 
 struct PreparedLevel {
     uint32_t width, height, depth;   // texels of the level
     uint64_t offset, size;           // bytes in PreparedTexture::data; the size covers all layers of the level
     uint32_t row_blocks;             // blocks per row of the output data (texels per row for uncompressed formats)
+    // Compact stand-in levels only (TexCaps::compact_standin; empty otherwise): entry layer * block rows + y is the offset in data of block row y
+    // of that layer (row_blocks blocks); rows that repeat share one offset. `size` is then the bytes of the distinct rows.
+    std::vector<uint64_t> rows;
 };
 
 struct PreparedTexture {
@@ -54,6 +60,7 @@ struct PreparedTexture {
     bool transcoded = false;             // ASTC was transcoded to BC7 or decoded to RGBA8 (the data is not the source encoding)
     bool from_cache = false;             // the data came from the BC7 disk cache
     bool provisional = false;            // a quick stand-in (TexCaps::provisional): replaced when the background job has the real data
+    bool compact = false;                // some levels are given as rows (PreparedLevel::rows; TexCaps::compact_standin)
     std::vector<PreparedLevel> level;
     std::vector<uint8_t> data;
     std::string error;                   // set when prepare_texture returns false
@@ -68,6 +75,11 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
 // no_disk ([nvn] tex_async = standin, render thread): no file is opened; only the entries this process has already read, peeked or written count
 // (an unseen RGBA8 / BC5 entry then gets a BC7 image, and its texture a BC7 transcode in the background: a little less exact, never a stall).
 VkFormat cache_entry_format(const Texture& t, bool no_disk = false);
+// The calling thread's prepare_texture tells `fn(ctx, format)` the format the image needs as soon as it knows it, before reading the entry's data:
+// the entry's format when it is RGBA8 or BC5, VK_FORMAT_UNDEFINED for BC7 or no entry (the background job sets it; the render thread making the
+// texture's image then need not wait for the whole job, texprep::peek_entry_format). Null: off. Thread-local.
+using EntryFormatHook = void (*)(void* ctx, VkFormat format);
+void set_entry_format_hook(EntryFormatHook fn, void* ctx);
 // Texture content override (nxrt/tex_override.h). apply: when a hook is set and it answers for the texture, replaces bc7 (the tight
 // linear BC7 blocks of the w x h texture) with the encoded answer.
 bool texture_override_active();
