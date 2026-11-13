@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -202,8 +203,25 @@ LONG WINAPI render_throw_report(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// [sched] render_priority (default normal = left as created): the render thread's Windows priority. The process runs in the high priority
+// class and the game's job workers (nn::os priority 15 and up) sit at above normal or higher with the dynamic boost off, so under load they and
+// the background texture workers can take the core from the render thread, which is on the frame's critical path. above / highest lift it.
+void apply_render_priority() {
+    std::string v = nxrt::config_get_str("sched", "render_priority", "normal");
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    int p = THREAD_PRIORITY_NORMAL;
+    if (v == "above" || v == "above_normal") p = THREAD_PRIORITY_ABOVE_NORMAL;
+    else if (v == "highest") p = THREAD_PRIORITY_HIGHEST;
+    else if (v == "time_critical") p = THREAD_PRIORITY_TIME_CRITICAL;
+    else if (v != "normal" && v != "off") NXLOG_W(kTag, "[sched] render_priority = %s is not normal, above, highest or time_critical: normal", v.c_str());
+    if (p == THREAD_PRIORITY_NORMAL) return;
+    SetThreadPriority(GetCurrentThread(), p);
+    NXLOG_I(kTag, "render thread priority: %s ([sched] render_priority)", v.c_str());
+}
+
 void render_loop() {
     t_render_thread = true;
+    apply_render_priority();
     static void* veh = AddVectoredExceptionHandler(0, render_throw_report);
     (void)veh;
     g->tid = std::this_thread::get_id();

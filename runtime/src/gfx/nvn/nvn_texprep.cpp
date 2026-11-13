@@ -223,6 +223,16 @@ void debounce_locked(Texture* t) {
 
 void worker_main() {
     log_set_thread_name("nvn-texprep");
+    // [nvn] tex_prep_priority = normal (default) | below: below normal keeps a burst of background cache reads and untiling off the game's
+    // and the render thread's cores (both run at normal priority in the high class); the render thread waits at most tex_prep_wait_ms for a job.
+    {
+        static const bool below = [] {
+            std::string v = config_get_str("nvn", "tex_prep_priority", "normal");
+            for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return v == "below" || v == "below_normal";
+        }();
+        if (below) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
     State& s = S();
     std::unique_lock<std::mutex> lk(s.mu);
     for (;;) {

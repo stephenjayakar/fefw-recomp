@@ -152,7 +152,20 @@ const char* log_path() {
     return g_path.c_str();  // valid until the next log_init or log_shutdown
 }
 
-void log_set_thread_name(const char* name) { std::snprintf(t_name, sizeof t_name, "%s", name ? name : ""); }
+void log_set_thread_name(const char* name) {
+    std::snprintf(t_name, sizeof t_name, "%s", name ? name : "");
+    // Also the Windows thread description, so the [diag] budget thread table and external profilers see the runtime's worker names.
+    using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const SetDescFn set_desc = reinterpret_cast<SetDescFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
+    if (set_desc && t_name[0]) {
+        wchar_t w[sizeof t_name];
+        size_t i = 0;
+        for (; t_name[i] && i + 1 < sizeof t_name; ++i) w[i] = static_cast<wchar_t>(static_cast<unsigned char>(t_name[i]));
+        w[i] = 0;
+        set_desc(GetCurrentThread(), w);
+    }
+}
 
 const char* log_thread_name() { return t_name; }
 
