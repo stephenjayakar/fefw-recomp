@@ -3622,7 +3622,11 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
         vkCmdDispatchIndirect(F->cb, ind.buffer, ind.offset);
     } else {
         vkCmdDispatch(F->cb, x, y, z);
-        if (gpass_on()) gstamp(("cs " + cs->hash.substr(0, 8)).c_str());
+        if (gpass_on()) {
+            char lb[64];
+            std::snprintf(lb, sizeof lb, "cs %.8s g%ux%ux%u", cs->hash.c_str(), x, y, z);
+            gstamp(lb);
+        }
     }
     shadows_after_dispatch();
     cs_after_dispatch();
@@ -3921,7 +3925,11 @@ void do_copy_texture_texture(const P_CopyTexTex& p) {
     }
     memory_barrier(F->cb);
     counters().copies.fetch_add(1, std::memory_order_relaxed);
-    gstamp("copy texture");
+    if (gpass_on()) {
+        char lb[96];
+        std::snprintf(lb, sizeof lb, "copy texture %dx%dx%d %s%s", sr.w, sr.h, std::max(1, sr.d), s->fmt ? s->fmt->name : "?", same_size && same_fmt && !mirror ? "" : " blit");
+        gstamp(lb);
+    }
 }
 
 void do_downsample(const P_Downsample& p) {
