@@ -399,7 +399,11 @@ chosen functions, `mkhot.py` writes `games/fefw/hot.txt`).
 | commit | what | measured (static) |
 |---|---|---|
 | a3e72a3 | `recomp/nxrecomp/opt.py` mode 'flags' (game config `opt = ('flags',)`): NZCV in a function-local `NxFlags`, never stored across calls/returns (AAPCS64; per-function liveness check, 1 of 137,872 functions keeps context flags), cond() tests the compared operands (`cmp; jl`). Build: `-g0`, `-fomit-frame-pointer` | 478 hottest functions: -18 % x86 instructions, -17 % bytes; fp: -0.8 % more |
-| (next) | `inline_replace`: nnSdk memcpy/memmove/memset/memcmp/strlen/strcmp as native routines (cxx.h `hle_*`, same x0 and memory); `rbit` via `__builtin_bitreverse` (folds `clz(rbit)` to tzcnt); `hot_order`: the 3,409 hottest functions (99.5 % of samples) in `.text$nxh<rank>` sections, packed by the linker | - |
+| a323081 | `inline_replace`: nnSdk memcpy/memmove/memset/memcmp/strlen/strcmp as native routines (cxx.h `hle_*`, same x0 and memory; 200k-case test against the lifted routines); opt 'vstore' (scalar results into a V register as one 16-byte store); `rbit` via `__builtin_bitreverse`; `hot_order`: the 3,409 hottest functions (99.5 % of samples) in `.text$nxh<rank>` sections, packed by the linker | with a3e72a3 = **codegen-1**: .text 189 -> 147 MB |
+| de84924 | `inline_edges`: 1,039 hot caller -> small callee pairs get a `static inline` copy of the callee in the caller's unit; PLT stubs in the hot sections; fefw_build.py `--pgo-gen` / `--pgo-use` / `--mcpu` | - |
+| d7921d9 | the game's zstd (`ZSTD_decompressMultiFrame`, f_71000c6a60) runs zstd 1.5.7 natively (game-build/fefw/src/fefw_hle.cpp; lifted original as fallback; `FEFW_HLE_ZSTD=0` = off); inline_replace bodies may call the original (NX_ORIG) | with de84924 = **codegen-2** |
+
+**codegen-1 measured** (tester window 6, w6-base vs w6-cg1, same DLL fc93a41 + gpu set, one run each): main thread CPU/frame -12 to -14 % (hub_cold 13.36 -> 11.65 ms, street_cold 14.70 -> 12.68), job workers -14 %, avg fps +1.3..+2.1, frames > 20 ms -24..-30 %, fast-travel arrival worst frame -24..-30 % (485 -> 339 ms), budget game work p50 hub_cold 16.3 -> 14.0. Battle scenario fine. With the whole stack (window 7, m5-full: + stutter-5 + cpu-3 + split_submit 2): hub_cold 59.6 fps / 1% 48.8, street_cold 56.3 / 40.9; game work p50 13.2 hub / 16.5 street.
 
 Checks: `recomp/tests/nxflags_test.cpp` (23.7 M cases, the NxFlags helpers against ctx.h's); the e2e oracle (`NXRECOMP_OPT=flagsafe`:
 30/30 identical; `flags`: only the final NZCV differs, as intended).

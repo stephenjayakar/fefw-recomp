@@ -100,7 +100,7 @@ def cxxflags(variant):
     """The compile flags of the lifted code for a CPU_VARIANTS key ('fma': the flags every release before 0.1.7 used)."""
     extra = []
     if PGO['gen']:
-        extra.append('-fprofile-generate')
+        extra += ['-fprofile-generate', '-mllvm', '-enable-name-compression=false']   # (the LLVM 22 llvm-profdata release has no zlib)
     if PGO['use']:
         extra += ['-fprofile-use=' + PGO['use'], '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled']
     return ['-target', 'x86_64-windows-gnu', '-mcpu=' + (PGO['mcpu'] or CPU_VARIANTS[variant]['mcpu'])] + CXXFLAGS_COMMON + extra
