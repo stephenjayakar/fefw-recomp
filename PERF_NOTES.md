@@ -272,3 +272,57 @@ What the profile (`tools/perf/prof_hitch.py`) showed and what followed (stutter-
 - 246 ms arrival frame: a render-thread pool chunk import only to GPU-untile a first upload (2389144, `untile_import` false).
 - Fast-travel arrival frames of 300-740 ms: the game's main thread is on the CPU for 95% of them ("presenting thread on the CPU" in the
   hitch line), in game code (`f_71000cd800`, `f_71000d3ee0` under romfs reads: probably decompression). Game-side; open.
+
+## 6. GPU track (branch `perf/gpu`)
+
+Goal: GPU time per frame comfortably under 16.6 ms at native 3840x2160 (render ratio 1.0, no upscaler) on the RTX 3080 10 GB, in
+Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-perf/queue/gpu-<n>/`; only the tester runs the game.
+
+### What the back end does per frame (static reading, 13 Nov)
+
+- Dynamic rendering. A pass is (re)opened whenever the targets change, a draw samples a texture that needs a layout change or upload
+  (`prepare_textures`: the pass breaks), the depth attachment switches between writable and read-only (a draw samples the depth target),
+  and around every dispatch, copy, clear-texture, fill, query and game barrier. Load op is LOAD (CLEAR only for a never-used image),
+  store op STORE; on an immediate-mode GPU like the 3080 that costs next to nothing, so load/store ops are not a lever here.
+- Barriers: with `[nvn] pass_barriers = tracked` (default) a pass that only wrote its attachments ends without a barrier and layout
+  changes use narrow stage masks. Every dispatch is followed by a full barrier (all commands, all memory), every copy/fill/clear-texture
+  too, and every `nvnCommandBufferBarrier` of the game becomes a full barrier that also ends the pass.
+- Shadow maps: the game's own base size (2048 docked, `[fefw] shadow_size`), independent of the output size.
+- Present: one full-screen draw of the 3840x2160 window texture into the swapchain image plus the (empty) overlay pass; ~0.1-0.2 ms.
+- Upscaler step at render ratio 1.0: `[dlss] upscaler` decides; `taau`/`bilinear` run a 4K compute pass into an RGBA16F history image
+  and blit it into the game's output texture (two 4K images read, two written).
+- Pool copies (`pool_mirror`) keep vertex/uniform reads off PCIe; compute shadows and copy-backs move a few MB per second.
+
+### First profile (tester trace 13 Nov 09:50, 4K, render x1.0, `gpu_passes` so drains are included)
+
+`tmp/fefw-perf/gpu/gp_report.py` over the trace. Gameplay holds 60 fps; GPU 10-16 ms per frame with the profiler's drains.
+
+| what | ms/frame | notes |
+|---|---:|---|
+| probe-filter compute `cs 8ab94383` (+ `eaac1801`, `13a045cc`, `7419dc86`) | 2.2-3.8 | 24-48 dispatches x ~57 us; 8x8 groups, a cube-sampling loop writing a 2D image (prefiltered reflection probes); each followed by a full barrier, spread between unrelated passes |
+| full-screen 1-draw passes at 3840x2160 (RGBA16F, RGBA8, R11G11B10F) | ~4-5 | the game's post and lighting passes; one RGBA16F pass is ~1.2 ms |
+| G-buffer (5 targets + D32F) and depth pre-pass | 0.6-0.9 | 100-370 draws |
+| `copy texture` (the game's CopyTextureToTexture) | 1.0 | 13-18 a frame at ~70 us (full-screen sized) |
+| `write memory` (UpdateUniformBuffer) | 0.5 | 60 a frame in runs of 15, two full barriers each |
+| clustered light compute `cs ee541a5d` | 0.43 | one dispatch, 256-wide groups |
+| feedback copies (runtime) | 0.24 | 4 a frame, every level copied |
+| `dlss` step | 0.24 | |
+| shadow maps 2048 / 1024 | 0.2-0.4 | not resolution-bound |
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| `d4e3410` | `[prof] gpu_stats`: GPU ms per frame (submission timestamps), commands and barriers per frame, pass profile in the log (`gpu_passes` without the trace) | `[prof] gpu_stats = 0` |
+| `d4e3410` | tracked dispatch barriers: the full barrier after a dispatch is left open until something depends on it | `[nvn] dispatch_barriers = full` (`tracked` to try) |
+| `5d3e3e9` | tracked game barriers: `nvnCommandBufferBarrier` left out (pass kept open) when only attachment writes are unbarriered | `[nvn] game_barriers = full` (`tracked` to try) |
+| `5d3e3e9` | sticky read-only depth pass for draws that neither sample nor write depth/stencil | `[nvn] depth_ro_sticky = false` |
+| `4f41980` | UBO update runs: one barrier before and after a run of back-to-back `UpdateUniformBuffer` instead of two per update | `[nvn] batch_ubo_updates = false` |
+| `4f41980` | feedback copies hold only the sampled levels (bloom mip chains no longer copy level 0) | `[nvn] feedback_levels = false` |
+| `10e0b76` | draws that share nothing with open dispatches run without the barrier: compute overlaps graphics | `[nvn] dispatch_barriers = tracked_draws` |
+
+### Test log
+
+| request | what | result |
+|---|---|---|
+| gpu-1 | baseline GPU ms/frame + pass profile at 4K; A/B of the three toggles together | queued 13 Nov (5d3e3e9) |

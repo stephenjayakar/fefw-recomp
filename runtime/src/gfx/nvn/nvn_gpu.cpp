@@ -22,6 +22,7 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
@@ -66,6 +67,20 @@ struct Slot {
     uint64_t sets_live = 0;               // descriptor sets allocated from this slot's pools since the last reset (vk.descriptor_sets)
     uint32_t gp_n = 0;                    // GPU pass profiler: timestamps written by the submission
     std::vector<std::pair<std::string, uint32_t>> gp_labels;   // label and argument of each interval (stamp i closes interval i)
+    uint64_t frame = 0;                   // [prof] gpu_stats: presents counted when the submission was recorded (the frame it belongs to)
+};
+
+// [prof] gpu_stats = N: every N frames one log line (nvn.gpustats) with the GPU time per frame (the sum of each submission's first-to-last
+// timestamp, the present's own command buffer excluded) and the commands and barriers per frame; with [prof] gpu_passes as well, the GPU
+// time per pass label. Render thread only.
+struct GpuStats {
+    int64_t every = 0;
+    uint64_t cur_frame = UINT64_MAX;
+    double cur_ns = 0;
+    std::vector<float> frame_ms;
+    uint64_t presents0 = 0;
+    uint64_t c0[14] = {};
+    std::map<std::string, std::pair<double, uint64_t>> gp;   // label -> GPU ns, intervals
 };
 
 struct Deferred {
@@ -126,6 +141,7 @@ struct Gpu {
     StagingRing ring;
     VkQueryPool qpool = VK_NULL_HANDLE;   // frame trace: two timestamps per slot
     VkQueryPool gpool = VK_NULL_HANDLE;   // GPU pass profiler ([prof] gpu_passes): kGpMax timestamps per slot
+    GpuStats stats;
     uint32_t next_slot = 0;
     Counters ctr;
 
@@ -365,6 +381,70 @@ void wait_serial_blocking(uint64_t serial) {
     read_completed();
 }
 
+uint64_t stats_counter(int i) {
+    const Counters& c = g->ctr;
+    switch (i) {
+        case 0: return c.draws.load(std::memory_order_relaxed);
+        case 1: return c.passes.load(std::memory_order_relaxed);
+        case 2: return c.pass_breaks.load(std::memory_order_relaxed);
+        case 3: return c.dispatches.load(std::memory_order_relaxed);
+        case 4: return c.clears.load(std::memory_order_relaxed);
+        case 5: return c.copies.load(std::memory_order_relaxed);
+        case 6: return c.submits.load(std::memory_order_relaxed);
+        case 7: return static_cast<uint64_t>(g_gauge_barriers_mem.get());
+        case 8: return static_cast<uint64_t>(g_gauge_barriers_img.get());
+        case 9: return c.texture_uploads.load(std::memory_order_relaxed);
+        case 11: return c.game_barriers.load(std::memory_order_relaxed);
+        case 12: return c.dispatch_barriers_left_out.load(std::memory_order_relaxed);
+        case 13: return c.game_barriers_left_out.load(std::memory_order_relaxed);
+        default: return c.presents.load(std::memory_order_relaxed);
+    }
+}
+
+// [prof] gpu_stats: one submission's GPU time, added to the frame it was recorded in; a full window of frames is logged.
+void stats_add(uint64_t frame, double ns) {
+    GpuStats& st = g->stats;
+    if (frame != st.cur_frame) {
+        if (st.cur_frame != UINT64_MAX && st.cur_ns > 0) st.frame_ms.push_back(static_cast<float>(st.cur_ns * 1e-6));
+        if (st.cur_frame == UINT64_MAX) {
+            for (int i = 0; i < 14; ++i) st.c0[i] = stats_counter(i);
+            st.gp.clear();
+        }
+        st.cur_frame = frame;
+        st.cur_ns = 0;
+    }
+    st.cur_ns += ns;
+    if (st.frame_ms.size() < static_cast<size_t>(st.every)) return;
+    std::vector<float> v = st.frame_ms;
+    std::sort(v.begin(), v.end());
+    double sum = 0;
+    for (float x : v) sum += x;
+    const size_t n = v.size();
+    auto pct = [&](double q) { return static_cast<double>(v[std::min(n - 1, static_cast<size_t>(q * static_cast<double>(n - 1) + 0.5))]); };
+    uint64_t c1[14];
+    for (int i = 0; i < 14; ++i) c1[i] = stats_counter(i);
+    const double frames = std::max<double>(1.0, static_cast<double>(c1[10] - st.c0[10]));
+    auto pf = [&](int i) { return static_cast<double>(c1[i] - st.c0[i]) / frames; };
+    NXLOG_I("nvn.gpustats", "%zu frames: GPU ms/frame avg %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f | per frame: draws %.0f, passes %.1f, pass breaks %.1f, "
+            "dispatches %.1f, clears %.1f, copies %.1f, submits %.1f, full barriers %.1f (game barriers %.1f, of them left out %.1f), image barriers %.1f, texture uploads %.1f, dispatch barriers left out %.1f",
+            n, sum / static_cast<double>(n), pct(0.5), pct(0.9), pct(0.99), static_cast<double>(v[n - 1]), pf(0), pf(1), pf(2), pf(3), pf(4), pf(5),
+            pf(6), pf(7), pf(11), pf(13), pf(8), pf(9), pf(12));
+    if (!st.gp.empty()) {
+        // the pass profiler's intervals by label, the most expensive first ("pass WxH cN:fmt dfmt": one render pass; "cs <hash>": one dispatch)
+        std::vector<std::pair<double, std::string>> by;
+        double total = 0;
+        for (const auto& kv : st.gp) { by.emplace_back(kv.second.first, kv.first); total += kv.second.first; }
+        std::sort(by.begin(), by.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        NXLOG_I("nvn.gpustats", "pass profile (timestamps drain the GPU between intervals): %.2f ms/frame in %zu labels", total * 1e-6 / frames, by.size());
+        for (size_t i = 0; i < by.size() && i < 40; ++i)
+            NXLOG_I("nvn.gpustats", "  %7.3f ms/frame %6.1f/frame  %s", by[i].first * 1e-6 / frames, static_cast<double>(st.gp[by[i].second].second) / frames,
+                    by[i].second.c_str());
+    }
+    st.frame_ms.clear();
+    st.gp.clear();
+    std::copy(c1, c1 + 14, st.c0);
+}
+
 Slot& acquire_slot() {
     NXFT_MIN("slot.acquire", 20000);
     Slot& s = g->slots[g->next_slot];
@@ -381,6 +461,7 @@ Slot& acquire_slot() {
             static const uint16_t z = ft::zone_id("gpu.exec");
             const double ns = static_cast<double>(ts[1] - ts[0]) * g->dev->properties().limits.timestampPeriod;
             ft::event(z, s.cpu_t0, s.cpu_t0 + static_cast<uint64_t>(ns), static_cast<uint32_t>(s.serial));
+            if (g->stats.every > 0) stats_add(s.frame, ns);
         }
     }
     if (s.gp_n >= 2 && g->gpool) {      // GPU pass profiler: one event per interval between two timestamps, named gp:<label>, arg = draws
@@ -396,6 +477,11 @@ Slot& acquire_slot() {
                 auto it = zones.find(s.gp_labels[i].first);
                 if (it == zones.end()) it = zones.emplace(s.gp_labels[i].first, ft::zone_id(("gp:" + s.gp_labels[i].first).c_str())).first;
                 ft::event(it->second, t, t + d, s.gp_labels[i].second);
+                if (g->stats.every > 0) {
+                    auto& e = g->stats.gp[s.gp_labels[i].first];
+                    e.first += static_cast<double>(d);
+                    e.second++;
+                }
                 t += d;
             }
         }
@@ -697,8 +783,17 @@ void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImag
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+namespace {
+thread_local std::unordered_map<VkCommandBuffer, uint64_t> t_barriers_in_cb;   // full memory barriers this thread recorded, per command buffer
+}
+uint64_t memory_barrier_count(VkCommandBuffer cb) {
+    const auto it = t_barriers_in_cb.find(cb);
+    return it == t_barriers_in_cb.end() ? 0 : it->second;
+}
+
 void memory_barrier(VkCommandBuffer cb) {
     g_gauge_barriers_mem.add(1);
+    ++t_barriers_in_cb[cb];
     VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -747,6 +842,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g->qpool, qi);
         s.timed = true;
         s.cpu_t0 = ft::now_ns();
+        s.frame = g->ctr.presents.load(std::memory_order_relaxed);
     }
     bool aborted = false;
     try {
@@ -1229,14 +1325,15 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
             delete gp;
             return false;
         }
-    if (ft::on()) {
+    gp->stats.every = std::max<int64_t>(0, config_get_int("prof", "gpu_stats", 0));
+    if (ft::on() || gp->stats.every > 0) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qi.queryCount = kSlots * 2;
         if (vkCreateQueryPool(dev.device(), &qi, nullptr, &gp->qpool) != VK_SUCCESS) gp->qpool = VK_NULL_HANDLE;
         else vk_gauge_query_pools().add(1);
     }
-    if (ft::on() && config_get_bool("prof", "gpu_passes", false)) {
+    if ((ft::on() || gp->stats.every > 0) && config_get_bool("prof", "gpu_passes", false)) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qi.queryCount = kSlots * kGpMax;

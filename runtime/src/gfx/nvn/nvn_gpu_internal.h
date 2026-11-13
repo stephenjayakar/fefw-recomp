@@ -39,6 +39,7 @@ struct Counters {
     std::atomic<uint64_t> passes{0}, pass_breaks{0}, pipelines_created{0}, pipeline_cache_hits{0}, descriptor_sets{0};
     std::atomic<uint64_t> textures_created{0}, texture_uploads{0}, texture_upload_bytes{0}, bc7_transcodes{0}, textures_failed{0};
     std::atomic<uint64_t> pools_imported{0}, unresolved_addresses{0}, unsupported_ops{0}, submit_replay_ns{0};
+    std::atomic<uint64_t> game_barriers{0}, game_barriers_left_out{0}, dispatch_barriers_left_out{0};   // nvnCommandBufferBarrier replayed (left out: [nvn] game_barriers = tracked); [nvn] dispatch_barriers = tracked
 };
 Counters& counters();
 bool counters_ready();   // false until the GPU back end is set up (counters() would read through a null pointer)
@@ -108,6 +109,8 @@ void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImag
                    uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count);
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
+// Full memory barriers this thread recorded into `cb` so far: a change since a point in its recording means one lies between.
+uint64_t memory_barrier_count(VkCommandBuffer cb);
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
 // all memory. Set by the replay for each submission; any thread may record image barriers, so it is an atomic.
 void set_narrow_barriers(bool on);
