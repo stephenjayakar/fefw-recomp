@@ -245,4 +245,13 @@ inclusive tables.
   scale with the scene. (`tmp/fefw-perf/cpu/slowframes.py`, `busy.py`.)
 - Tester's baseline (BASELINE.md): main CPU 13-15 ms/frame, render replay 10 ms (hub) / 15 ms (street), GPU 15-16 ms, street 52 fps;
   the street's game thread waits on GPU fences two presents old ~300 times per 10 s: main, render and GPU are serialised.
-- cpu-1 (queued): budget lines, sampler + replay_stats, priority knobs, reserve, split_submit_ms, present_ahead = 2.
+- cpu-1 A/D (tester window 2): the game thread is the limiter at 4K: work p50 16.7 ms (hub) / 20.7 ms (street), its CPU p50
+  14.5-17 ms plus 3.6-5 ms of waits on its job workers; render thread work 9.6 / 13.0 ms; GPU 15 ms. `render_place = reserve`: no
+  win (render work a little lower, game work the same, p99s worse), stays off.
+- stutter-1's slow-frame samples, resolved with its map (`tmp/fefw-perf/cpu/prof_fold.py`, `rt_from_guest.py`, `label_main.py`):
+  79 % of main's busy samples are lifted game code; **8.9 % (23.7 % in the post-fast-travel stalls) sit on one `fetch_add`: the
+  import-call counter `host_import` bumps on every cross-module call**, and the job workers guest-82..85 spend 46-52 % of their busy
+  samples there. A shared counter written by ~20 threads at millions of calls a second: the cache line moves on every call.
+  Fixed: per-thread counters (`tl_counts.h`) for imports, HLE thunks and SVCs, and one lookup per import (`import_resolve_named`).
+- The lifted game code is compiled at `-O1` by the player-side build (`tools/build/fefw_build.py`). An `-O2` fefw.exe is the biggest
+  remaining lever for the game thread; it needs a full exe rebuild (asked the tester: queue/cpu-2).
