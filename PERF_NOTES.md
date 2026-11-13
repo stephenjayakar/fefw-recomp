@@ -202,3 +202,39 @@ A/B toggles, one at a time against the default:
 3. `controls.ini` `[display] astc_quality = fast`: one cache lookup per texture instead of two, and no background re-encode writing to
    the disk. Textures are slightly less sharp (bc7e preset 1 instead of 3).
 4. Keep RAM free while playing (the session had 1.5 GB free): the OS file cache is what makes revisits cheap.
+
+## CPU track (branch `perf/cpu`)
+
+Goal: on the Ryzen 7 3700X both the game thread and the render thread fit in 16.6 ms with headroom at `[fefw] fps60 = 1`, with steady
+pacing. Test requests go to `tmp/fefw-perf/queue/cpu-<n>/`.
+
+### What the code already does (studied, not redone)
+
+- Frame limiter (`src/gfx/frame_limiter.cpp`): QPC schedule, high-resolution waitable timer, spin only the last 0.3-3 ms (twice the
+  timer's average overshoot), carry of at most 0.1 period after a late frame, resync after 4 periods. fefw paces in the present call
+  (`[latency] pace = present`) on the render thread, right before acquire and vkQueuePresent, at 60 / present interval
+  (`game_rate`). At 1440p (run w1a) the presents leave the limiter at p5 16.585 / p50 16.667 / p95 16.669 / p99 16.714 ms: the limiter
+  itself is not a jitter source. The user plays borderless, vsync off (`immediate`), so presentation is not quantised to the 240 Hz grid.
+- Threads: the console core model gives the six guest cores ideal processors on six physical cores (core of CPU 0 left out), boost
+  off, process in the high priority class. nvn-render is a normal-priority host thread (below the game's job workers, level with main and
+  the 5 texprep workers). `[sched] render_place` (core5 / apart / mask) exists, no fps change measured upstream.
+- Render thread: dirty bits, a layout memo, push descriptors for uniforms (`push_uniforms`), set caching, `replay_stats` per-draw cost
+  timers. The game thread's NVN recording is a header check, an uncontended lock and an append per call.
+- Guest sleeps: high-resolution timer, short sleeps yield-polled; 1 ms system timer resolution held while audio runs.
+- Existing profilers: `[prof] sample_hz` (folded stacks; `sample_exact = true` + the DLL's linker map resolve `fefw_rt.dll` frames),
+  `[prof] trace`, `[nvn] replay_stats`, `[kernel] occupancy`, `[kernel] wait_stats`.
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| `diag: [diag] budget ...` | Every 10 s summary also logs (tag `budget`): render thread work / CPU / GPU waits per frame (p50 p95 p99 max), game thread frame / work (gap minus present back pressure) / CPU per present, slow frames (over 1.2x the median) by cause (waiting for the game, render work, GPU/swapchain), and CPU % per thread group of the whole process (driver threads named by their module). Worker threads get Windows thread descriptions. | `[diag] budget = true` |
+| same | `[sched] render_priority = normal / above / highest`: the render thread's priority. | `normal` (unchanged) |
+| same | `[nvn] tex_prep_priority = normal / below`: background texture workers below the game and render threads. | `normal` (unchanged) |
+
+Tools: `tmp/fefw-perf/cpu/prof_fold.py <folded> <fefw_rt.map>` resolves sampled `fefw_rt.dll` offsets and prints per-thread self and
+inclusive tables.
+
+### Measurements
+
+(pending cpu-1)
