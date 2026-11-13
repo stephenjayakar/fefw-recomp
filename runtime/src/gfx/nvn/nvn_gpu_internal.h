@@ -39,7 +39,7 @@ struct Counters {
     std::atomic<uint64_t> passes{0}, pass_breaks{0}, pipelines_created{0}, pipeline_cache_hits{0}, descriptor_sets{0};
     std::atomic<uint64_t> textures_created{0}, texture_uploads{0}, texture_upload_bytes{0}, bc7_transcodes{0}, textures_failed{0};
     std::atomic<uint64_t> pools_imported{0}, unresolved_addresses{0}, unsupported_ops{0}, submit_replay_ns{0};
-    std::atomic<uint64_t> game_barriers{0}, dispatch_barriers_left_out{0};   // nvnCommandBufferBarrier replayed; [nvn] dispatch_barriers = tracked
+    std::atomic<uint64_t> game_barriers{0}, game_barriers_left_out{0}, dispatch_barriers_left_out{0};   // nvnCommandBufferBarrier replayed (left out: [nvn] game_barriers = tracked); [nvn] dispatch_barriers = tracked
 };
 Counters& counters();
 bool counters_ready();   // false until the GPU back end is set up (counters() would read through a null pointer)

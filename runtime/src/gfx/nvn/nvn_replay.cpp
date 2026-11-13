@@ -2537,6 +2537,19 @@ const ShaderInfo* passthrough_tcs_for(const ShaderInfo* vs, const ShaderInfo* te
 }
 const ShaderInfo* tcs_now() { return S.stage[kTessCtl] ? S.stage[kTessCtl] : g_gen_tcs; }
 
+// [nvn] depth_ro_sticky (default false): a draw that does not sample the depth target and writes neither depth nor stencil stays in an
+// open pass whose depth attachment is read-only, instead of ending it for a writable one. The transparent and particle draws of a frame
+// (depth test on, depth writes off) where only some of them sample the depth (soft particles) then stay in one pass, without a layout
+// change of the full-size depth buffer back and forth at each switch.
+bool depth_ro_for_draw() {
+    if (g_want_depth_ro) return true;
+    static const bool sticky = nxrt::config_get_bool("nvn", "depth_ro_sticky", false);
+    if (!sticky || !P.open || !P.depth_ro || !targets_match()) return false;
+    const bool writes_depth = S.ds.depth_test && S.ds.depth_write;
+    const bool writes_stencil = P.has_stencil && S.ds.stencil_test && (S.stencil_wmask[0] != 0 || S.stencil_wmask[1] != 0);
+    return !writes_depth && !writes_stencil;
+}
+
 bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* topo_out) {
     rs_start();
     const ShaderInfo* vs = S.stage[kVertex];
@@ -2608,7 +2621,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     }
     if (g_fb_seen || (g_dirty & (kDesc | kPipe))) feedback_prepare(*pl);
     rs_mark(kRsFb);
-    if (!ensure_pass(g_want_depth_ro, g_prog_writes)) {
+    if (!ensure_pass(depth_ro_for_draw(), g_prog_writes)) {
         // which draw, and what its targets are (the first of each vertex/fragment shader pair)
         const std::string vs = S.stage[kVertex] ? S.stage[kVertex]->hash : "-", fs = S.stage[kFragment] ? S.stage[kFragment]->hash : "-";
         if (first_time_key("draw-no-target " + vs + " " + fs)) {
@@ -4333,7 +4346,22 @@ void run_list(const CmdList& list, int depth) {
                 }
                 break;
             }
-            case Op::Barrier: end_pass(); memory_barrier(F->cb); counters().game_barriers.fetch_add(1, std::memory_order_relaxed); break;
+            case Op::Barrier: {
+                counters().game_barriers.fetch_add(1, std::memory_order_relaxed);
+                // [nvn] game_barriers = tracked (default full): with tracked pass barriers, everything recorded since the last full barrier
+                // that has no barrier of its own is attachment writes of passes (a pass whose draws wrote other memory ended with a full
+                // barrier, copies and fills carry one, open dispatches are excluded here). Every later use of those attachments gets its
+                // own dependency (a layout change, or pending_conflict for the next pass on the same image), so the game's barrier adds
+                // nothing: it neither ends the pass nor drains the GPU.
+                static const bool tracked = nxrt::config_get_str("nvn", "game_barriers", "full") == "tracked";
+                if (tracked && g_tracked && !g_pass_unsafe && !g_cs_open && !g_xfb_active) {
+                    counters().game_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                end_pass();
+                memory_barrier(F->cb);
+                break;
+            }
             case Op::FenceSync: {
                 const auto& p = r.payload<P_Sync>();
                 if (p.sync) { p.sync->serial.store(F->serial); p.sync->armed.store(true); }

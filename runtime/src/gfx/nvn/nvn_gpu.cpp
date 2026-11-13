@@ -79,7 +79,7 @@ struct GpuStats {
     double cur_ns = 0;
     std::vector<float> frame_ms;
     uint64_t presents0 = 0;
-    uint64_t c0[13] = {};
+    uint64_t c0[14] = {};
     std::map<std::string, std::pair<double, uint64_t>> gp;   // label -> GPU ns, intervals
 };
 
@@ -380,6 +380,7 @@ uint64_t stats_counter(int i) {
         case 9: return c.texture_uploads.load(std::memory_order_relaxed);
         case 11: return c.game_barriers.load(std::memory_order_relaxed);
         case 12: return c.dispatch_barriers_left_out.load(std::memory_order_relaxed);
+        case 13: return c.game_barriers_left_out.load(std::memory_order_relaxed);
         default: return c.presents.load(std::memory_order_relaxed);
     }
 }
@@ -390,7 +391,7 @@ void stats_add(uint64_t frame, double ns) {
     if (frame != st.cur_frame) {
         if (st.cur_frame != UINT64_MAX && st.cur_ns > 0) st.frame_ms.push_back(static_cast<float>(st.cur_ns * 1e-6));
         if (st.cur_frame == UINT64_MAX) {
-            for (int i = 0; i < 13; ++i) st.c0[i] = stats_counter(i);
+            for (int i = 0; i < 14; ++i) st.c0[i] = stats_counter(i);
             st.gp.clear();
         }
         st.cur_frame = frame;
@@ -404,14 +405,14 @@ void stats_add(uint64_t frame, double ns) {
     for (float x : v) sum += x;
     const size_t n = v.size();
     auto pct = [&](double q) { return static_cast<double>(v[std::min(n - 1, static_cast<size_t>(q * static_cast<double>(n - 1) + 0.5))]); };
-    uint64_t c1[13];
-    for (int i = 0; i < 13; ++i) c1[i] = stats_counter(i);
+    uint64_t c1[14];
+    for (int i = 0; i < 14; ++i) c1[i] = stats_counter(i);
     const double frames = std::max<double>(1.0, static_cast<double>(c1[10] - st.c0[10]));
     auto pf = [&](int i) { return static_cast<double>(c1[i] - st.c0[i]) / frames; };
     NXLOG_I("nvn.gpustats", "%zu frames: GPU ms/frame avg %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f | per frame: draws %.0f, passes %.1f, pass breaks %.1f, "
-            "dispatches %.1f, clears %.1f, copies %.1f, submits %.1f, full barriers %.1f (game %.1f), image barriers %.1f, texture uploads %.1f, dispatch barriers left out %.1f",
+            "dispatches %.1f, clears %.1f, copies %.1f, submits %.1f, full barriers %.1f (game barriers %.1f, of them left out %.1f), image barriers %.1f, texture uploads %.1f, dispatch barriers left out %.1f",
             n, sum / static_cast<double>(n), pct(0.5), pct(0.9), pct(0.99), static_cast<double>(v[n - 1]), pf(0), pf(1), pf(2), pf(3), pf(4), pf(5),
-            pf(6), pf(7), pf(11), pf(8), pf(9), pf(12));
+            pf(6), pf(7), pf(11), pf(13), pf(8), pf(9), pf(12));
     if (!st.gp.empty()) {
         // the pass profiler's intervals by label, the most expensive first ("pass WxH cN:fmt dfmt": one render pass; "cs <hash>": one dispatch)
         std::vector<std::pair<double, std::string>> by;
@@ -425,7 +426,7 @@ void stats_add(uint64_t frame, double ns) {
     }
     st.frame_ms.clear();
     st.gp.clear();
-    std::copy(c1, c1 + 13, st.c0);
+    std::copy(c1, c1 + 14, st.c0);
 }
 
 Slot& acquire_slot() {
