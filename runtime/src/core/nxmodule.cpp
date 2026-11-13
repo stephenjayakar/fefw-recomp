@@ -38,7 +38,20 @@ std::unique_ptr<Entry> g_owned[kMaxListed];           // owns the entries, regis
 std::atomic<Entry*> g_list[kMaxListed];               // the same, for lock-free readers: entries [0, g_count) are valid
 std::atomic<size_t> g_count{0};
 std::atomic<Entry*> g_by_index[kMaxModules];
-std::atomic<uint64_t> g_import_calls{0};
+// Imports through the registry, counted in cache-line stripes (one per thread, round robin): every guest thread calls imports at a high rate,
+// and one shared counter made each call a cache-line transfer between cores (8.9 % of the game thread's busy samples sat on its fetch_add).
+struct alignas(64) ImportStripe { std::atomic<uint64_t> n{0}; };
+constexpr size_t kImportStripes = 64;
+ImportStripe g_import_stripes[kImportStripes];
+std::atomic<uint32_t> g_import_stripe_next{0};
+uint64_t import_calls_sum() {
+    uint64_t t = 0;
+    for (const ImportStripe& s : g_import_stripes) t += s.n.load(std::memory_order_relaxed);
+    return t;
+}
+void import_calls_zero() {
+    for (ImportStripe& s : g_import_stripes) s.n.store(0, std::memory_order_relaxed);
+}
 std::mutex g_type_lock;                               // resolved imported typeinfo slots (ABI 3 NxEh.type_syms), keyed by slot address
 std::unordered_map<const uint64_t*, uint64_t> g_type_cache;
 
@@ -50,7 +63,7 @@ struct GaugeHook {
     ~GaugeHook() { nxrt::gauge_unregister(name); }
 };
 GaugeHook gauge_nx_modules("core.nx_modules", [] { return static_cast<int64_t>(g_count.load(std::memory_order_acquire)); });
-GaugeHook gauge_import_calls("core.import_calls", [] { return static_cast<int64_t>(g_import_calls.load(std::memory_order_relaxed)); });
+GaugeHook gauge_import_calls("core.import_calls", [] { return static_cast<int64_t>(import_calls_sum()); });
 GaugeHook gauge_type_cache("core.type_cache", [] {   // resolved typeinfo slots (only grows)
     std::lock_guard<std::mutex> lk(g_type_lock);
     return static_cast<int64_t>(g_type_cache.size());
@@ -192,7 +205,7 @@ void nxmodules_clear() {
         g_list[k].store(nullptr);
         g_owned[k].reset();
     }
-    g_import_calls = 0;
+    import_calls_zero();
     std::lock_guard<std::mutex> tk(g_type_lock);
     g_type_cache.clear();
 }
@@ -256,10 +269,13 @@ void import_cache_invalidate() {
     invalidate_caches_locked();
 }
 
-uint64_t import_calls() { return g_import_calls.load(std::memory_order_relaxed); }
+uint64_t import_calls() { return import_calls_sum(); }
 
 namespace detail {
-void count_import() { g_import_calls.fetch_add(1, std::memory_order_relaxed); }
+void count_import() {
+    thread_local ImportStripe* t_stripe = &g_import_stripes[g_import_stripe_next.fetch_add(1, std::memory_order_relaxed) % kImportStripes];
+    t_stripe->n.fetch_add(1, std::memory_order_relaxed);
+}
 }  // namespace detail
 
 }  // namespace nxrt
