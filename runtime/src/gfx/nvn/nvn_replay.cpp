@@ -3320,9 +3320,14 @@ void trace_snap_after_dispatch(const ShaderInfo& cs, const ProgLayout& pl) {
 // on the GPU instead of each one draining it. A dispatch with a binding this cannot follow (texel buffers, an unknown source) keeps the
 // full barrier after it.
 struct CsRange { uint64_t a, b; };
+// An image use: the image and the NVN levels [l0, l1) and layers [a0, a1) its view covers.
+struct CsImg {
+    const void* img;
+    uint32_t l0, l1, a0, a1;
+};
 struct CsSet {
     std::vector<CsRange> rd, wr;
-    std::vector<const void*> img_rd, img_wr;
+    std::vector<CsImg> img_rd, img_wr;
     bool pool = false;                                     // samples through the texture pool: any texture
     void clear() { rd.clear(); wr.clear(); img_rd.clear(); img_wr.clear(); pool = false; }
     size_t size() const { return rd.size() + wr.size() + img_rd.size() + img_wr.size(); }
@@ -3352,6 +3357,67 @@ uint64_t g_cs_draw_overlaps = 0, g_cs_draw_conflicts = 0;
 std::vector<CsRange> g_draw_extra_rd;                      // the draw being set up: its index range (do_draw_elements)
 
 const void* cs_img_key(Texture* t) { return t->gpu ? static_cast<const void*>(t->gpu) : static_cast<const void*>(t); }
+
+// The subresources a binding's view covers (all of them without a view, and always for 3D images, whose layers are slices).
+CsImg cs_img(Texture* t, const TextureViewInfo* v) {
+    CsImg u{cs_img_key(t), 0, UINT32_MAX, 0, UINT32_MAX};
+    if (!v || t->b.target == NVN_TEXTURE_TARGET_3D) return u;
+    if (v->has_levels && v->min_level >= 0) {
+        u.l0 = static_cast<uint32_t>(v->min_level);
+        u.l1 = v->num_levels > 0 ? u.l0 + static_cast<uint32_t>(v->num_levels) : UINT32_MAX;
+    }
+    if (v->has_layers && v->min_layer >= 0) {
+        u.a0 = static_cast<uint32_t>(v->min_layer);
+        u.a1 = v->num_layers > 0 ? u.a0 + static_cast<uint32_t>(v->num_layers) : UINT32_MAX;
+    }
+    return u;
+}
+
+// Bindings of a module that the shader only queries (textureSize / textureQueryLevels / samples), never reads: (set << 16 | binding).
+// A dispatch that only asks an image for its size does not depend on what writes it (the probe filters of Fortune's Weave bind the
+// image they write as a texture too, for its size).
+bool spv_query_only(const ShaderInfo* sh, uint32_t set, uint32_t binding) {
+    static std::unordered_map<const ShaderInfo*, std::vector<uint32_t>> cache;
+    auto it = cache.find(sh);
+    if (it == cache.end()) {
+        std::vector<uint32_t> out;
+        const std::vector<uint32_t>& w = sh->spirv;
+        std::unordered_map<uint32_t, uint32_t> src, sets, binds;
+        std::unordered_map<uint32_t, int> use;          // root variable -> 1 queried only, 2 read
+        std::vector<std::pair<uint32_t, int>> ops;      // (image operand id, kind)
+        for (size_t i = 5; i < w.size();) {
+            const uint32_t n = w[i] >> 16, op = w[i] & 0xffffu;
+            if (n == 0 || i + n > w.size()) break;
+            const uint32_t* a = &w[i + 1];
+            if (op == 71 && n >= 4 && (a[1] == 33 || a[1] == 34)) (a[1] == 33 ? binds : sets)[a[0]] = a[2];   // Decorate Binding / DescriptorSet
+            else if ((op == 61 || op == 86 || op == 100 || op == 65 || op == 66) && n >= 4) src[a[1]] = a[2];  // Load, SampledImage, Image, AccessChain
+            else if (op >= 103 && op <= 107 && n >= 4) ops.push_back({a[2], 1});          // ImageQuery*
+            else if (op >= 87 && op <= 98 && n >= 4) ops.push_back({a[2], 2});            // ImageSample*, Fetch, Gather, Read, ...
+            else if (op == 99 && n >= 2) ops.push_back({a[0], 2});                        // ImageWrite
+            else if (((op >= 305 && op <= 320) || op == 60 || op >= 4500) && n >= 4) ops.push_back({a[2], 2});   // sparse, texel pointer, newer
+            i += n;
+        }
+        auto root = [&](uint32_t x) {
+            for (int k = 0; k < 16; ++k) {
+                auto f = src.find(x);
+                if (f == src.end()) break;
+                x = f->second;
+            }
+            return x;
+        };
+        for (const auto& o : ops) {
+            int& u = use[root(o.first)];
+            u = std::max(u, o.second);
+        }
+        for (const auto& b : binds) {
+            const auto u = use.find(b.first);
+            if (u != use.end() && u->second == 1) out.push_back(((sets.count(b.first) ? sets[b.first] : 0u) << 16) | b.second);
+        }
+        it = cache.emplace(sh, std::move(out)).first;
+    }
+    const uint32_t key = set << 16 | binding;
+    return std::find(it->second.begin(), it->second.end(), key) != it->second.end();
+}
 
 // Everything the dispatch about to run binds. False: a binding this does not follow.
 bool cs_collect(const ProgLayout& pl, uint64_t indirect, CsSet& o) {
@@ -3392,14 +3458,15 @@ bool cs_collect(const ProgLayout& pl, uint64_t indirect, CsSet& o) {
             case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
                 if (b.nvn.source == NvnSource::TexturePoolArray) { o.pool = true; break; }
                 if (b.nvn.source == NvnSource::SamplerPoolArray) break;
+                if (spv_query_only(d.shader, b.set, b.binding)) break;        // only its size is asked
                 const TexResolved r = resolve_texture(d);
-                if (r.tex) o.img_rd.push_back(cs_img_key(r.tex));
+                if (r.tex) o.img_rd.push_back(cs_img(r.tex, r.has_view ? &r.view : nullptr));
                 break;
             }
             case VK_DESCRIPTOR_TYPE_SAMPLER: break;
             case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
                 const TexResolved r = resolve_image(d);
-                if (r.tex) o.img_wr.push_back(cs_img_key(r.tex));
+                if (r.tex) o.img_wr.push_back(cs_img(r.tex, r.has_view ? &r.view : nullptr));
                 break;
             }
             default: return false;                                 // texel buffers (pool memory seen as texels) and anything else
@@ -3414,9 +3481,10 @@ bool cs_overlap(const std::vector<CsRange>& a, const std::vector<CsRange>& b) {
             if (x.a < y.b && y.a < x.b) return true;
     return false;
 }
-bool cs_has(const std::vector<const void*>& a, const std::vector<const void*>& b) {
-    for (const void* x : a)
-        if (std::find(b.begin(), b.end(), x) != b.end()) return true;
+bool cs_has(const std::vector<CsImg>& a, const std::vector<CsImg>& b) {
+    for (const CsImg& x : a)
+        for (const CsImg& y : b)
+            if (x.img == y.img && x.l0 < y.l1 && y.l0 < x.l1 && x.a0 < y.a1 && y.a0 < x.a1) return true;
     return false;
 }
 bool cs_conflict(const CsSet& open, const CsSet& n) {
@@ -3481,8 +3549,14 @@ void cs_after_dispatch() {
 }
 
 // Ops that record no GPU work (state and bindings) or that check the open dispatches themselves keep them open.
+bool game_barriers_tracked() {
+    static const bool tracked = nxrt::config_get_str("nvn", "game_barriers", "full") == "tracked";
+    return tracked;
+}
+
 bool cs_keeps_open(Op op) {
     if (op < Op::DrawArrays) return true;
+    if (op == Op::Barrier && game_barriers_tracked()) return true;      // the dispatches' dependencies are followed here (case Op::Barrier)
     if ((op == Op::DrawArrays || op == Op::DrawElements) && cs_draws_on()) return true;    // begin_draw checks (cs_check_draw)
     switch (op) {
         case Op::Dispatch: case Op::DispatchIndirect: case Op::FenceSync: case Op::WaitSync: case Op::CallCommands: case Op::PushDebugGroup:
@@ -3514,8 +3588,8 @@ void cs_check_draw(const ProgLayout& pl) {
                 if (v.addr) d.rd.push_back({v.addr, v.size ? v.addr + v.size : UINT64_MAX});
             d.rd.insert(d.rd.end(), g_draw_extra_rd.begin(), g_draw_extra_rd.end());
             for (uint32_t i = 0; i < S.ncolor && i < 8; ++i)
-                if (S.color_tex[i]) d.img_wr.push_back(cs_img_key(S.color_tex[i].get()));
-            if (S.depth_tex) d.img_wr.push_back(cs_img_key(S.depth_tex.get()));
+                if (S.color_tex[i]) d.img_wr.push_back(cs_img(S.color_tex[i].get(), nullptr));
+            if (S.depth_tex) d.img_wr.push_back(cs_img(S.depth_tex.get(), nullptr));
             dep = cs_conflict(g_cs_open_set, d);
         }
     }
@@ -3562,7 +3636,10 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
                     const uint32_t* w = reinterpret_cast<const uint32_t*>(r.tex->mem);
                     for (uint32_t i = 0; i < 64; ++i) { char t[16]; std::snprintf(t, sizeof t, " %08x", w[i]); words += t; }
                 }
-                TRACE("    cs b%u %s type %d -> %s @%p:%s", d.binding, b.name.c_str(), static_cast<int>(d.type), tex_desc(r.tex, c, sizeof c), r.tex ? static_cast<void*>(r.tex->mem) : nullptr, words.c_str());
+                TRACE("    cs b%u %s type %d -> %s view L%d+%d A%d+%d%s @%p:%s", d.binding, b.name.c_str(), static_cast<int>(d.type), tex_desc(r.tex, c, sizeof c),
+                      r.has_view && r.view.has_levels ? r.view.min_level : -1, r.has_view && r.view.has_levels ? r.view.num_levels : -1,
+                      r.has_view && r.view.has_layers ? r.view.min_layer : -1, r.has_view && r.view.has_layers ? r.view.num_layers : -1,
+                      spv_query_only(d.shader, b.set, b.binding) ? " (size query only)" : "", r.tex ? static_cast<void*>(r.tex->mem) : nullptr, words.c_str());
             }
         }
     }
@@ -4515,8 +4592,9 @@ void run_list(const CmdList& list, int depth) {
                 // barrier, copies and fills carry one, open dispatches are excluded here). Every later use of those attachments gets its
                 // own dependency (a layout change, or pending_conflict for the next pass on the same image), so the game's barrier adds
                 // nothing: it neither ends the pass nor drains the GPU.
-                static const bool tracked = nxrt::config_get_str("nvn", "game_barriers", "full") == "tracked";
-                if (tracked && g_tracked && !g_pass_unsafe && !g_cs_open && !g_xfb_active) {
+                // Open dispatches (dispatch_barriers = tracked) stay open: every later command either checks its dependency on them or
+                // closes them first.
+                if (game_barriers_tracked() && g_tracked && !g_pass_unsafe && !g_xfb_active && (!g_cs_open || cs_tracked_on())) {
                     counters().game_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
