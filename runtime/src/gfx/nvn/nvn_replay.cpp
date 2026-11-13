@@ -1299,8 +1299,12 @@ void prepare_textures(const ProgLayout& pl) {
             cap = std::chrono::milliseconds(std::max(pool_ms, burst_ms));
         }
     }
+    // [nvn] burst_defer_uncompressed (default off): during a burst, pool-only first uploads of uncompressed textures (UI images, look-up
+    // tables: their pool element is the dummy meanwhile, which can show as a wrong colour for a few frames) wait as well
+    static const bool burst_uncompressed = config_get_bool("nvn", "burst_defer_uncompressed", false);
     auto budgeted = [&](Texture* t, size_t i) {
-        return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)));
+        return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)) ||
+                               (burst && burst_uncompressed && i >= pool_from && tex_first_upload_uncompressed_deferrable(t)));
     };
     if (pool_ms > 0 && !need.empty()) {
         if (spent >= cap) {

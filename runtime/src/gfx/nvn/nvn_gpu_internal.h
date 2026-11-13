@@ -272,6 +272,9 @@ bool tex_first_upload_deferrable(Texture* t);
 // The image holds a stand-in of the texture's current content and the texture is waiting for its upload (its job's result is there, or the
 // render thread will keep the stand-in): the swap may wait a frame (the pool upload budget). Render thread.
 bool tex_standin_swap_pending(Texture* t);
+// The same as tex_first_upload_deferrable for an uncompressed texture from the game's memory ([nvn] burst_defer_uncompressed): its image
+// exists, never held content, is not rendered to. Render thread.
+bool tex_first_upload_uncompressed_deferrable(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
 // A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the
