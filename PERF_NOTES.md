@@ -317,5 +317,8 @@ cube and write their own level; the texture binding of the written cube is used 
 | gpu-2 | A (stats) vs B (five toggles), a7df953 | GPU hub_cold 15.11 -> 10.88 ms/frame, street_cold 15.02 -> 10.85 (-28%); busiest crowd windows avg 16.6 -> 12.4, p99 19.1 -> 15.0; full barriers 768 -> 378/frame; 1.95M of 2.94M dispatch barriers left out; render CPU unchanged; no visual differences. fps unchanged (game thread 16.7-20.7 ms) |
 | gpu-3 | soak of the recommended set (battle map, long run) + pass profile, 622901f | queued 13 Nov |
 
+State 13 Nov 13:00: the tester merged `a7df953` into perf-stutter (`f54db25`) with every default unchanged (off). The battle explore run
+x4-battle (perf-stutter, toggles off) already holds 59.3 fps at 72% GPU busy; gpu-3 measures it with the set on.
+
 Recommended set (after the gpu-3 soak, then as defaults): `dispatch_barriers = tracked` (`tracked_draws` never met a draw after an open
 dispatch), `game_barriers = tracked`, `batch_ubo_updates = true`, `feedback_levels = true`, `depth_ro_sticky = true`.
