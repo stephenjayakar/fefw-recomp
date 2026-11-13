@@ -273,6 +273,15 @@ What the profile (`tools/perf/prof_hitch.py`) showed and what followed (stutter-
 - Fast-travel arrival frames of 300-740 ms: the game's main thread is on the CPU for 95% of them ("presenting thread on the CPU" in the
   hitch line), in game code (`f_71000cd800`, `f_71000d3ee0` under romfs reads: probably decompression). Game-side; open.
 
+#### stutter-2 result (s2-default, 47ab015)
+
+hub_cold 57.2 fps avg, 1% low 38.5, 482 frames over 20 ms (s1 906, upstream b3 415), 4 over 33 ms, worst 36 ms (upstream 192). The
+menu_to_world load-in frame 582 ms (s1 892, upstream 3828, perf-stutter 17942); the load frame that lost 340 ms to the import counter
+went from 729 to 452 ms. street_cold / hub_warm / street_warm worst frames 457 / 278 / 421 ms: game code at fast-travel arrivals.
+
+stutter-3 (58d4987): during a burst, first uploads of textures the draws bind themselves wait too (the dummy is sampled meanwhile), and a
+draw needing more than 64 first uploads starts the burst at once.
+
 ## 6. GPU track (branch `perf/gpu`)
 
 Goal: GPU time per frame comfortably under 16.6 ms at native 3840x2160 (render ratio 1.0, no upscaler) on the RTX 3080 10 GB, in
