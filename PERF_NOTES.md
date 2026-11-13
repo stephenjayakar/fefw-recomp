@@ -233,6 +233,9 @@ pacing. Test requests go to `tmp/fefw-perf/queue/cpu-<n>/`.
 | same | `[nvn] tex_prep_priority = normal / below`: background texture workers below the game and render threads. | `normal` (unchanged) |
 | `sched: [sched] render_place = reserve ...` | One physical core with no console core on it (3700X: core 7 = CPUs 14-15, the CCX of main's core 6) is kept for nvn-render alone, and main's SMT sibling is kept free; guest threads get the smaller pool, and a sweeper moves every other host thread (runtime workers, driver threads) to that pool every 2 s. | `[sched] render_place = off` (unchanged) |
 | `nvn: [nvn] split_submit_ms ...` | At a render pass boundary, once N ms of a submission's recording have passed (16+ draws, `split_min_draws`), the command buffer so far goes to the GPU (no signal; the final buffer signals the serial) and recording continues in a fresh command buffer of the slot, with all command buffer state rebound. Not with queries or stream-out active, batched submits or a pending pool copy. The GPU starts on a long submission while the render thread still records it. | `0` (off) |
+| `core: import, HLE thunk and SVC call counters per thread ...` + `core: host_import resolves target and name in one lookup` + `d50e1ac` (import counter as a plain per-thread block) | Every cross-module call, HLE thunk call and SVC bumped a shared atomic; now each thread counts into its own block (`include/nxrt/tl_counts.h`), summed on read, and host_import resolves target and name in one lookup. | always on (same counts in reports) |
+| `nvn: command lists reserve their last size up front ...` | A command buffer's next list reserves the bytes and held objects of its last one (decaying hint, capped), so a big list is not grown and copied a dozen times while main records it. | always on |
+| `nvn: tex_sampled_view remembers the last sampled-format check ...` | The per-image `std::map<VkFormat,bool>` lookup per descriptor is skipped when the format is the last one checked. | always on |
 
 Tools: `tmp/fefw-perf/cpu/prof_fold.py <folded> <fefw_rt.map>` resolves sampled `fefw_rt.dll` offsets and prints per-thread self and
 inclusive tables.
@@ -253,5 +256,14 @@ inclusive tables.
   import-call counter `host_import` bumps on every cross-module call**, and the job workers guest-82..85 spend 46-52 % of their busy
   samples there. A shared counter written by ~20 threads at millions of calls a second: the cache line moves on every call.
   Fixed: per-thread counters (`tl_counts.h`) for imports, HLE thunks and SVCs, and one lookup per import (`import_resolve_named`).
-- The lifted game code is compiled at `-O1` by the player-side build (`tools/build/fefw_build.py`). An `-O2` fefw.exe is the biggest
-  remaining lever for the game thread; it needs a full exe rebuild (asked the tester: queue/cpu-2).
+- cpu-1 window 3: A2 (per-thread counters) = A within noise in steady state (main CPU unchanged: the counter only hurts under
+  load-time contention); H (`[kernel] spin_us = 40`) is a loss (street_cold 43.5 vs 50.9 fps, main CPU up, waits not down).
+- Run B (sampler, steady state, 4K, `tmp/fefw-perf/runs/c1-cpu1-B`): main's busy samples are **85.8 % lifted game code**, NVN
+  recording 5 % (a fifth of it vector growth, fixed), the import path ~3.5 %, SVCs ~2.5 %. The render thread at 2586 draws/frame
+  (street) replays 16.8 ms = 6.5 us/draw: descriptor sets 1.9, compute-out checks 1.1, texture prep 0.6, pipeline key 0.6, vertex
+  buffers 0.4, the draw call 0.2 (`nvn.rstats`); the hottest single leaves: run_list, build_set, tex_or_null, out_overlaps.
+- **The `-O1` in `tools/build/fefw_build.py` is not what it looks like:** the bundled Zig maps `-O1`, `-O2` and `-O3` all to clang
+  `-O2 -vectorize-loops -vectorize-slp` (`zig cc -###`). An `-O2` exe built at 4 jobs (1073 s) came out with every section the same
+  size as 0.1.7's. The game code is already -O2. Remaining compiler levers for the game thread: a profile-guided build (instrumented
+  exe, a profiling run of the real scenes, rebuild with the profile; typical 10-20 % on branchy code; several hours of build and
+  test time), or a native-ISA variant (`-mcpu=znver2`: LZCNT for the guest's CLZ, BMI2 shifts; a few % at most).
