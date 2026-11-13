@@ -188,6 +188,9 @@ struct CommandBuffer : Obj {
     CommandBuffer() : Obj(kKind) {}
     Ref<CmdList> rec;                 // the list being recorded (null when not recording)
     bool recording = false;
+    // The sizes of this buffer's last list: the next list reserves them up front, so recording a big list does not reallocate and copy its
+    // byte vector a dozen times as it grows (a fifth of the game thread's NVN recording time went to vector growth and its memcpy).
+    size_t bytes_hint = 0, held_hint = 0;
     // NVN2 nvnCommandBufferSetRecordingMode (the sdk keeps it at cmdbuf+0x18). It picks how the driver encodes the commands (a per-mode
     // header word ahead of each packet; a mode-2 buffer drops Barrier), not what they do, so the replay only keeps the value.
     int32_t recording_mode = 0;

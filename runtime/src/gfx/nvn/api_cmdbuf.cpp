@@ -362,6 +362,8 @@ void nvnCommandBufferBeginRecording(NVNcommandBuffer* c) {
     std::lock_guard<std::mutex> lk(cb->lock);
     cb->rec = Ref<CmdList>(new CmdList());
     cb->rec->meter = cb;
+    if (cb->bytes_hint) cb->rec->bytes.reserve(cb->bytes_hint + cb->bytes_hint / 8);
+    if (cb->held_hint) cb->rec->held.reserve(cb->held_hint + cb->held_hint / 8);
     cb->recording = true;
     cb->tpool = nullptr;
     cb->ctl_group = false;
@@ -382,6 +384,10 @@ NVNcommandHandle nvnCommandBufferEndRecording(NVNcommandBuffer* c) {
         if (!cb->recording || !cb->rec) return 0;
         list = std::move(cb->rec);
         cb->recording = false;
+        // the next list of this buffer starts with room for one like this; a much smaller one lets the hint decay (lists of one buffer vary)
+        constexpr size_t kHintMax = 64u << 20;
+        cb->bytes_hint = std::min(kHintMax, std::max(list->bytes.size(), cb->bytes_hint - cb->bytes_hint / 4));
+        cb->held_hint = std::min<size_t>(1u << 20, std::max(list->held.size(), cb->held_hint - cb->held_hint / 4));
         cb->tpool = nullptr;
         list->meter = nullptr;
         flush_segment(cb);
