@@ -15,6 +15,107 @@
 
 #define NX_BASE_UNUSED 0
 
+// NZCV in a local of the lifted function (nxrecomp/opt.py). The four flags are computed exactly as ctx.h's helpers do (and read
+// from there by get_nzcv, the context stores and any direct use), and the setter also records what it compared, so cond() can test
+// the operands directly: `cmp; b.ge` becomes one compare and branch instead of the N == V formula, which the host compiler does not
+// fold back. Each fast path is the same function of the operands as the flag formula it replaces (AArch64 condition semantics):
+//   subtraction a - b (adds with carry-in 1 of ~b): EQ a == b, CS a >= b, HI a > b, GE a >= b signed, GT a > b signed;
+//   FCMP a, b: EQ a == b, MI a < b, CS !(a < b), HI !(a <= b), GE a >= b, GT a > b, VS unordered.
+// Once inlined, the kind is a constant at almost every use and the unused fields disappear.
+enum { NXF_RAW = 0, NXF_ADD64, NXF_ADD32, NXF_FCMP };
+struct NxFlags {
+    uint32_t N, Z, C, V;
+    uint32_t k, cin;
+    uint64_t a, b;
+    double fa, fb;
+};
+#define NXF_INLINE static inline __attribute__((always_inline))
+NXF_INLINE uint64_t adds64(NxFlags *c, uint64_t a, uint64_t b, uint32_t cin) {
+    uint64_t r = a + b + cin;
+    c->N = (uint32_t)(r >> 63);
+    c->Z = r == 0;
+    c->C = (r < a) || (cin && r == a);
+    c->V = (uint32_t)(((a ^ r) & (b ^ r)) >> 63);
+    c->k = NXF_ADD64; c->a = a; c->b = b; c->cin = cin;
+    return r;
+}
+NXF_INLINE uint32_t adds32(NxFlags *c, uint32_t a, uint32_t b, uint32_t cin) {
+    uint64_t wide = (uint64_t)a + b + cin;
+    uint32_t r = (uint32_t)wide;
+    c->N = r >> 31;
+    c->Z = r == 0;
+    c->C = (uint32_t)(wide >> 32);
+    c->V = ((a ^ r) & (b ^ r)) >> 31;
+    c->k = NXF_ADD32; c->a = a; c->b = b; c->cin = cin;
+    return r;
+}
+NXF_INLINE uint64_t logic64(NxFlags *c, uint64_t r) { c->N = (uint32_t)(r >> 63); c->Z = r == 0; c->C = 0; c->V = 0; c->k = NXF_RAW; return r; }
+NXF_INLINE uint32_t logic32(NxFlags *c, uint32_t r) { c->N = r >> 31; c->Z = r == 0; c->C = 0; c->V = 0; c->k = NXF_RAW; return r; }
+NXF_INLINE void set_nzcv(NxFlags *c, int f) { c->N = (f >> 3) & 1; c->Z = (f >> 2) & 1; c->C = (f >> 1) & 1; c->V = f & 1; c->k = NXF_RAW; }
+NXF_INLINE uint64_t get_nzcv(const NxFlags *c) { return ((uint64_t)c->N << 31) | ((uint64_t)c->Z << 30) | ((uint64_t)c->C << 29) | ((uint64_t)c->V << 28); }
+NXF_INLINE void fcmp(NxFlags *c, double a, double b) {
+    if (a != a || b != b) set_nzcv(c, 3);
+    else if (a == b) set_nzcv(c, 6);
+    else if (a < b) set_nzcv(c, 8);
+    else set_nzcv(c, 2);
+    c->k = NXF_FCMP; c->fa = a; c->fb = b;
+}
+NXF_INLINE int cond(const NxFlags *c, int cc) {
+    int r;
+    if (c->k == NXF_ADD64 && c->cin == 1) {             // SUBS / CMP a, b with b = ~c->b
+        const uint64_t a = c->a, b = ~c->b;
+        switch (cc >> 1) {
+        case 0: r = a == b; break;
+        case 1: r = a >= b; break;
+        case 4: r = a > b; break;
+        case 5: r = (int64_t)a >= (int64_t)b; break;
+        case 6: r = (int64_t)a > (int64_t)b; break;
+        case 7: return 1;
+        default: goto raw;
+        }
+        return (cc & 1) ? !r : r;
+    }
+    if (c->k == NXF_ADD32 && c->cin == 1) {
+        const uint32_t a = (uint32_t)c->a, b = ~(uint32_t)c->b;
+        switch (cc >> 1) {
+        case 0: r = a == b; break;
+        case 1: r = a >= b; break;
+        case 4: r = a > b; break;
+        case 5: r = (int32_t)a >= (int32_t)b; break;
+        case 6: r = (int32_t)a > (int32_t)b; break;
+        case 7: return 1;
+        default: goto raw;
+        }
+        return (cc & 1) ? !r : r;
+    }
+    if (c->k == NXF_FCMP) {
+        const double a = c->fa, b = c->fb;
+        switch (cc >> 1) {
+        case 0: r = a == b; break;
+        case 1: r = !(a < b); break;
+        case 2: r = a < b; break;
+        case 3: r = a != a || b != b; break;
+        case 4: r = !(a <= b); break;
+        case 5: r = a >= b; break;
+        case 6: r = a > b; break;
+        default: return 1;
+        }
+        return (cc & 1) ? !r : r;
+    }
+raw:
+    switch (cc >> 1) {
+    case 0: r = c->Z; break;
+    case 1: r = c->C; break;
+    case 2: r = c->N; break;
+    case 3: r = c->V; break;
+    case 4: r = c->C && !c->Z; break;
+    case 5: r = c->N == c->V; break;
+    case 6: r = c->N == c->V && !c->Z; break;
+    default: return 1;
+    }
+    return (cc & 1) ? !r : r;
+}
+
 namespace nx {
 
 using ::adds64; using ::adds32; using ::logic64; using ::logic32; using ::set_nzcv; using ::get_nzcv;
@@ -129,13 +230,15 @@ NX_INLINE void barrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 NX_INLINE uint64_t subs64(Ctx *c, uint64_t a, uint64_t b) { return adds64(c, a, ~b, 1); }
 NX_INLINE uint32_t subs32(Ctx *c, uint32_t a, uint32_t b) { return adds32(c, a, ~b, 1); }
+NX_INLINE uint64_t subs64(NxFlags *c, uint64_t a, uint64_t b) { return adds64(c, a, ~b, 1); }
+NX_INLINE uint32_t subs32(NxFlags *c, uint32_t a, uint32_t b) { return adds32(c, a, ~b, 1); }
 
 
 
 
 
-template <typename F>
-NX_INLINE void fcmp(Ctx *c, F a, F b) {
+template <typename F, typename C>
+NX_INLINE void fcmp(C *c, F a, F b) {
     if (std::isnan(a) || std::isnan(b))
         set_nzcv(c, 0b0011);
     else if (a == b)

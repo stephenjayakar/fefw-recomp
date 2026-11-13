@@ -80,7 +80,10 @@ CPU_VARIANTS = {
 }
 # recomp/cmake/NxRecomp.cmake flags for the lifted code, in clang (not clang-cl) syntax, plus NX_INLINE_INDIRECT
 # (recomp/games/fefw/CMakeLists.txt); -mcpu per variant. -ffp-contract=off: no multiply and add is fused that the guest kept apart.
-CXXFLAGS_COMMON = ['-std=c++20', '-O1', '-w', '-fno-exceptions', '-fno-rtti', '-fno-strict-aliasing', '-ffp-contract=off', '-fno-math-errno',
+# The bundled zig c++ turns -O1, -O2 and -O3 alike into clang -O2 (plus loop and SLP vectorisation; `zig c++ -###` shows it). -g0: no
+# debug info (zig adds CodeView by default; nothing reads it, and the compile is faster without). -fomit-frame-pointer: one more host
+# register for the lifted code (zig keeps RBP frames by default); host unwinding uses the .pdata tables, not frame pointers.
+CXXFLAGS_COMMON = ['-std=c++20', '-O1', '-g0', '-fomit-frame-pointer', '-w', '-fno-exceptions', '-fno-rtti', '-fno-strict-aliasing', '-ffp-contract=off', '-fno-math-errno',
                    '-fno-threadsafe-statics', '-DNX_INLINE_INDIRECT']
 
 

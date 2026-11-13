@@ -32,6 +32,8 @@ class Config(GameConfig):
         ModuleSpec('rtld', 0x7700000000, 'rtld'),
     ]
     overrides = {}
+    # nxrecomp/opt.py: NZCV in function locals (perf/codegen; fewer and shorter x86 instructions, the same guest behaviour)
+    opt = ('flags',)
     # rtld's process entry (0x0): this rtld has an FDE there, Pokopia's has none; listed so discovery roots it either way
     extra_entries = {'rtld': [0x0]}
     patches = None

@@ -41,6 +41,11 @@ class GameConfig:
     # time-limit fallback (cmake/nx_cc_launcher.py) lowers it when a file still takes too long
     optnone_insns = 20000
 
+    # function-level optimisation of the generated C++ (nxrecomp/opt.py), a tuple of: 'flags' (NZCV in locals and never stored
+    # across calls and returns, which the AAPCS64 leaves undefined), 'xregs' / 'vregs' (X / V registers in locals: experimental,
+    # not faster so far). Empty: the output is as before. The environment variable NXRECOMP_OPT overrides it.
+    opt = ()
+
     # host function names to treat as noreturn-like terminators (none by default)
     noreturn_imports = ()
 
