@@ -1223,6 +1223,10 @@ void prepare_textures(const ProgLayout& pl) {
         if (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform && b.nvn.source != NvnSource::ImageBinding) continue;
         TexResolved r = resolve_texture(d);
         if (!r.tex) continue;
+        if (!r.tex->gpu && tex_first_upload_deferrable(r.tex)) {   // an asset with no image yet: made when its upload runs (it may wait)
+            need.push_back(r.tex);
+            continue;
+        }
         if (!tex_gpu(r.tex)) continue;
         // owned by the pass; a compute dispatch runs outside every pass, so the graphics attachments do not own what it samples
         if (shares_image(r.tex, S.depth_tex.get()) || (d.nvn_stage != kCompute && is_color_feedback(r.tex))) continue;
