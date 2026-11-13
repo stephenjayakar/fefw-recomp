@@ -1268,10 +1268,12 @@ void prepare_textures(const ProgLayout& pl) {
     static uint64_t budget_present = ~0ull;
     static std::chrono::steady_clock::duration spent{}, cap{};
     static bool burst = false;
+    static std::unordered_set<Texture*> firsts_frame;   // distinct textures whose first upload the draws of this frame needed
     const uint64_t now_p = counters().presents.load(std::memory_order_relaxed);
     if (now_p != budget_present) {
         budget_present = now_p;
         spent = std::chrono::steady_clock::duration::zero();
+        firsts_frame.clear();
         burst = static_cast<int64_t>(pool_held_backlog()) > backlog_n;
         cap = std::chrono::milliseconds(std::max<int64_t>(0, burst ? std::max(pool_ms, burst_ms) : pool_ms));
     }
@@ -1283,12 +1285,16 @@ void prepare_textures(const ProgLayout& pl) {
     // the draw samples the dummy texture until theirs is in (descriptor resolution below). A load-in's first frame still made 583 uploads, most
     // of them bound, in 582 ms (s2-default). Outside a burst bound textures always go at once.
     static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", true);
-    // a draw that needs more than pool_upload_backlog first uploads (the first frame after a loading screen) starts the burst at once
-    if (pool_ms > 0 && !burst && need.size() > static_cast<size_t>(std::max<int64_t>(0, backlog_n))) {
-        size_t firsts = 0;
+    // more than pool_upload_backlog first uploads needed by this frame's draws so far (the first frame after a loading screen, spread over
+    // many draws) start the burst at once; s3-default's load-in frame still made 576 uploads with the per-draw count
+    if (pool_ms > 0 && !burst) {
+        const size_t lim = static_cast<size_t>(std::max<int64_t>(0, backlog_n));
         for (Texture* t : need)
-            if (tex_first_upload_deferrable(t) && ++firsts > static_cast<size_t>(backlog_n)) break;
-        if (firsts > static_cast<size_t>(backlog_n)) {
+            if (tex_first_upload_deferrable(t)) {
+                firsts_frame.insert(t);
+                if (firsts_frame.size() > lim) break;
+            }
+        if (firsts_frame.size() > lim) {
             burst = true;
             cap = std::chrono::milliseconds(std::max(pool_ms, burst_ms));
         }
