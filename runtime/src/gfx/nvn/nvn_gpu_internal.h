@@ -263,6 +263,10 @@ uint32_t tex_layers(Texture* t);
 bool tex_is_depth(Texture* t);
 // Readiness aligned with supported uploads; retains layout dependencies.
 bool tex_pool_preparation_pending(Texture* t);
+// A texture whose first upload may wait for a later frame when it is only needed through a texture pool ([nvn] pool_upload_ms): an asset texture
+// (ASTC or BCn from the game's memory) whose image never held content, is not rendered to, and is not a depth image. Its pool element is the dummy
+// until then. Render thread.
+bool tex_first_upload_deferrable(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
 // A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the

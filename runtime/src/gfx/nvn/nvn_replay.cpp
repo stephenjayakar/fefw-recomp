@@ -1197,6 +1197,9 @@ void vol3d_prepare(const ProgLayout& pl) {
     }
 }
 
+std::atomic<uint64_t> g_pool_uploads_deferred{0};
+const bool g_pool_deferred_hitch = (nxrt::hitch_add_counter("pool_uploads_deferred", []() -> uint64_t { return g_pool_uploads_deferred.load(std::memory_order_relaxed); }), true);
+
 // Makes the textures a draw samples current (uploaded, in their sampled layout) and the storage images it binds writable (GENERAL).
 // Ends the pass when it has to touch images. The depth attachment itself is left to the pass.
 void prepare_textures(const ProgLayout& pl) {
@@ -1227,11 +1230,13 @@ void prepare_textures(const ProgLayout& pl) {
             if (r.tex->cpu_dirty.load() && ft::on()) ft::mark(b.nvn.source == NvnSource::SamplerBinding ? "tx.dirty_bind" : "tx.dirty_uniform", r.tex->id);
         }
     }
+    size_t pool_from = need.size();   // need[pool_from..]: textures only needed because the pools hold them
     if (pl.has_set[kPoolSet]) {
         // a shader indexing the pools may sample any registered texture: those not ready, except what the pass renders to (their pool
         // elements hold the dummy meanwhile, nvn_pipeline.cpp)
         const bool compute = std::any_of(pl.bindings.begin(), pl.bindings.end(), [](const BindingDesc& d) { return d.nvn_stage == kCompute; });
         const size_t from = need.size();
+        pool_from = from;
         pool_textures_to_prepare(S.tpool.get(), need);
         need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(from), need.end(),
                                   [&](Texture* t) { return shares_image(t, S.depth_tex.get()) || (!compute && is_color_feedback(t)); }),
@@ -1246,9 +1251,31 @@ void prepare_textures(const ProgLayout& pl) {
     for (Texture* t : need_storage) out_texture_read(t);
     end_pass(true);     // layout changes and uploads follow: each carries the dependency for its own image
     counters().pass_breaks.fetch_add(1, std::memory_order_relaxed);
-    for (Texture* t : need) {
+    // [nvn] pool_upload_ms (default 24; 0 = no limit): the first uploads of asset textures that a draw needs only because a texture pool holds
+    // them (not bound by the draw itself) take at most this much render-thread time per presented frame; the rest stay not ready (their pool
+    // elements are the dummy) and go in the next frames. A load-in registers thousands of textures and uploaded them all before its first
+    // draw: 4378 uploads, 3.8 GB, an 8 s frame at 4K (x2-explore). Bound textures, rewrites of uploaded textures, render targets and
+    // uncompressed data are never held back.
+    static const int64_t pool_ms = config_get_int("nvn", "pool_upload_ms", 24);
+    static uint64_t budget_present = ~0ull;
+    static std::chrono::steady_clock::duration spent{};
+    const uint64_t now_p = counters().presents.load(std::memory_order_relaxed);
+    if (now_p != budget_present) {
+        budget_present = now_p;
+        spent = std::chrono::steady_clock::duration::zero();
+    }
+    const auto cap = std::chrono::milliseconds(std::max<int64_t>(0, pool_ms));
+    for (size_t i = 0; i < need.size(); ++i) {
+        Texture* t = need[i];
+        const bool slice = pool_ms > 0 && i >= pool_from && tex_first_upload_deferrable(t);
+        if (slice && spent >= cap) {
+            g_pool_uploads_deferred.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const auto t0 = slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         tex_ensure_current(t, *F);
         tex_transition(t, *F, tex_sampled_layout(t));
+        if (slice) spent += std::chrono::steady_clock::now() - t0;
     }
     for (Texture* t : need_storage) {
         if (tex_scale(t) != 1.0f) tex_rescale(t, *F, 1.0f, "bound as a storage image");   // imageStore coordinates are not scaled (Ryujinx: ResScaleUnsupported)

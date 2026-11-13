@@ -2162,6 +2162,12 @@ uint32_t tex_layers(Texture* t) { return t->layers; }
 
 bool tex_is_depth(Texture* t) { return t->fmt && t->fmt->aspect != kAspectColor; }
 
+bool tex_first_upload_deferrable(Texture* t) {
+    const TexGpu* g = t ? t->gpu : nullptr;
+    return g && !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f && t->fmt && (t->fmt->astc || t->fmt->bc) &&
+           (t->mem || t->vpool) && t->cpu_dirty.load(std::memory_order_relaxed);
+}
+
 bool tex_pool_preparation_pending(Texture* t) {
     const TexGpu* g = t ? t->gpu : nullptr;
     if (!g || g->failed) return true; // caller normally initializes/checks the image first
