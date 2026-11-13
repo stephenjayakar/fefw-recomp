@@ -1283,6 +1283,16 @@ void prepare_textures(const ProgLayout& pl) {
     // the draw samples the dummy texture until theirs is in (descriptor resolution below). A load-in's first frame still made 583 uploads, most
     // of them bound, in 582 ms (s2-default). Outside a burst bound textures always go at once.
     static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", true);
+    // a draw that needs more than pool_upload_backlog first uploads (the first frame after a loading screen) starts the burst at once
+    if (pool_ms > 0 && !burst && need.size() > static_cast<size_t>(std::max<int64_t>(0, backlog_n))) {
+        size_t firsts = 0;
+        for (Texture* t : need)
+            if (tex_first_upload_deferrable(t) && ++firsts > static_cast<size_t>(backlog_n)) break;
+        if (firsts > static_cast<size_t>(backlog_n)) {
+            burst = true;
+            cap = std::chrono::milliseconds(std::max(pool_ms, burst_ms));
+        }
+    }
     auto budgeted = [&](Texture* t, size_t i) {
         return pool_ms > 0 && (((i >= pool_from || (burst && bound_defer)) && tex_first_upload_deferrable(t)) || (swap_budget && tex_standin_swap_pending(t)));
     };
