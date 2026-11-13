@@ -1252,15 +1252,21 @@ void prepare_textures(const ProgLayout& pl) {
     // elements are the dummy) and go in the next frames. A load-in registers thousands of textures and uploaded them all before its first
     // draw: 4378 uploads, 3.8 GB, an 8 s frame at 4K (x2-explore). Bound textures, rewrites of uploaded textures, render targets and
     // uncompressed data are never held back.
-    static const int64_t pool_ms = config_get_int("nvn", "pool_upload_ms", 24);
+    // [nvn] pool_upload_ms (default 6) is the budget while only a few textures wait, so the frame stays near its usual time; with a backlog of
+    // more than [nvn] pool_upload_backlog (64) held back in the previous frame (a load-in, a fast travel) it is [nvn] pool_upload_burst_ms
+    // (24): the area streams in within a second or so at a lower frame rate. A flat 24 ms made walking through a cold area show twice the
+    // frames over 20 ms (s1-stutter1, hub_cold).
+    static const int64_t pool_ms = config_get_int("nvn", "pool_upload_ms", 6);
+    static const int64_t burst_ms = config_get_int("nvn", "pool_upload_burst_ms", 24);
+    static const int64_t backlog_n = config_get_int("nvn", "pool_upload_backlog", 64);
     static uint64_t budget_present = ~0ull;
-    static std::chrono::steady_clock::duration spent{};
+    static std::chrono::steady_clock::duration spent{}, cap{};
     const uint64_t now_p = counters().presents.load(std::memory_order_relaxed);
     if (now_p != budget_present) {
         budget_present = now_p;
         spent = std::chrono::steady_clock::duration::zero();
+        cap = std::chrono::milliseconds(std::max<int64_t>(0, static_cast<int64_t>(pool_held_backlog()) > backlog_n ? std::max(pool_ms, burst_ms) : pool_ms));
     }
-    const auto cap = std::chrono::milliseconds(std::max<int64_t>(0, pool_ms));
     if (pool_ms > 0 && pool_from < need.size()) {
         if (spent >= cap) {
             // the frame's budget is spent: the held-back textures leave the list before the pass is ended for them (each draw that indexes

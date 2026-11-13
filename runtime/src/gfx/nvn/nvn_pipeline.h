@@ -169,6 +169,8 @@ void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out);
 // The texture's first upload waits for a later frame ([nvn] pool_upload_ms): until this frame ends it is left out of the lists every draw looks
 // through (its pool elements keep the dummy); the next frame's first look takes it up again. Render thread.
 void pool_hold(Texture* t);
+// How many textures the last frame that held any held back (the backlog the pool upload budget looks at).
+size_t pool_held_backlog();
 // Some registration, layout move or CPU write since the pair was last made current: the replay sets its bindings again. O(1).
 bool pool_state_moved(TexturePool* tp, SamplerPool* sp);
 void pool_sets_shutdown();                       // device idle

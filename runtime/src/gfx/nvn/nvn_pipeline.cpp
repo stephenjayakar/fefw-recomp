@@ -971,6 +971,7 @@ std::vector<Ref<Texture>> g_layout_moves;       // pool_note_layout, drained by 
 // at the first look of the next frame they are looked at again (one full scan, and back into the pending lists). Render thread.
 std::unordered_set<Texture*> g_held;
 uint64_t g_held_present = 0;
+size_t g_held_prev = 0;                         // how many the last frame that held any held back
 constexpr size_t kPoolWatchMax = 4096;          // a longer watch list becomes "look at every texture" (PoolRes::all)
 // Bumped by everything that may change whether a watched texture is ready to be sampled (a layout change, a CPU write). The end of a pass,
 // after which the replay no longer leaves its attachments alone, needs none: end_pass marks every binding dirty, so the next draw looks anyway.
@@ -1182,8 +1183,12 @@ bool changed_since(Pool* p, uint64_t from, uint64_t* now, std::vector<uint32_t>&
 
 // The held textures of the frame that ended go back to being looked at (pool_hold). True when there were any.
 bool release_held() {
-    if (g_held.empty()) return false;
     if (counters().presents.load(std::memory_order_relaxed) == g_held_present) return false;
+    if (g_held.empty()) {
+        g_held_prev = 0;                        // a frame went by without holding anything: no backlog
+        return false;
+    }
+    g_held_prev = g_held.size();
     g_held.clear();
     for (auto& r : g_pool_res) r->all = true;
     for (auto& pp : g_pool_pairs)
@@ -1433,6 +1438,11 @@ void pool_texture_remade(Texture* t) {
             if (x && (x == t || (g && x->gpu == g))) pool_note_change(*tp, static_cast<int>(id));
         }
     }
+}
+
+size_t pool_held_backlog() {
+    // the textures held in the frame that ended (released at the first look of this one), or held so far in this one
+    return std::max(g_held_prev, g_held.size());
 }
 
 void pool_hold(Texture* t) {
