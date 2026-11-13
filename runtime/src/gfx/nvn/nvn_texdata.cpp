@@ -570,6 +570,13 @@ int entry_qualities(AstcQuality am, int q[2]) {
 }
 }  // namespace
 
+thread_local EntryFormatHook t_entry_hook = nullptr;
+thread_local void* t_entry_hook_ctx = nullptr;
+void set_entry_format_hook(EntryFormatHook fn, void* ctx) {
+    t_entry_hook = fn;
+    t_entry_hook_ctx = ctx;
+}
+
 VkFormat cache_entry_format(const Texture& t, bool no_disk) {
     if (!t.mem) return VK_FORMAT_UNDEFINED;
     // no_disk: what this process learned only. No non-BC7 entry seen yet (the usual case): BC7, without hashing the storage.
@@ -662,6 +669,8 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                 else if (ef == bc7_format && (want == VK_FORMAT_UNDEFINED || want == bc7_format)) { mode = Mode::Bc7; chosen = i; }
             }
             entry_applies = chosen >= 0;
+            if (t_entry_hook) t_entry_hook(t_entry_hook_ctx, entry_applies && (mode == Mode::Rgba8 || mode == Mode::Bc5) ? (mode == Mode::Bc5 ? bc5_format : rgba8_format)
+                                                                                                                  : VK_FORMAT_UNDEFINED);
             const int use = entry_applies ? chosen : nq - 1;   // no usable entry: the fast preset's file is where a transcode goes
             key = cand[use].key;
             cache_file = cand[use].path;

@@ -75,6 +75,11 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
 // no_disk ([nvn] tex_async = standin, render thread): no file is opened; only the entries this process has already read, peeked or written count
 // (an unseen RGBA8 / BC5 entry then gets a BC7 image, and its texture a BC7 transcode in the background: a little less exact, never a stall).
 VkFormat cache_entry_format(const Texture& t, bool no_disk = false);
+// The calling thread's prepare_texture tells `fn(ctx, format)` the format the image needs as soon as it knows it, before reading the entry's data:
+// the entry's format when it is RGBA8 or BC5, VK_FORMAT_UNDEFINED for BC7 or no entry (the background job sets it; the render thread making the
+// texture's image then need not wait for the whole job, texprep::peek_entry_format). Null: off. Thread-local.
+using EntryFormatHook = void (*)(void* ctx, VkFormat format);
+void set_entry_format_hook(EntryFormatHook fn, void* ctx);
 // Texture content override (nxrt/tex_override.h). apply: when a hook is set and it answers for the texture, replaces bc7 (the tight
 // linear BC7 blocks of the w x h texture) with the encoded answer.
 bool texture_override_active();

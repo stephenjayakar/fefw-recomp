@@ -39,6 +39,8 @@ struct Entry {
     uint64_t seq = 0;                        // identifies the queued job (bumped to cancel it)
     bool again = false;                      // written again while the job ran: queue another when it ends
     bool slow = false;                       // Running: the job found no cache entry and transcodes (take does not wait for it)
+    bool fmt_known = false;                  // Running: the job knows the format the image needs (entry_hook), fmt_pub
+    VkFormat fmt_pub = VK_FORMAT_UNDEFINED;
     uint64_t held = 0;                       // bytes accounted for this entry
     std::unique_ptr<PreparedTexture> res;
     gfx::Buffer stage;                       // big results: the data already copied into a host-visible buffer for the upload (res->data is then empty)
@@ -236,6 +238,22 @@ void debounce_locked(Texture* t) {
     s.cv_work.notify_all();
 }
 
+// The running job's prepare_texture knows the image format (the entry's) before it reads the data: published for peek_entry_format, which
+// the render thread calls while it makes the texture's image. It waited up to tex_prep_wait_ms for the whole job (a cache read) instead:
+// image creation took 2.3 ms at p90 in a 4K run, 234 ms for 122 images in one load-in frame.
+void entry_hook(void* ctx, VkFormat f) {
+    Texture* t = static_cast<Texture*>(ctx);
+    State& s = S();
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        auto it = s.map.find(t);
+        if (it == s.map.end() || it->second.st != Entry::Running) return;
+        it->second.fmt_known = true;
+        it->second.fmt_pub = f;
+    }
+    s.cv_done.notify_all();
+}
+
 void worker_main() {
     log_set_thread_name("nvn-texprep");
     State& s = S();
@@ -273,9 +291,11 @@ void worker_main() {
         if (it == s.map.end() || it->second.seq != job.seq || it->second.st != Entry::Queued) continue;   // cancelled: the render thread took the texture back
         Entry& e = it->second;
         e.st = Entry::Running;
+        e.fmt_known = false;
         e.job_gen = t->prep_gen.load(std::memory_order_acquire);
         const uint32_t gen = e.job_gen;
         lk.unlock();
+        set_entry_format_hook(entry_hook, t);
 
         auto res = std::make_unique<PreparedTexture>();
         bool crashed = false, ok = false;
@@ -321,6 +341,7 @@ void worker_main() {
             }
         }
 
+        set_entry_format_hook(nullptr, nullptr);
         lk.lock();
         Entry& e2 = s.map[t];   // the entry is never erased while a job runs (the render thread only erases Queued and Done entries)
         e2.slow = false;
@@ -531,6 +552,10 @@ bool peek_entry_format(Texture* t, VkFormat& entry) {
         if (it == s.map.end()) return false;
         Entry& e = it->second;
         if (e.st == Entry::Running && e.job_gen == t->prep_gen.load(std::memory_order_acquire)) {
+            if (e.fmt_known) {          // the job has looked at the cache entry: its format is known before the job is done
+                entry = e.fmt_pub;
+                return true;
+            }
             if (e.slow) return false;   // no cache entry: the job transcodes (seconds); the caller looks the texture up itself, as with no job
             if (s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout) return false;
             continue;
