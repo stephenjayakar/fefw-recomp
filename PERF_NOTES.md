@@ -250,3 +250,25 @@ uncompressed textures 50 ms; image creation under the trace's 30 us floor. So th
 (575c10f), then the count (1726755).
 
 Test request `queue/stutter-1` (DLL 72f45f52, a07e3e2).
+
+#### stutter-1 result (tester run s1-stutter1, 7d72d56, 4K hub scenario)
+
+| scene | stutter-1 | upstream 0.1.7 (b3) | perf-stutter (b2) |
+|---|---|---|---|
+| menu_to_world worst frame | 312 ms (+ one 892 ms load-in upload frame) | 419 ms (+ 3828 ms) | 624 ms (+ 17942 ms) |
+| hub_cold | 0 frames > 100 ms, worst 46 ms; but 906 frames > 20 ms | 1 > 100 ms (192); 415 > 20 ms | 1 (216); 531 |
+| street_cold / hub_warm / street_warm worst | 450 / 288 / 414 ms | 433 / 301 / 370 | 462 / 303 / 404 |
+
+0 render-thread BC7 reads (2875 on texprep), texprep evictions 439 (b2: 4123), no texture faults in the stills.
+
+What the profile (`tools/perf/prof_hitch.py`) showed and what followed (stutter-2):
+
+- 729 ms load frame: the main thread 170 of 339 samples and a job worker 151 in one contended atomic, the global import-call counter in
+  `host_import`: striped per thread (e7a2c85).
+- 892 ms load-in frame: bc7e encode of the stand-ins' 64/32 px levels 97 of 254 upload samples (2389144, `standin_encode_px` 16); 3093
+  images created in the frame, 151 ms (7b46ffa, lazy images for held textures).
+- hub_cold's extra 20 ms frames: every pool draw re-scanned the held textures (c17ea4d) and the flat 24 ms budget stretched streaming
+  frames (6dc02c8: 6 ms, 24 ms only with a backlog).
+- 246 ms arrival frame: a render-thread pool chunk import only to GPU-untile a first upload (2389144, `untile_import` false).
+- Fast-travel arrival frames of 300-740 ms: the game's main thread is on the CPU for 95% of them ("presenting thread on the CPU" in the
+  hitch line), in game code (`f_71000cd800`, `f_71000d3ee0` under romfs reads: probably decompression). Game-side; open.
