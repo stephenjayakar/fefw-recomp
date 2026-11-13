@@ -3884,6 +3884,11 @@ void do_copy_texture_texture(const P_CopyTexTex& p) {
     ss.level -= tex_level_drop(s);   // image levels from here on
     ds.level -= tex_level_drop(d);
     if (sr.w <= 0 || sr.h <= 0 || dr.w <= 0 || dr.h <= 0) return;
+    if (g_trace) {
+        char a1[96], a2[96];
+        TRACE("copy texture %s level %u layer %u region %d,%d %dx%dx%d -> %s level %u layer %u region %d,%d %dx%dx%d flags %x", tex_desc(s, a1, sizeof a1), ss.level,
+              ss.layer, sr.x, sr.y, sr.w, sr.h, sr.d, tex_desc(d, a2, sizeof a2), ds.level, ds.layer, dr.x, dr.y, dr.w, dr.h, dr.d, p.flags);
+    }
     tex_ensure_exact(s, *F);
     if (s != d) tex_ensure_exact(d, *F);
     const bool same = s == d;
