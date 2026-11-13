@@ -35,6 +35,7 @@
 #include "nvn_format.h"
 #include "nvn_mask_clear.h"
 #include "nvn_gpu_internal.h"
+#include "nvn_texprep.h"
 #include "nvn_tess_gen.h"
 #include "nxrt/lowlat.h"
 #include "extras/hdr_nvn.h"
@@ -1265,6 +1266,10 @@ void prepare_textures(const ProgLayout& pl) {
         spent = std::chrono::steady_clock::duration::zero();
     }
     const auto cap = std::chrono::milliseconds(std::max<int64_t>(0, pool_ms));
+    // the textures whose background result is ready go first: an upload buffer to adopt costs far less than a stand-in or a CPU untile, and
+    // the others get more time for their jobs
+    if (pool_ms > 0 && pool_from + 1 < need.size())
+        std::stable_partition(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(), [](Texture* t) { return texprep::has_result(t); });
     for (size_t i = 0; i < need.size(); ++i) {
         Texture* t = need[i];
         const bool slice = pool_ms > 0 && i >= pool_from && tex_first_upload_deferrable(t);

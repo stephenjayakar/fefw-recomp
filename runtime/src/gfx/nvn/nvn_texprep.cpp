@@ -695,6 +695,14 @@ void provisional_uploaded(Texture* t) {
     if (!t->destroyed.load()) schedule_locked(t, true, true);
 }
 
+bool has_result(Texture* t) {
+    if (!t || !enabled()) return false;
+    State& s = S();
+    std::lock_guard<std::mutex> lk(s.mu);
+    auto it = s.map.find(t);
+    return it != s.map.end() && it->second.st == Entry::Done && it->second.job_gen == t->prep_gen.load(std::memory_order_acquire);
+}
+
 bool standin_on_screen(Texture* t) {
     if (!t || !enabled() || !async_standin_cfg()) return false;
     return t->prep_prov.load(std::memory_order_acquire) == (t->prep_gen.load(std::memory_order_acquire) | 0x80000000u);
