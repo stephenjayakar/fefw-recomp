@@ -1266,7 +1266,12 @@ void prepare_textures(const ProgLayout& pl) {
             // the frame's budget is spent: the held-back textures leave the list before the pass is ended for them (each draw that indexes
             // the pools would otherwise break the render pass for uploads it then skips)
             const size_t before = need.size();
-            need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(), [](Texture* t) { return tex_first_upload_deferrable(t); }),
+            need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(),
+                                      [](Texture* t) {
+                                          if (!tex_first_upload_deferrable(t)) return false;
+                                          pool_hold(t);   // out of the lists the next draws of this frame look through
+                                          return true;
+                                      }),
                        need.end());
             g_pool_uploads_deferred.fetch_add(before - need.size(), std::memory_order_relaxed);
         } else if (pool_from + 1 < need.size()) {
@@ -1285,6 +1290,7 @@ void prepare_textures(const ProgLayout& pl) {
         const bool slice = pool_ms > 0 && i >= pool_from && tex_first_upload_deferrable(t);
         if (slice && spent >= cap) {
             g_pool_uploads_deferred.fetch_add(1, std::memory_order_relaxed);
+            pool_hold(t);
             continue;
         }
         const auto t0 = slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

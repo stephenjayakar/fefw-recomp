@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "nxrt/config.h"
 #include "nxrt/ftrace.h"
@@ -938,6 +939,7 @@ struct PoolCopy {
     uint64_t tex_version = 0, smp_version = 0;  // the registrations it holds
     uint64_t used = 0, used_before = 0;         // serial of the last submission that bound it, and of the one before that
     std::vector<uint32_t> pending;              // texture ids holding the dummy until their texture is in its sampled layout
+    std::vector<uint32_t> held;                 // the same for textures whose first upload waits for a later frame (pool_hold): looked at once a frame
 };
 struct PoolPair {
     Ref<TexturePool> tp;
@@ -964,6 +966,11 @@ struct PoolRes {
 std::vector<std::unique_ptr<PoolPair>> g_pool_pairs;
 std::vector<std::unique_ptr<PoolRes>> g_pool_res;
 std::vector<Ref<Texture>> g_layout_moves;       // pool_note_layout, drained by pool_textures_to_prepare
+// pool_hold ([nvn] pool_upload_ms): textures whose first upload waits for a later frame. Until the frame ends they are left out of the watch
+// lists and the sets' pending lists, which every draw that indexes the pools looks through (thousands of them while a load-in streams in);
+// at the first look of the next frame they are looked at again (one full scan, and back into the pending lists). Render thread.
+std::unordered_set<Texture*> g_held;
+uint64_t g_held_present = 0;
 constexpr size_t kPoolWatchMax = 4096;          // a longer watch list becomes "look at every texture" (PoolRes::all)
 // Bumped by everything that may change whether a watched texture is ready to be sampled (a layout change, a CPU write). The end of a pass,
 // after which the replay no longer leaves its attachments alone, needs none: end_pass marks every binding dirty, so the next draw looks anyway.
@@ -1046,14 +1053,18 @@ VkDescriptorImageInfo pool_image(const TexturePool::Entry& e, VkImageViewType ty
 // Writes the elements of `ids` (all ids when null) of one set from the pools as they are now.
 void write_pool_textures(PoolCopy& c, TexturePool* tp, const std::vector<uint32_t>* ids) {
     static std::vector<VkDescriptorImageInfo> flat, cube;
-    std::vector<uint32_t> pending;
+    std::vector<uint32_t> pending, held;
     std::vector<VkWriteDescriptorSet> writes;
     auto element = [&](const TexturePool::Entry* e, uint32_t id, size_t at) {
         bool not_ready = false;
         static const TexturePool::Entry kNone;
         flat[at] = pool_image(e ? *e : kNone, VK_IMAGE_VIEW_TYPE_2D, &not_ready);
         cube[at] = pool_image(e ? *e : kNone, VK_IMAGE_VIEW_TYPE_CUBE, &not_ready);
-        if (not_ready) pending.push_back(id);
+        if (not_ready) {
+            Texture* t = e && e->used ? e->tex.get() : nullptr;
+            if (t && !g_held.empty() && g_held.count(t)) held.push_back(id);
+            else pending.push_back(id);
+        }
     };
     std::shared_lock<std::shared_mutex> lk;
     if (tp) lk = std::shared_lock<std::shared_mutex>(tp->lock);
@@ -1081,6 +1092,7 @@ void write_pool_textures(PoolCopy& c, TexturePool* tp, const std::vector<uint32_
             writes.push_back(w);
         }
         c.pending.clear();
+        c.held.clear();
     } else {
         flat.resize(ids->size());
         cube.resize(ids->size());
@@ -1098,14 +1110,18 @@ void write_pool_textures(PoolCopy& c, TexturePool* tp, const std::vector<uint32_
                 writes.push_back(w);
             }
         }
-        // the ids written now are no longer pending (unless they still are)
-        c.pending.erase(std::remove_if(c.pending.begin(), c.pending.end(), [&](uint32_t id) { return std::find(ids->begin(), ids->end(), id) != ids->end(); }),
-                        c.pending.end());
+        // the ids written now are no longer pending (unless they still are); sorted copy: a load-in streams in thousands of them
+        std::vector<uint32_t> written(ids->begin(), ids->end());
+        std::sort(written.begin(), written.end());
+        auto was_written = [&](uint32_t id) { return std::binary_search(written.begin(), written.end(), id); };
+        c.pending.erase(std::remove_if(c.pending.begin(), c.pending.end(), was_written), c.pending.end());
+        c.held.erase(std::remove_if(c.held.begin(), c.held.end(), was_written), c.held.end());
     }
     lk = {};
     vkUpdateDescriptorSets(vkdev(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     g_pool_writes.add(static_cast<int64_t>(ids ? ids->size() * 2 : 2ull * kPoolTextureCount));
     c.pending.insert(c.pending.end(), pending.begin(), pending.end());
+    c.held.insert(c.held.end(), held.begin(), held.end());
 }
 
 void write_pool_samplers(PoolCopy& c, SamplerPool* sp, const std::vector<uint32_t>* ids) {
@@ -1161,6 +1177,20 @@ bool changed_since(Pool* p, uint64_t from, uint64_t* now, std::vector<uint32_t>&
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     ids.erase(std::remove_if(ids.begin(), ids.end(), [](uint32_t id) { return id >= kPoolTextureCount; }), ids.end());
+    return true;
+}
+
+// The held textures of the frame that ended go back to being looked at (pool_hold). True when there were any.
+bool release_held() {
+    if (g_held.empty()) return false;
+    if (counters().presents.load(std::memory_order_relaxed) == g_held_present) return false;
+    g_held.clear();
+    for (auto& r : g_pool_res) r->all = true;
+    for (auto& pp : g_pool_pairs)
+        for (PoolCopy& c : pp->copies) {
+            c.pending.insert(c.pending.end(), c.held.begin(), c.held.end());
+            c.held.clear();
+        }
     return true;
 }
 
@@ -1405,8 +1435,15 @@ void pool_texture_remade(Texture* t) {
     }
 }
 
+void pool_hold(Texture* t) {
+    if (!t) return;
+    g_held.insert(t);
+    g_held_present = counters().presents.load(std::memory_order_relaxed);
+}
+
 void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out) {
     if (!tp) return;
+    release_held();
     PoolRes& r = pool_res(tp);
     const uint64_t serial = current_serial();
     r.last_use = serial;
@@ -1500,6 +1537,7 @@ void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out) {
     const size_t first = out.size();
     static const bool depth_readiness = config_get_bool("nvn", "depth_pool_readiness", true);
     auto look = [&](Texture* t) {
+        if (!g_held.empty() && g_held.count(t)) return;            // held back for this frame (pool_hold)
         if ((t->destroyed.load(std::memory_order_relaxed) && !t->gpu && !texture_registry_find_alias(t)) || !tex_gpu(t)) return;
         const bool pending = depth_readiness ? tex_pool_preparation_pending(t)
             : t->cpu_dirty.load(std::memory_order_relaxed) || tex_layout(t) != tex_sampled_layout(t);
@@ -1523,6 +1561,7 @@ void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out) {
 }
 
 bool pool_state_moved(TexturePool* tp, SamplerPool* sp) {
+    if (release_held()) return true;
     if (!g_layout_moves.empty()) return true;
     PoolRes* r = nullptr;
     for (auto& x : g_pool_res)
