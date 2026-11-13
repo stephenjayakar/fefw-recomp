@@ -231,10 +231,18 @@ pacing. Test requests go to `tmp/fefw-perf/queue/cpu-<n>/`.
 | `diag: [diag] budget ...` | Every 10 s summary also logs (tag `budget`): render thread work / CPU / GPU waits per frame (p50 p95 p99 max), game thread frame / work (gap minus present back pressure) / CPU per present, slow frames (over 1.2x the median) by cause (waiting for the game, render work, GPU/swapchain), and CPU % per thread group of the whole process (driver threads named by their module). Worker threads get Windows thread descriptions. | `[diag] budget = true` |
 | same | `[sched] render_priority = normal / above / highest`: the render thread's priority. | `normal` (unchanged) |
 | same | `[nvn] tex_prep_priority = normal / below`: background texture workers below the game and render threads. | `normal` (unchanged) |
+| `sched: [sched] render_place = reserve ...` | One physical core with no console core on it (3700X: core 7 = CPUs 14-15, the CCX of main's core 6) is kept for nvn-render alone, and main's SMT sibling is kept free; guest threads get the smaller pool, and a sweeper moves every other host thread (runtime workers, driver threads) to that pool every 2 s. | `[sched] render_place = off` (unchanged) |
+| `nvn: [nvn] split_submit_ms ...` | At a render pass boundary, once N ms of a submission's recording have passed (16+ draws, `split_min_draws`), the command buffer so far goes to the GPU (no signal; the final buffer signals the serial) and recording continues in a fresh command buffer of the slot, with all command buffer state rebound. Not with queries or stream-out active, batched submits or a pending pool copy. The GPU starts on a long submission while the render thread still records it. | `0` (off) |
 
 Tools: `tmp/fefw-perf/cpu/prof_fold.py <folded> <fefw_rt.map>` resolves sampled `fefw_rt.dll` offsets and prints per-thread self and
 inclusive tables.
 
 ### Measurements
 
-(pending cpu-1)
+- Tester's x2-explore trace (perf-stutter, 4K, gpu_passes on): 1525 of 10711 frames are 19-45 ms. In them main's work goes from about 8.5
+  to 17 ms (frame minus back pressure, sync and slow svc waits), nvn-render replay from 5.3 to 15.6-19.4 ms (normal frames: 10.8 ms in
+  the limiter), GPU exec from 10.7 to 16.3 ms. Slow frames come in runs (heavier views: more draws, shadow passes): CPU and GPU both
+  scale with the scene. (`tmp/fefw-perf/cpu/slowframes.py`, `busy.py`.)
+- Tester's baseline (BASELINE.md): main CPU 13-15 ms/frame, render replay 10 ms (hub) / 15 ms (street), GPU 15-16 ms, street 52 fps;
+  the street's game thread waits on GPU fences two presents old ~300 times per 10 s: main, render and GPU are serialised.
+- cpu-1 (queued): budget lines, sampler + replay_stats, priority knobs, reserve, split_submit_ms, present_ahead = 2.
