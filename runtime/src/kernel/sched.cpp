@@ -130,6 +130,40 @@ uint64_t take_slot(uint64_t proc, int* slot_out) {
     return proc;
 }
 
+// [sched] render_place = reserve (host_place.cpp): one physical core that holds no console core's processor (and is not CPU 0's core) is
+// kept for the render thread, and the SMT sibling of console core 0's processor (main's) is kept free, so the two threads on the frame's critical
+// path never share a core with a guest worker or a background job (on Zen 2 a busy sibling costs the other hardware thread a third of its speed).
+// The free core nearest to main's is taken (on a Ryzen 3700X: core 7 next to main's core 6, the same CCX, so the command lists main writes stay
+// in the L3 the render thread reads). Both leave the guest pool; the placer moves the runtime's and the driver's host threads off them too.
+void apply_reserve() {
+    std::string how = config_get_str("sched", "render_place", "off");
+    for (char& ch : how) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (how != "reserve" || !g_info.active || !g_info.soft) return;
+    const std::vector<uint64_t> full = cores_fastest_first(g_info.pool, true);   // physical cores of the pool, all their hardware threads
+    uint64_t used = 0;
+    for (int i = 0; i < g_info.cores; ++i) used |= g_info.host_masks[i];
+    const int main_p = lowest_bit(g_info.host_masks[0]);
+    uint64_t best = 0;
+    int best_dist = 1 << 30;
+    for (uint64_t c : full) {
+        if (c & used) continue;
+        const int d = std::abs(lowest_bit(c) - main_p);
+        if (d < best_dist) best_dist = d, best = c;
+    }
+    if (!best) {
+        NXLOG_W("sched", "[sched] render_place = reserve: no free physical core left beside the console cores; render thread placement as `apart`");
+        return;
+    }
+    uint64_t main_sib = 0;
+    for (uint64_t c : full)
+        if (c & g_info.host_masks[0]) main_sib = c & ~g_info.host_masks[0];
+    g_info.render_core = best;
+    g_info.reserved = best | main_sib;
+    g_info.pool &= ~g_info.reserved;
+    NXLOG_I("sched", "render_place = reserve: processors %llx kept for the render thread, main's sibling %llx kept free; guest pool %llx",
+            (unsigned long long)best, (unsigned long long)main_sib, (unsigned long long)g_info.pool);
+}
+
 void log_model() {
     std::string m;
     char buf[32];
@@ -208,6 +242,7 @@ void init_locked() {
                 if (chosen >> b & 1) g_info.host_masks[k++] = 1ull << b;
             g_info.slot = slot;
             g_info.active = k == nc;
+            apply_reserve();
             log_model();
             return;
         }

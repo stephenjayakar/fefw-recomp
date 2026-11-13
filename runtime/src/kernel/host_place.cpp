@@ -14,6 +14,7 @@
 // A placer thread looks for the named threads in the diag registry every 2 s for the first 120 s (the render thread starts with the
 // first NVN device), applies the setting once to each, and exits.
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <cctype>
 #include <cstdlib>
@@ -68,10 +69,13 @@ void place(const ThreadRecord& r, const std::string& how, const SchedInfo& si) {
     const int before = ideal_of(h);
     uint64_t aff = si.pool;
     int ideal = -1;
-    if (how == "core5" || how == "apart") {
+    if (how == "reserve" && si.render_core) {
+        aff = si.render_core;
+        ideal = low_bit(si.render_core);
+    } else if (how == "core5" || how == "apart" || how == "reserve") {
         const int last = si.cores >= 6 ? 5 : si.cores - 1;
         ideal = low_bit(si.host_masks[last]);
-        if (how == "apart") aff &= ~phys_core_of(low_bit(si.host_masks[0]));
+        if (how == "apart" || how == "reserve") aff &= ~phys_core_of(low_bit(si.host_masks[0]));
     } else {
         const uint64_t m = _strtoui64(how.c_str(), nullptr, 16);
         if (m) aff = m, ideal = low_bit(m);
@@ -90,14 +94,46 @@ void place(const ThreadRecord& r, const std::string& how, const SchedInfo& si) {
     CloseHandle(h);
 }
 
+// render_place = reserve: every host thread of the process that is not a guest thread and not the render thread (the runtime's workers, the
+// driver's threads, audio) gets the guest pool as its affinity, so nothing but the render thread runs on its core and nothing shares main's.
+// Threads come and go for the whole session (texture workers, the driver's), so this sweep runs every 2 s while the process lives.
+void sweep_host_threads(const SchedInfo& si, const std::vector<ThreadRecord>& recs, std::unordered_set<uint32_t>& swept) {
+    std::unordered_set<uint32_t> skip;
+    for (const ThreadRecord& r : recs)
+        if (r.guest_tid || r.name == "nvn-render") skip.insert(r.host_tid);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te;
+    te.dwSize = sizeof te;
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    int moved = 0;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || skip.count(te.th32ThreadID) || swept.count(te.th32ThreadID)) continue;
+        swept.insert(te.th32ThreadID);
+        HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (SetThreadAffinityMask(h, static_cast<DWORD_PTR>(si.pool))) ++moved;
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    static bool told = false;
+    if (moved && !told) {
+        told = true;
+        NXLOG_I("sched", "render_place = reserve: %d host threads (workers, driver) moved to the guest pool %llx; new ones follow every 2 s", moved,
+                (unsigned long long)si.pool);
+    }
+}
+
 void placer(std::string how, bool log) {
-    std::unordered_set<uint32_t> done;
+    std::unordered_set<uint32_t> done, swept;
     bool logged = false;
-    for (int i = 0; i < 60; i++) {
+    const bool reserve = how == "reserve";
+    for (int i = 0; reserve || i < 60; i++) {
         Sleep(2000);
         const SchedInfo si = sched_info();
         if (!si.active) return;
         const std::vector<ThreadRecord> recs = diag_threads();
+        if (reserve && si.render_core) sweep_host_threads(si, recs, swept);
         if (how != "off")
             for (const ThreadRecord& r : recs)
                 if (r.name == "nvn-render" && done.insert(r.host_tid).second) place(r, how, si);
@@ -114,7 +150,7 @@ void placer(std::string how, bool log) {
             }
             NXLOG_I("sched", "host threads (name=ideal processor/priority):%s", line.c_str());
         }
-        if ((how == "off" || !done.empty()) && (!log || logged)) return;
+        if (!reserve && (how == "off" || !done.empty()) && (!log || logged)) return;
     }
 }
 
