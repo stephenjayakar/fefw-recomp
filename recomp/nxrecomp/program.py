@@ -149,6 +149,20 @@ class Env:
         o = os.environ.get('NXRECOMP_OPT')
         self.opt = frozenset(x for x in (o.split(',') if o is not None else self.cfg.opt) if x and x != 'none')
         self.opt_flag_notes = []
+        self.replace_mismatch = []    # GameConfig.inline_replace entries whose words did not match (lifted as usual)
+        # hot code layout (GameConfig.hot_order): guest entry -> rank
+        self.hot_rank = {}
+        if self.cfg.hot_order and getattr(self.cfg, 'dir', None):
+            with open(os.path.join(self.cfg.dir, self.cfg.hot_order)) as f:
+                for line in f:
+                    t = line.split('#', 1)[0].split()
+                    if t:
+                        self.hot_rank.setdefault(int(t[0], 16), len(self.hot_rank))
+
+    def section_attr(self, entry):
+        """The section attribute of a function in the hot list (GameConfig.hot_order), else ''."""
+        r = self.hot_rank.get(entry)
+        return '' if r is None else '__attribute__((section(".text$nxh%05d"))) ' % r
 
     # ---- words
     def word(self, addr):
@@ -301,6 +315,14 @@ def lift_function(env, entry):
             return 'void f_%x(Ctx *__restrict c) { f_%x(c); }' % (entry, tgt), 0, [], []
         env.imports.add(env.plt_symbol(entry))
         return 'void f_%x(Ctx *__restrict c) { host_import(c, NX_IMPORT_ID(%d, %d)); }' % (entry, env.module_index, sym), 0, [], []
+    rep = env.cfg.inline_replace.get(entry)
+    if rep is not None:
+        body, words = rep
+        have = tuple(env.word(entry + 4 * i) for i in range(len(words)))
+        if have == tuple(words):
+            sec = env.section_attr(entry)
+            return '%svoid f_%x(Ctx *__restrict c) {\n  c->fn = 0x%xULL;\n  %s\n}' % (sec, entry, entry, body), 0, [], []
+        env.replace_mismatch.append(entry)
     end = env.extent(entry)
     fn = Lifter(entry, end, env)
     lines, bad = [], []
@@ -331,7 +353,8 @@ def lift_function(env, entry):
         cold = 'NX_OPTNONE '
     elif entry in env.sites['noinline'] or entry in env.sites['entryhook'] or entry in env.sites['midhook']:
         cold = '__attribute__((noinline)) '
-    out = ['%svoid %s_%x(Ctx *__restrict c%s) {' % (cold, 'u' if two else 'f', entry, ', uint64_t rp' if two else ''),
+    sec = env.section_attr(entry)
+    out = ['%s%svoid %s_%x(Ctx *__restrict c%s) {' % (sec, cold, 'u' if two else 'f', entry, ', uint64_t rp' if two else ''),
            '  c->fn = 0x%xULL;' % entry]
     if entry in env.sites['entryhook']:
         out.append('  if (nx_hook_entry(c, 0x%xULL)) return;' % entry)
@@ -366,11 +389,12 @@ def lift_function(env, entry):
     out.append('}')
     text = '\n'.join(out)
     if env.opt:
-        text, info = opt.optimize(text, flags_abi='flags' in env.opt, xregs='xregs' in env.opt, vregs='vregs' in env.opt)
+        text, info = opt.optimize(text, flags_abi='flags' in env.opt, xregs='xregs' in env.opt, vregs='vregs' in env.opt,
+                                  vstore='vstore' in env.opt)
         if info.get('flag_entry') or info.get('flag_after_call'):
             env.opt_flag_notes.append((entry, bool(info.get('flag_entry')), bool(info.get('flag_after_call'))))
     if two:
-        text += '\nvoid f_%x(Ctx *__restrict c) { %s }' % (entry, 'nx_catch_call(c, u_%x);' % entry if entry in env.catchers else 'u_%x(c, 0);' % entry)
+        text += '\n%svoid f_%x(Ctx *__restrict c) { %s }' % (sec, entry, 'nx_catch_call(c, u_%x);' % entry if entry in env.catchers else 'u_%x(c, 0);' % entry)
     return text, len(lines), bad, [(lp, entry) for lp in pads]
 
 
@@ -442,12 +466,13 @@ def _worker_text(entries):
     env.wanted = collections.OrderedDict()
     texts, resume, insns = [], [], 0
     env.opt_flag_notes = []
+    env.replace_mismatch = []
     for a in entries:
         t, n, _, r = lift_function(env, a)
         texts.append(t)
         resume += r
         insns += n
-    return '\n\n'.join(texts), resume, insns, env.opt_flag_notes
+    return '\n\n'.join(texts), resume, insns, (env.opt_flag_notes, env.replace_mismatch)
 
 
 def _write_if_changed(path, content):
@@ -551,11 +576,12 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
                 groups.setdefault((a - env.base) // bucket, []).append(a)
             names = {k: 'c_%04x.cpp' % k for k in groups}
         jobs_list = [(k, v) for k, v in groups.items()]
-        resume, files, changed, insns, notes = [], [], 0, 0, []
-        for (k, entries), (text, res, n, nt) in zip(jobs_list, map_ordered(pool, _worker_text, [v for _, v in jobs_list])):
+        resume, files, changed, insns, notes, mism = [], [], 0, 0, [], []
+        for (k, entries), (text, res, n, (nt, mm)) in zip(jobs_list, map_ordered(pool, _worker_text, [v for _, v in jobs_list])):
             resume += res
             insns += n
             notes += nt
+            mism += mm
             content = GEN_HEADER + text + '\n'
             files.append(names[k])
             changed += _write_if_changed(os.path.join(outdir, names[k]), content)
@@ -579,7 +605,12 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
         # context flags themselves; the other side (any caller / the callee) does not store them under the AAPCS64 assumption.
         log('%s: opt flags: %d functions read flags live at entry or after a call (kept in the context): %s'
             % (img.name, len(notes), ' '.join('%x%s%s' % (a, ' entry' if e else '', ' after-call' if c else '') for a, e, c in sorted(notes)[:40])))
-    return {'functions': len(all_funcs), 'files': files, 'instructions': insns, 'not_translated': bad, 'opt_flag_notes': sorted(notes)}
+    replaced = sum(1 for a in all_funcs if a in env.cfg.inline_replace) - len(mism)
+    if env.cfg.inline_replace and (replaced or mism):
+        log('%s: inline_replace: %d functions replaced by native routines%s' % (img.name, replaced, (
+            '; NOT replaced (instruction words differ, lifted as usual): ' + ' '.join('%x' % a for a in sorted(mism))) if mism else ''))
+    return {'functions': len(all_funcs), 'files': files, 'instructions': insns, 'not_translated': bad, 'opt_flag_notes': sorted(notes),
+            'replace_mismatch': sorted(mism)}
 
 
 def map_ordered(pool, fn, items):

@@ -658,6 +658,49 @@ inline V128 clmul64(uint64_t a, uint64_t b) {
     return r;
 }
 
+// ---- scalar results into a vector register (nxrecomp/opt.py 'vstore') ----------------------------------------------------
+// Writing an S / D / W / X element 0 of a V register clears the rest. Emitted as vzero + element store, that is a 16-byte store and
+// a smaller one to the same register; a later 16-byte read of it cannot be forwarded from the two stores and waits for both to
+// reach the cache. These build the whole register first, so it is one 16-byte store. Same 128 bits.
+NX_INLINE V128 lane0_f(float t) { V128 v; v.d[0] = 0; v.d[1] = 0; v.f[0] = t; return v; }
+NX_INLINE V128 lane0_df(double t) { V128 v; v.d[1] = 0; v.df[0] = t; return v; }
+NX_INLINE V128 lane0_w(uint32_t t) { V128 v; v.d[0] = t; v.d[1] = 0; return v; }
+NX_INLINE V128 lane0_d(uint64_t t) { V128 v; v.d[0] = t; v.d[1] = 0; return v; }
+
+// ---- C library string routines, run natively (GameConfig.inline_replace) -------------------------------------------------
+// The guest's own memcpy / memmove / memset / memcmp / strlen / strcmp (nnSdk's, the Arm optimized-routines ones) lifted
+// instruction by instruction are byte loops and register shuffles; these give the same results with the host's routines. Each
+// takes the AAPCS64 arguments from x0.. and leaves the result in x0 exactly as the guest routine does (memcpy / memmove / memset:
+// x0 unchanged = the destination; memcmp / strcmp: the difference of the first differing bytes as unsigned chars, written as a W
+// register, 0 when equal; strlen: the length). Registers the guest routine clobbers (x1..x18, v0..v7, NZCV) are left as they
+// are: no caller reads them after the call (AAPCS64). The guest memcpy (__memcpy_aarch64) is overlap-safe like memmove.
+NX_INLINE void hle_memmove(Ctx *c) { std::memmove(reinterpret_cast<void *>(c->x[0]), reinterpret_cast<const void *>(c->x[1]), c->x[2]); }
+NX_INLINE void hle_memset(Ctx *c) { std::memset(reinterpret_cast<void *>(c->x[0]), static_cast<int>(static_cast<uint8_t>(c->x[1])), c->x[2]); }
+NX_INLINE void hle_strlen(Ctx *c) { c->x[0] = std::strlen(reinterpret_cast<const char *>(c->x[0])); }
+NX_INLINE uint32_t hle_bytediff(uint64_t x, uint64_t y) {   // first differing byte (lowest address = lowest byte) of two unequal words
+    const unsigned s = static_cast<unsigned>(__builtin_ctzll(x ^ y)) & ~7u;
+    return static_cast<uint32_t>((x >> s) & 0xff) - static_cast<uint32_t>((y >> s) & 0xff);
+}
+NX_INLINE void hle_memcmp(Ctx *c) {
+    const uint8_t *a = reinterpret_cast<const uint8_t *>(c->x[0]), *b = reinterpret_cast<const uint8_t *>(c->x[1]);
+    uint64_t n = c->x[2], i = 0;
+    uint32_t r = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t x, y;
+        std::memcpy(&x, a + i, 8);
+        std::memcpy(&y, b + i, 8);
+        if (x != y) { c->x[0] = hle_bytediff(x, y); return; }
+    }
+    for (; i < n; i++)
+        if (a[i] != b[i]) { r = static_cast<uint32_t>(a[i]) - static_cast<uint32_t>(b[i]); break; }
+    c->x[0] = r;
+}
+NX_INLINE void hle_strcmp(Ctx *c) {
+    const uint8_t *a = reinterpret_cast<const uint8_t *>(c->x[0]), *b = reinterpret_cast<const uint8_t *>(c->x[1]);
+    for (;; a++, b++)
+        if (*a != *b || !*a) { c->x[0] = static_cast<uint32_t>(*a) - static_cast<uint32_t>(*b); return; }
+}
+
 }  // namespace nx
 
 #include "cxx_fp.h"

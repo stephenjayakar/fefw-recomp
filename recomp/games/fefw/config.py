@@ -32,8 +32,21 @@ class Config(GameConfig):
         ModuleSpec('rtld', 0x7700000000, 'rtld'),
     ]
     overrides = {}
-    # nxrecomp/opt.py: NZCV in function locals (perf/codegen; fewer and shorter x86 instructions, the same guest behaviour)
-    opt = ('flags',)
+    # nxrecomp/opt.py (perf/codegen; fewer and shorter x86 instructions, the same guest behaviour): NZCV in function locals, and
+    # scalar results written to a V register as one whole-register store
+    opt = ('flags', 'vstore')
+    # nnSdk 22.2.0's C string routines run natively (cxx.h hle_*; same results, checked against the lifted routines by
+    # recomp/tests/hle_libc_test.cpp). Address: (body, the routine's first instruction words).
+    inline_replace = {
+        0x75007bbc80: ('nx::hle_memmove(c);', (0x8b020024, 0x8b020005, 0xf102005f, 0x540007a8)),   # __memcpy_aarch64 (overlap-safe)
+        0x750078df20: ('nx::hle_memmove(c);', (0xeb01001f, 0x54000ba0, 0x8b020028, 0xeb00011f)),   # memmove
+        0x750078e1e0: ('nx::hle_memset(c);', (0xb40006c2, 0x8b020008, 0x39000001, 0x381ff101)),    # memset
+        0x75007a6c20: ('nx::hle_strlen(c);', (0xaa0003e8, 0xf240081f, 0x54000560, 0x39400008)),    # strlen
+        0x75007bc140: ('nx::hle_memcmp(c);', (0xb4000162, 0x4a000028, 0x92400908, 0xb4000168)),    # memcmp
+        0x75007bc240: ('nx::hle_strcmp(c);', (0x4a000028, 0x92400908, 0xb4000288, 0x39400008)),    # strcmp
+    }
+    # hot code packed together (guest entries from the perf push's profiles, hottest first; see hot.txt's header)
+    hot_order = 'hot.txt'
     # rtld's process entry (0x0): this rtld has an FDE there, Pokopia's has none; listed so discovery roots it either way
     extra_entries = {'rtld': [0x0]}
     patches = None

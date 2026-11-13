@@ -41,9 +41,19 @@ class GameConfig:
     # time-limit fallback (cmake/nx_cc_launcher.py) lowers it when a file still takes too long
     optnone_insns = 20000
 
+    # guest address -> (C++ statements, first instruction words): the lifted function's body is these statements instead of its
+    # translation (a native routine with the same results, e.g. cxx.h's hle_memmove for the guest's memmove). The words are checked
+    # against the module, so another build of it is lifted as usual (and reported).
+    inline_replace = {}
+
+    # file (relative to recomp/games/<name>/) listing guest function entries, hottest first: each listed function goes into its own
+    # `.text$nxh<rank>` section, which the linker places together in rank order (hot code packed for the instruction cache and TLB)
+    hot_order = None
+
     # function-level optimisation of the generated C++ (nxrecomp/opt.py), a tuple of: 'flags' (NZCV in locals and never stored
-    # across calls and returns, which the AAPCS64 leaves undefined), 'xregs' / 'vregs' (X / V registers in locals: experimental,
-    # not faster so far). Empty: the output is as before. The environment variable NXRECOMP_OPT overrides it.
+    # across calls and returns, which the AAPCS64 leaves undefined; 'flagsafe': in locals but kept in the context too), 'vstore'
+    # (a scalar result into a V register as one whole-register store), 'xregs' / 'vregs' (X / V registers in locals, loaded at the
+    # first use after each call: experimental). Empty: the output is as before. The environment variable NXRECOMP_OPT overrides it.
     opt = ()
 
     # host function names to treat as noreturn-like terminators (none by default)
@@ -63,4 +73,6 @@ def load_game(name):
     spec = importlib.util.spec_from_file_location('nxrecomp_game_' + name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.Config()
+    cfg = mod.Config()
+    cfg.dir = os.path.dirname(path)
+    return cfg

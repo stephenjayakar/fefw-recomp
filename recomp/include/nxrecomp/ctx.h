@@ -250,8 +250,15 @@ static inline uint32_t clz32(uint32_t v) { return v ? (uint32_t)__builtin_clz(v)
 static inline uint64_t clz64(uint64_t v) { return v ? (uint64_t)__builtin_clzll(v) : 64; }
 static inline uint32_t cls32(uint32_t v) { return clz32(((v >> 1) ^ v) & 0x7fffffffu) - 1; }
 static inline uint64_t cls64(uint64_t v) { return clz64(((v >> 1) ^ v) & 0x7fffffffffffffffull) - 1; }
+/* RBIT: clang's bit-reverse builtin (the same bits; the compiler also folds clz(rbit(x)), the guest's count-trailing-zeros idiom in
+ * strlen / memchr / memcmp, into one tzcnt); other compilers keep the loop. */
+#if defined(__clang__)
+static inline uint32_t rbit32(uint32_t v) { return __builtin_bitreverse32(v); }
+static inline uint64_t rbit64(uint64_t v) { return __builtin_bitreverse64(v); }
+#else
 static inline uint32_t rbit32(uint32_t v) { uint32_t r = 0; for (int i = 0; i < 32; i++) r |= ((v >> i) & 1u) << (31 - i); return r; }
 static inline uint64_t rbit64(uint64_t v) { uint64_t r = 0; for (int i = 0; i < 64; i++) r |= ((v >> i) & 1ull) << (63 - i); return r; }
+#endif
 static inline uint64_t umulh(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * b) >> 64); }
 static inline uint64_t smulh(uint64_t a, uint64_t b) { return (uint64_t)(((__int128)(int64_t)a * (int64_t)b) >> 64); }
 static inline uint32_t sdiv32(uint32_t a, uint32_t b) {

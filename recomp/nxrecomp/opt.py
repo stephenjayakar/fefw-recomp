@@ -59,12 +59,20 @@ TOK = re.compile(r'''
 |(?P<mid>\bif\ \(nx_site_midhook\(c,\ 0x[0-9a-f]+ULL\)\)\ return;)
 |(?P<vsync>\bv_(?:tbl|ldn|stn)\(c,\ [^;]*?\);)
 |(?P<pure>\b(?:guest_mrs|guest_msr|stx64|stx32|stx16|stx8|stxp32|stxp64|ldxp128)\(c,\ )
+|(?P<goto>\bgoto\ (?P<gl>L_\w+);)
 |(?P<ret>\breturn;)
 |(?P<other>\b\w+\(c[,)]|>\(c[,)])
 ''', re.X)
 GOTO = re.compile(r'\bgoto (L_\w+);')
+# 'vstore': `vzero(&V); V.f[0] = t;` (a scalar result into element 0, the rest cleared) as one whole-register store (cxx.h lane0_*)
+VSTORE = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); c->v\[\1\]\.(f|df|w|d)\[0\] = t;')
+VSTORE_REP = r'c->v[\1] = nx::lane0_\2(t);'
+VSET = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); vset\(&c->v\[\1\], 2, 0, t\);')
+VSET_REP = r'c->v[\1] = nx::lane0_w((uint32_t)t);'
+VSTORE_D = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); vset\(&c->v\[\1\], 3, 0, t\);')
+VSTORE_D_REP = r'c->v[\1] = nx::lane0_d((uint64_t)t);'
 LABEL = re.compile(r'^(L_\w+): ')
-HEAD = re.compile(r'^((?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?)void ([fu])_([0-9a-f]+)\(Ctx \*__restrict c(, uint64_t rp)?\) \{$')
+HEAD = re.compile(r'^(?:__attribute__\(\(section\("[^"]*"\)\)\) )?((?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?)void ([fu])_([0-9a-f]+)\(Ctx \*__restrict c(, uint64_t rp)?\) \{$')
 
 
 class Skip(Exception):
@@ -78,7 +86,7 @@ def _xs(regs):
 class Func:
     """One lifted function, split into nodes (one per statement line; the rp and dispatch switches one node each)."""
 
-    def __init__(self, lines, vregs=True, xregs=True):
+    def __init__(self, lines, vregs=True, xregs=True, vstore=False):
         self.head = lines[0]
         self.pre = []                 # lines before the first node: `c->fn = ...;`, the entry hook
         nodes = []                    # [label or None, text, is_block]
@@ -109,6 +117,9 @@ class Func:
             else:
                 raise Skip('line shape: ' + ln[:40])
             i += 1
+        if vstore:
+            for nd in nodes:
+                nd[1] = VSTORE_D.sub(VSTORE_D_REP, VSTORE.sub(VSTORE_REP, VSET.sub(VSET_REP, nd[1])))
         self.nodes = nodes
         self.index = {lab: k for k, (lab, _, _) in enumerate(nodes) if lab}
         self.toks = [[m for m in TOK.finditer(t) if (vregs or m.lastgroup not in ('va', 'vw', 'vr', 'vsync')) and (xregs or m.lastgroup not in ('xa', 'xw', 'xr'))] for _, t, _ in nodes]
@@ -173,7 +184,7 @@ def _flag_effects(toks, text):
     return gen, kill
 
 
-def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True):
+def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True, vstore=False):
     """-> (new text, info dict). info: 'skipped' (reason) or 'flag_entry' / 'flag_after_call' (bool) and counts."""
     lines = text.split('\n')
     m = HEAD.match(lines[0])
@@ -182,7 +193,7 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True):
     if m.group(1).startswith('NX_OPTNONE'):
         return text, {'skipped': 'optnone'}
     try:
-        func = Func(lines, vregs, xregs)
+        func = Func(lines, vregs, xregs, vstore)
     except Skip as e:
         return text, {'skipped': str(e)}
     N = len(func.nodes)
@@ -223,107 +234,162 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True):
             flag_after_call = flag_after_call or after
     safe_flags = (not flags_abi) or flag_entry or flag_after_call
 
-    # ---- dirty registers (forward): registers that may differ from the context at the start of each node
-    def walk(k, dirty, emit):
-        """Run node k from `dirty` (a set of 'x<n>' / 'v<n>' / 'f'); return the dirty set after it and, with emit, its new text."""
-        text = func.nodes[k][1]
-        out, pos = [], 0
-        d = set(dirty)
+    # ---- registers (forward): which are held in their local (L) and which of those may differ from the context (D)
+    # A register enters L at its first access after a sync point: the context value is loaded at the start of that segment (the
+    # statement, or the part of it after the sync), whether the access reads or writes (a write may be partial: a lane, a compound
+    # assignment; a load nobody needs is dropped by the compiler). At a join, a register in L on any incoming edge is in L, and the
+    # edges where it is not get the load (at the goto, or at the end of a falling-through node). D is the union over the edges. At a
+    # sync point the registers in D are stored; after a call the caller-saved ones leave L (x19..x29 and SP stay with keep_cs).
+    XREG = {'xa': 'xan', 'xw': 'xwn', 'xr': 'xrn'}
+    VREG = {'va': 'van', 'vw': 'vwn', 'vr': 'vrn'}
+    WRITES = ('xa', 'xw', 'va', 'vw')
+    after_call_keep = frozenset('x%d' % i for i in CALLEE_SAVED) if keep_cs else frozenset()
+    rkey = lambda r: (r[0], int(r[1:]) if r != 'f' else 0)
 
-        def stores(regs):
-            s = []
-            for r in sorted(regs, key=lambda r: (r[0], int(r[1:]) if r != 'f' else 0)):
-                if r == 'f':
-                    if safe_flags:
-                        s.append('c->N = gf.N; c->Z = gf.Z; c->C = gf.C; c->V = gf.V;')
-                elif r[0] == 'x':
-                    s.append('c->x[%s] = gx%s;' % (r[1:], r[1:]))
-                else:
-                    s.append('c->v[%s] = gv%s;' % (r[1:], r[1:]))
-            return ' '.join(s)
+    def stores(regs):
+        s = []
+        for r in sorted(regs, key=rkey):
+            if r == 'f':
+                if safe_flags:
+                    s.append('c->N = gf.N; c->Z = gf.Z; c->C = gf.C; c->V = gf.V;')
+            elif r[0] == 'x':
+                s.append('c->x[%s] = gx%s;' % (r[1:], r[1:]))
+            else:
+                s.append('c->v[%s] = gv%s;' % (r[1:], r[1:]))
+        return ' '.join(s)
 
-        def loads(xregs=(), vregs=(), fl=False):
-            s = ['gx%d = c->x[%d];' % (i, i) for i in xregs if i in xs]
-            s += ['gv%d = c->v[%d];' % (i, i) for i in vregs if i in vs]
-            if fl:
+    def loads(regs):
+        s = []
+        for r in sorted(regs, key=rkey):
+            if r == 'f':
                 s.append('gf.N = c->N; gf.Z = c->Z; gf.C = c->C; gf.V = c->V; gf.k = NXF_RAW;')
-            return ' '.join(s)
+            elif r[0] == 'x':
+                s.append('gx%s = c->x[%s];' % (r[1:], r[1:]))
+            else:
+                s.append('gv%s = c->v[%s];' % (r[1:], r[1:]))
+        return ' '.join(s)
 
-        for mt in func.toks[k]:
+    def regname(mt):
+        g = mt.lastgroup
+        if g in XREG:
+            return 'x' + mt.group(XREG[g])
+        if g in VREG:
+            return 'v' + mt.group(VREG[g])
+        if g == 'call' and xregs and mt.group('ciarg') and mt.group('ciarg').startswith('c->x'):
+            return 'x' + mt.group('ciarg')[5:-1]
+        return None
+
+    SYNC = ('call', 'svc', 'site', 'mid', 'vsync', 'ret')
+
+    def walk(k, L, D, Lin, emit):
+        """Run node k from (L, D). Returns (edges [(target, L, D)], L, D at the end, new text or None). Lin: the L of every node's
+        start (for the loads on edges; None while the analysis runs)."""
+        text = func.nodes[k][1]
+        toks = func.toks[k]
+        out, pos = [], 0
+        L, D = set(L), set(D)
+        # flags: always 'in their local'; 'f' in D means written since the last sync (stored in safe mode)
+        edges = []
+        # segment starts: the node start, and right after each sync token
+        def segment_loads(i0):
+            need = set()
+            for mt in toks[i0:]:
+                r = regname(mt)                  # (a call's register operand is read before the call)
+                if r and r not in L:
+                    need.add(r)
+                if mt.lastgroup in SYNC:
+                    break
+            return need
+
+        need = segment_loads(0)
+        if emit and need:
+            out.append(loads(need) + ' ')
+        L |= need
+        for i, mt in enumerate(toks):
             g = mt.lastgroup
             if emit:
                 out.append(text[pos:mt.start()])
-            rep = None
+            rep = mt.group(0)
+            r = regname(mt)
+            if g in WRITES:
+                D.add(r)
             if g == 'xa':
-                d.add('x' + mt.group('xan'))
                 rep = '&gx' + mt.group('xan')
-            elif g == 'xw':
-                d.add('x' + mt.group('xwn'))
-                rep = 'gx' + mt.group('xwn')
-            elif g == 'xr':
-                rep = 'gx' + mt.group('xrn')
+            elif g in ('xw', 'xr'):
+                rep = 'gx' + mt.group(XREG[g])
             elif g == 'va':
-                d.add('v' + mt.group('van'))
                 rep = '&gv' + mt.group('van')
-            elif g == 'vw':
-                d.add('v' + mt.group('vwn'))
-                rep = 'gv' + mt.group('vwn')
-            elif g == 'vr':
-                rep = 'gv' + mt.group('vrn')
+            elif g in ('vw', 'vr'):
+                rep = 'gv' + mt.group(VREG[g])
             elif g == 'ff':
                 rep = 'gf.' + mt.group('ffn')
             elif g == 'fw':
-                d.add('f')
+                D.add('f')
                 rep = mt.group(0)[:-3] + '(&gf,'
             elif g == 'fr':
                 rep = mt.group(0)[:-3] + '(&gf,'
             elif g == 'fg':
                 rep = mt.group(0)[:-3] + '(&gf)'
-            elif g == 'call':
-                call = mt.group(0)
-                if xregs and mt.group('ciarg') and mt.group('ciarg').startswith('c->x'):
-                    call = 'call_indirect(c, gx%s);' % mt.group('ciarg')[5:-1]
-                rep = '{ %s %s %s }' % (stores(d), call, loads(CALLER_X if keep_cs else range(32), range(32), safe_flags))
-                d = set()
-            elif g == 'svc':
-                rep = '{ %s %s %s }' % (stores(d), mt.group(0), loads(range(32)))
-                d = {r for r in d if r[0] != 'x'}
-            elif g == 'site':
-                rep = '{ %s c->N = gf.N; c->Z = gf.Z; c->C = gf.C; c->V = gf.V; %s %s }' % (
-                    stores(d - {'f'}), mt.group(0), loads(range(32), range(32), True))
-                d = set()
-            elif g == 'mid':
-                rep = '%s c->N = gf.N; c->Z = gf.Z; c->C = gf.C; c->V = gf.V; %s %s' % (
-                    stores(d - {'f'}), mt.group(0), loads(range(32), range(32), True))
-                d = set()
-            elif g == 'vsync':
-                rep = '{ %s %s %s }' % (stores({r for r in d if r[0] == 'v'}), mt.group(0), loads((), range(32)))
-                d = {r for r in d if r[0] != 'v'}
-            elif g == 'ret':
-                rep = '{ %s return; }' % stores(d)
-            elif g == 'pure':
-                rep = mt.group(0)
+            elif g == 'goto':
+                t = func.index[mt.group('gl')]
+                edges.append((t, frozenset(L), frozenset(D)))
+                if emit:
+                    fix = Lin[t] - L
+                    if fix:
+                        rep = '{ %s %s }' % (loads(fix), rep)
+            elif g in SYNC:
+                if g == 'call':
+                    call = mt.group(0)
+                    if r:
+                        call = 'call_indirect(c, gx%s);' % r[1:]
+                    keep = {x for x in L if x in after_call_keep}
+                    rep = '{ %s %s %s }' % (stores(D), call, loads({'f'}) if safe_flags else '')
+                    L, D = keep, set()
+                elif g == 'svc':
+                    rep = '{ %s %s }' % (stores(D), mt.group(0))
+                    L, D = {x for x in L if x[0] != 'x'}, set()
+                elif g in ('site', 'mid'):
+                    fl = 'c->N = gf.N; c->Z = gf.Z; c->C = gf.C; c->V = gf.V;'
+                    body = '%s %s %s %s' % (stores(D - {'f'}), fl, mt.group(0), loads({'f'}))
+                    rep = ('{ %s }' % body) if g == 'site' else body
+                    L, D = set(), set()
+                elif g == 'vsync':
+                    rep = '{ %s %s }' % (stores({x for x in D if x[0] == 'v'}), mt.group(0))
+                    L, D = {x for x in L if x[0] != 'v'}, {x for x in D if x[0] != 'v'}
+                elif g == 'ret':
+                    rep = '{ %s return; }' % stores(D)
+                if g != 'ret':
+                    nd = segment_loads(i + 1)
+                    if nd:
+                        rep = rep + ' ' + loads(nd)
+                        L |= nd
             if emit:
                 out.append(rep)
             pos = mt.end()
         if emit:
             out.append(text[pos:])
-        return d, ''.join(out) if emit else None
+        return edges, L, D, (''.join(out) if emit else None)
 
-    dirty_in = [None] * N
-    dirty_in[0] = frozenset()
+    N_ = N
+    Lin = [None] * N_
+    Din = [None] * N_
+    Lin[0], Din[0] = frozenset(), frozenset()
     work = [0]
     while work:
         k = work.pop()
-        d, _ = walk(k, dirty_in[k], False)
-        for s in func.succ[k]:
-            nd = frozenset(d) if dirty_in[s] is None else dirty_in[s] | d
-            if nd != dirty_in[s]:
-                dirty_in[s] = nd
-                work.append(s)
-    for k in range(N):
-        if dirty_in[k] is None:          # unreachable in this graph (dead code after a terminator): nothing pending
-            dirty_in[k] = frozenset()
+        edges, L, D, _ = walk(k, Lin[k], Din[k], None, False)
+        text, block = func.nodes[k][1], func.nodes[k][2]
+        if k + 1 < N_ and not Func._terminal(text, block):
+            edges.append((k + 1, frozenset(L), frozenset(D)))
+        for t, l2, d2 in edges:
+            nl = l2 if Lin[t] is None else Lin[t] | l2
+            nd = d2 if Din[t] is None else Din[t] | d2
+            if nl != Lin[t] or nd != Din[t]:
+                Lin[t], Din[t] = frozenset(nl), frozenset(nd)
+                work.append(t)
+    for k in range(N_):
+        if Lin[k] is None:               # unreachable in this graph (dead code after a terminator): nothing held, nothing pending
+            Lin[k], Din[k] = frozenset(), frozenset()
 
     # ---- emit
     decl = []
@@ -334,7 +400,11 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True):
     decl.append('  NxFlags gf = {c->N, c->Z, c->C, c->V};')
     out = [lines[0]] + pre + decl
     for k, (lab, text, block) in enumerate(func.nodes):
-        _, new = walk(k, dirty_in[k], True)
+        _, L, D, new = walk(k, Lin[k], Din[k], Lin, True)
+        if k + 1 < N_ and (k + 1) in func.succ[k] and not Func._terminal(text, block):
+            fix = Lin[k + 1] - L
+            if fix:
+                new = new + ' ' + loads(fix)
         if lab == 'L_dispatch':
             out.append('L_dispatch: ' + new)
         elif lab:
@@ -346,7 +416,7 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True):
     return '\n'.join(out), info
 
 
-def optimize_shard(src, flags_abi=True, stats=None, vregs=True, keep_cs=True, xregs=True):
+def optimize_shard(src, flags_abi=True, stats=None, vregs=True, keep_cs=True, xregs=True, vstore=False):
     """The same on a whole generated c_NNN.cpp (for experiments on existing lifter output): every multi-line function."""
     out, i = [], 0
     lines = src.split('\n')
@@ -356,7 +426,7 @@ def optimize_shard(src, flags_abi=True, stats=None, vregs=True, keep_cs=True, xr
             j = i
             while lines[j] != '}':
                 j += 1
-            new, info = optimize('\n'.join(lines[i:j + 1]), flags_abi, vregs, keep_cs, xregs)
+            new, info = optimize('\n'.join(lines[i:j + 1]), flags_abi, vregs, keep_cs, xregs, vstore)
             if stats is not None:
                 key = info.get('skipped') or ('safe' if info.get('safe_flags') else 'ok')
                 stats[key] = stats.get(key, 0) + 1

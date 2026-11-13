@@ -370,3 +370,44 @@ inclusive tables.
 - Tester's baseline (BASELINE.md): main CPU 13-15 ms/frame, render replay 10 ms (hub) / 15 ms (street), GPU 15-16 ms, street 52 fps;
   the street's game thread waits on GPU fences two presents old ~300 times per 10 s: main, render and GPU are serialised.
 - cpu-1 (queued): budget lines, sampler + replay_stats, priority knobs, reserve, split_submit_ms, present_ahead = 2.
+
+## Codegen track (branch `perf/codegen`)
+
+The game thread is the 4K60 wall (work p50 16.3 ms hub / 19.8 ms street, cpu-1 A2) and 86 % of its busy samples are in lifted
+game code. This track works on the code the lifter emits and on how fefw.exe is compiled. Tools and scratch: `tmp/fefw-perf/codegen/`
+(`tools/exe_fnmap.py` maps fefw.exe offsets to guest functions from the nxmod FnEntry tables, `hot.py` ranks lifted functions by self
+samples, `annotate.py` puts samples on x86 instructions, `extract.py` / `cc.sh` / `fsize.py` / `breakdown.py` build and size a TU of
+chosen functions, `mkhot.py` writes `games/fefw/hot.txt`).
+
+### Findings
+- **The release build is already clang -O2.** The bundled `zig c++` maps -O1, -O2 and -O3 all to `-cc1 -O2` with loop and SLP
+  vectorisation (`zig c++ -###`); cpu-2's -O2 exe was byte-identical in code. zig also adds `-mframe-pointer=all`, CodeView debug info
+  and `-tune-cpu generic`.
+- **The profile is flat:** on main, the top 60 lifted functions are 36 % of busy samples, 782 functions 90 %. libc routines (memcmp,
+  memcpy, memset, strlen, memmove) about 2 %. The fast-travel arrival stalls are the same kind of game code (allocation, memcpy,
+  containers), not decompression.
+- **Where the samples land** (cpu-1 B, main, skid-corrected to the previous instruction): ~48 % on guest memory loads (pointer
+  chasing: `mov rax, [rax]` is the top instruction), ~16 % on context loads (`c->x`, `c->v`), ~6 % context stores, ~8 % vector ALU,
+  ~4.5 % function entries (`push rbp` right after a call: instruction fetch), 1.8 % atomics. The game thread is largely memory-latency
+  bound; fewer instructions (and fewer stores) still help by keeping more loads in flight.
+- **The generated code's biggest waste was NZCV:** every flag-setting instruction stored N, Z, C and V to the context, and conditions
+  were rebuilt from them with formulas the compiler does not fold back (`cmp; b.lt` = 8 x86 instructions). In the 478 hottest functions
+  15.7 % of instructions were context stores, 14.3 % context loads.
+- Host code is big: the hot 90 % of samples spans 782 functions / 5.9 MB of x86 spread over a 189 MB .text.
+
+### Changes
+| commit | what | measured (static) |
+|---|---|---|
+| a3e72a3 | `recomp/nxrecomp/opt.py` mode 'flags' (game config `opt = ('flags',)`): NZCV in a function-local `NxFlags`, never stored across calls/returns (AAPCS64; per-function liveness check, 1 of 137,872 functions keeps context flags), cond() tests the compared operands (`cmp; jl`). Build: `-g0`, `-fomit-frame-pointer` | 478 hottest functions: -18 % x86 instructions, -17 % bytes; fp: -0.8 % more |
+| (next) | `inline_replace`: nnSdk memcpy/memmove/memset/memcmp/strlen/strcmp as native routines (cxx.h `hle_*`, same x0 and memory); `rbit` via `__builtin_bitreverse` (folds `clz(rbit)` to tzcnt); `hot_order`: the 3,409 hottest functions (99.5 % of samples) in `.text$nxh<rank>` sections, packed by the linker | - |
+
+Checks: `recomp/tests/nxflags_test.cpp` (23.7 M cases, the NxFlags helpers against ctx.h's); the e2e oracle (`NXRECOMP_OPT=flagsafe`:
+30/30 identical; `flags`: only the final NZCV differs, as intended).
+
+### Not done / ideas
+- Guest registers in locals (`opt.py` 'xregs' / 'vregs'): written, but not correct yet (e2e 27/30) and the code got larger: loading
+  registers at entry and after every call stretches live ranges and the compiler spills them. A lazy version (load at the first use
+  after a sync point, edge fix-ups at joins) would keep values across atomics and callee-saved registers across calls.
+- `-mcpu=znver2`: -0.1 % instructions in the hot set; not worth a separate A/B yet.
+- PGO (clang instrumentation needs a profile runtime for the mingw target), cross-TU inlining (zig + LTO untested), large pages for
+  guest memory (TLB misses on pointer chasing; runtime side, needs the lock-pages privilege and conflicts with write-watch).
