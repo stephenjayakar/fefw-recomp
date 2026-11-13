@@ -3,6 +3,7 @@
 #include "nxrt/gauge.h"
 
 #include <windows.h>
+#include <intrin.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 
@@ -67,6 +68,23 @@ std::atomic<uint64_t> g_game_present_last{0};     // QPC of the game's latest pr
 std::atomic<uint64_t> g_game_gap_max{0};          // longest gap between two game present calls since the last presented frame
 thread_local bool t_render_thread = false;
 thread_local bool t_game_present_thread = false;  // this thread has called hitch_note_game_present
+// The game's presenting thread (a handle opened at its first present) and the TSC rate, for its CPU time inside a slow frame: a frame where
+// the render thread idles and the game thread is "guest CPU" but was not on the CPU (page faults, preempted) shows it here.
+std::atomic<HANDLE> g_game_thread{nullptr};
+uint64_t g_prev_game_cycles = 0;                  // the presenting thread only
+uint64_t g_prev_faults = 0;
+uint64_t g_tsc0 = 0, g_qpc0 = 0;
+uint64_t game_cycles() {
+    HANDLE h = g_game_thread.load(std::memory_order_acquire);
+    ULONG64 c = 0;
+    if (h) QueryThreadCycleTime(h, &c);
+    return c;
+}
+uint64_t process_faults() {
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof pmc;
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? pmc.PageFaultCount : 0;
+}
 
 struct HitchEvent {
     double ms = 0;
@@ -75,6 +93,8 @@ struct HitchEvent {
     int64_t val[kMaxSources] = {};
     uint64_t phase[kHpCount] = {};                // ticks of each phase inside the frame
     uint64_t game_gap = 0;                        // ticks: longest gap between the game's present calls
+    double game_cpu_ms = -1;                      // CPU time of the game's presenting thread inside the frame (-1: unknown)
+    uint64_t faults = 0;                          // page faults of the process inside the frame (soft and hard)
 };
 std::mutex g_ev_mu;                               // taken by the presenting thread only for a frame over the limit
 std::vector<HitchEvent> g_pending;
@@ -89,6 +109,7 @@ void hitch_on_frame(uint64_t t, uint64_t prev_t, uint64_t n) {
     for (int i = 0; i < kHpCount; i++) curp[i] = g_phase[i].load(std::memory_order_relaxed);
     const uint64_t gap = g_game_gap_max.exchange(0, std::memory_order_relaxed);
     const uint64_t thr = g_hitch_ticks.load(std::memory_order_relaxed);
+    const uint64_t gc = game_cycles(), pf = process_faults();
     if (thr && prev_t && t > prev_t && t - prev_t > thr) {
         HitchEvent ev;
         ev.ms = (double)(t - prev_t) * 1000.0 / qpc_freq();
@@ -97,11 +118,19 @@ void hitch_on_frame(uint64_t t, uint64_t prev_t, uint64_t n) {
         for (size_t i = 0; i < ns; i++) ev.val[i] = g_src[i].counter ? (int64_t)(cur[i] - g_prev_val[i]) : (int64_t)cur[i];
         for (int i = 0; i < kHpCount; i++) ev.phase[i] = curp[i] - g_prev_phase[i];
         ev.game_gap = gap;
+        if (gc && g_prev_game_cycles && gc >= g_prev_game_cycles && g_tsc0) {   // cycles -> ms at the TSC rate measured since the monitor started
+            const double qms = static_cast<double>(t - g_qpc0) * 1000.0 / qpc_freq();
+            const double tsc_per_ms = qms > 100 ? static_cast<double>(__rdtsc() - g_tsc0) / qms : 0;
+            if (tsc_per_ms > 0) ev.game_cpu_ms = static_cast<double>(gc - g_prev_game_cycles) / tsc_per_ms;
+        }
+        ev.faults = pf >= g_prev_faults ? pf - g_prev_faults : 0;
         std::lock_guard<std::mutex> lk(g_ev_mu);
         if (g_pending.size() < 256) g_pending.push_back(ev);
     }
     for (size_t i = 0; i < ns; i++) g_prev_val[i] = cur[i];
     for (int i = 0; i < kHpCount; i++) g_prev_phase[i] = curp[i];
+    g_prev_game_cycles = gc;
+    g_prev_faults = pf;
 }
 
 struct FrameStats {
@@ -154,6 +183,14 @@ std::string format_event(const HitchEvent& ev, size_t others) {
     part(rep, "gpu slot wait", kHpRenderGpuWait);
     part(rep, "submit", kHpRenderSubmit);
     part(rep, "uploads", kHpRenderUpload);
+    {   // the uploads' parts: [take, prepare, staging]
+        std::string up;
+        part(up, "take", kHpRenderTexTake);
+        part(up, "prepare", kHpRenderTexPrep);
+        part(up, "staging", kHpRenderTexStaging);
+        if (!up.empty()) rep += " [" + up + "]";
+    }
+    part(rep, "image creation", kHpRenderImage);
     part(rep, "pipeline creation", kHpRenderPipeline);
     part(rep, "lock waits", kHpRenderLockWait);
     part(pre, "limiter", kHpRenderLimiter);
@@ -177,6 +214,14 @@ std::string format_event(const HitchEvent& ev, size_t others) {
             snprintf(b, sizeof b, ", presenting thread in system calls %.1f%s%s%s", v, sv.empty() ? "" : " (", sv.c_str(), sv.empty() ? "" : ")");
             game += b;
         }
+    }
+    if (ev.game_cpu_ms >= 0) {
+        snprintf(b, sizeof b, ", presenting thread on the CPU %.1f", ev.game_cpu_ms);
+        game += b;
+    }
+    if (ev.faults) {
+        snprintf(b, sizeof b, ", page faults +%llu", static_cast<unsigned long long>(ev.faults));
+        game += b;
     }
     out += game;
     std::string any_thr;
@@ -393,6 +438,16 @@ double hitch_phase_total_ms(int phase) {
     return static_cast<double>(g_phase[phase].load(std::memory_order_relaxed)) * 1000.0 / qpc_freq();
 }
 
+bool hitch_frame_age(uint64_t* frames, double* age_ms) {
+    const uint64_t n = g_ring_n.load(std::memory_order_acquire);
+    if (n == 0) return false;
+    const uint64_t t = g_ring[(n - 1) % kRing].load(std::memory_order_relaxed);
+    const uint64_t now = qpc();
+    if (frames) *frames = n;
+    if (age_ms) *age_ms = now > t ? static_cast<double>(now - t) * 1000.0 / qpc_freq() : 0.0;
+    return true;
+}
+
 uint64_t hitch_ticks() { return qpc(); }
 void hitch_phase_add(int phase, uint64_t ticks) {
     if (phase >= 0 && phase < kHpCount) g_phase[phase].fetch_add(ticks, std::memory_order_relaxed);
@@ -401,6 +456,11 @@ void hitch_set_render_thread() { t_render_thread = true; }
 bool hitch_on_render_thread() { return t_render_thread; }
 bool hitch_on_game_present_thread() { return t_game_present_thread; }
 void hitch_note_game_present() {
+    if (!t_game_present_thread && !g_game_thread.load(std::memory_order_relaxed)) {
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+        HANDLE expected = nullptr;
+        if (h && !g_game_thread.compare_exchange_strong(expected, h)) CloseHandle(h);
+    }
     t_game_present_thread = true;
     const uint64_t t = qpc();
     const uint64_t prev = g_game_present_last.exchange(t, std::memory_order_relaxed);
@@ -432,6 +492,8 @@ void hitch_start() {
     const double summary_s = config_get_double("diag", "hitch_summary_s", 10.0);
     const double hitch_ms = config_get_double("diag", "hitch_ms", 50.0);
     g_t0_ticks.store(qpc());
+    g_qpc0 = qpc();
+    g_tsc0 = __rdtsc();
     g_hitch_ticks.store(hitch_ms > 0 ? (uint64_t)(hitch_ms / 1000.0 * qpc_freq()) : 0);
     {
         std::lock_guard<std::mutex> lk(g_ev_mu);
