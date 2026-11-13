@@ -325,13 +325,27 @@ def lift_function(env, entry):
         env.imports.add(env.plt_symbol(entry))
         return ('%svoid f_%x(Ctx *__restrict c) { host_import(c, NX_IMPORT_ID(%d, %d)); }'
                 % (env.section_attr(entry), entry, env.module_index, sym), 0, [], [])
-    rep = env.cfg.inline_replace.get(entry)
+    rep = env.cfg.inline_replace.get(entry) if getattr(env, 'no_replace', None) != entry else None
     if rep is not None:
         body, words = rep
         have = tuple(env.word(entry + 4 * i) for i in range(len(words)))
         if have == tuple(words):
             sec = env.section_attr(entry)
-            return '%svoid f_%x(Ctx *__restrict c) {\n  c->fn = 0x%xULL;\n  %s\n}' % (sec, entry, entry, body), 0, [], []
+            orig = ''
+            if 'NX_ORIG' in body:            # the body may hand the call to the lifted original: o_<entry>, in the same unit
+                env.no_replace = entry
+                try:
+                    t, _, _, r = lift_function(env, entry)
+                finally:
+                    env.no_replace = None
+                head = 'void f_%x(Ctx *__restrict c) {' % entry
+                if t.startswith(sec):
+                    t = t[len(sec):]
+                if r or not t.startswith(head) or t.count('\nvoid '):
+                    raise ValueError('inline_replace %x: NX_ORIG needs a plain single-entry function' % entry)
+                orig = 'static void o_%x(Ctx *__restrict c) {' % entry + t[len(head):] + '\n'
+                body = body.replace('NX_ORIG', 'o_%x' % entry)
+            return orig + '%svoid f_%x(Ctx *__restrict c) {\n  c->fn = 0x%xULL;\n  %s\n}' % (sec, entry, entry, body), 0, [], []
         env.replace_mismatch.append(entry)
     end = env.extent(entry)
     fn = Lifter(entry, end, env)

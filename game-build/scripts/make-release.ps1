@@ -97,8 +97,9 @@ Put (Join-Path $RtDir 'fonts\DejaVuSans.ttf') 'fonts\DejaVuSans.ttf'
 Get-ChildItem $RtDir -Filter 'astcdec-*-shared.dll' -ErrorAction SilentlyContinue | ForEach-Object { Put $_.FullName $_.Name }
 Put $Launcher 'fefw-launcher.exe'
 Put (Join-Path $RtDir 'fefw_rt.lib') 'tools\build\sdk\fefw_rt.lib'
-foreach ($f in 'fefw_rt_api.h', 'fefw_stub.cpp', 'fefw_fma.c') { Put "$root\game-build\fefw\src\$f" "tools\build\sdk\$f" }
+foreach ($f in 'fefw_rt_api.h', 'fefw_stub.cpp', 'fefw_fma.c', 'fefw_hle.cpp') { Put "$root\game-build\fefw\src\$f" "tools\build\sdk\$f" }
 foreach ($f in 'fefw.rc', 'fefw.manifest', 'fefw.ico') { Put "$root\game-build\fefw\res\$f" "tools\build\sdk\$f" }
+Mirror "$root\game-build\fefw\third_party\zstd" 'tools\build\sdk\zstd'
 foreach ($f in 'fefw_build.py', 'dump_hashes.json') { Put "$root\game-build\release\$f" "tools\build\$f" }
 Put "$root\tools\nso\nso_unpack.py" 'tools\build\nso_unpack.py'
 Put "$root\recomp\LICENSE" 'tools\build\recomp\LICENSE'

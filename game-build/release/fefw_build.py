@@ -52,7 +52,9 @@ LIFTER = ['nxrecomp', 'include/nxrecomp', 'games/fefw/CMakeLists.txt', 'games/fe
           'games/fefw/inline.txt']
 SITES = 'games/fefw/main.sites'
 # what the link takes from sdk/ besides the lifted objects and fefw_rt.lib (stamped on its own, as 'runtime')
-SDK_FILES = ['fefw_stub.cpp', 'fefw_rt_api.h', 'fefw_fma.c', 'fefw.rc', 'fefw.manifest', 'fefw.ico']
+SDK_FILES = ['fefw_stub.cpp', 'fefw_rt_api.h', 'fefw_fma.c', 'fefw.rc', 'fefw.manifest', 'fefw.ico', 'fefw_hle.cpp', 'zstd']
+# fefw_hle.cpp: native routines the lifted code calls (GameConfig.inline_replace); zstd/: zstd 1.5.7's decoder sources (lib/zstd.h,
+# lib/common, lib/decompress; BSD), which fefw_hle.cpp uses. Both are compiled into fefw.exe at the link step.
 
 # name, NSO file, guest base, NxModule.index, translation units (as recomp/games/fefw/CMakeLists.txt)
 MODULES = [
@@ -510,6 +512,20 @@ def link(runner, obj, game, env, variant):
         libs.append(a)
     # the variant's own sources (compat: sdk/fefw_fma.c), as C and ahead of the libraries, so their fma / fmaf are the ones linked
     extra = []
+    # the native routines (sdk/fefw_hle.cpp) and the zstd decoder they use
+    zdir = os.path.join(SDK, 'zstd')
+    hle = [(os.path.join(SDK, 'fefw_hle.cpp'), 'c++')] + [(os.path.join(zdir, sub, f), 'cc') for sub in ('common', 'decompress')
+                                                       for f in sorted(os.listdir(os.path.join(zdir, sub))) if f.endswith('.c')]
+    for src, lang in hle:
+        o = os.path.join(obj, 'hle_' + os.path.basename(src) + '.o')
+        cmd = [ZIG, lang, '-target', 'x86_64-windows-gnu', '-mcpu=' + CPU_VARIANTS[variant]['mcpu'], '-O2', '-g0', '-w', '-DZSTD_DISABLE_ASM',
+               '-DZSTD_LEGACY_SUPPORT=0', '-I', zdir, '-I', os.path.join(RECOMP, 'include')]
+        if lang == 'c++':
+            cmd += ['-std=c++20', '-fno-exceptions', '-fno-rtti']
+        rc, tail = runner.run(cmd + ['-c', src, '-o', o], env=env)
+        if rc != 0:
+            raise Fail('Compiling %s failed (exit %d):\n%s' % (os.path.basename(src), rc, tail))
+        extra.append(o)
     for src in CPU_VARIANTS[variant]['link']:
         o = os.path.join(obj, os.path.splitext(src)[0] + '.o')
         rc, tail = runner.run([ZIG, 'cc', '-target', 'x86_64-windows-gnu', '-mcpu=' + CPU_VARIANTS[variant]['mcpu'], '-O1', '-ffp-contract=off',

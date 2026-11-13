@@ -116,6 +116,10 @@ raw:
     return (cc & 1) ? !r : r;
 }
 
+// ---- native routines outside the lifted code (fefw.exe: game-build/fefw/src/fefw_hle.cpp), for GameConfig.inline_replace bodies --------
+// `orig` is the lifted original (NX_ORIG in the body): the routine hands the call to it when it cannot give the same result.
+extern "C" void nx_hle_zstd_multiframe(Ctx *c, void (*orig)(Ctx *));
+
 namespace nx {
 
 using ::adds64; using ::adds32; using ::logic64; using ::logic32; using ::set_nzcv; using ::get_nzcv;

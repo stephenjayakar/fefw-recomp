@@ -44,6 +44,9 @@ class Config(GameConfig):
         0x75007a6c20: ('nx::hle_strlen(c);', (0xaa0003e8, 0xf240081f, 0x54000560, 0x39400008)),    # strlen
         0x75007bc140: ('nx::hle_memcmp(c);', (0xb4000162, 0x4a000028, 0x92400908, 0xb4000168)),    # memcmp
         0x75007bc240: ('nx::hle_strcmp(c);', (0x4a000028, 0x92400908, 0xb4000288, 0x39400008)),    # strcmp
+        # main's zstd 1.5.x ZSTD_decompressMultiFrame (loading / area changes): native zstd, the lifted original as the fallback
+        # (game-build/fefw/src/fefw_hle.cpp; FEFW_HLE_ZSTD=0 turns it off)
+        0x71000c6a60: ('nx_hle_zstd_multiframe(c, NX_ORIG);', (0xd503237f, 0xd10483ff, 0xa90c7bfd, 0xa90d6ffc)),
     }
     # hot code packed together (guest entries from the perf push's profiles, hottest first; see hot.txt's header)
     hot_order = 'hot.txt'
