@@ -528,6 +528,31 @@ BufRef resolve_in_pool(uint64_t gpu_address, uint64_t size, MemoryPool** pool_ou
 
 BufRef resolve_buffer(uint64_t gpu_address, uint64_t size) { return resolve_in_pool(gpu_address, size, nullptr, nullptr); }
 
+BufRef resolve_buffer_imported(uint64_t gpu_address, uint64_t size) {
+    BufRef out;
+    const PoolHit hit = pool_lookup(gpu_address);
+    PoolGpu* pg = hit.pool ? hit.pool->gpu : nullptr;
+    if (!pg || pg->failed) return out;
+    const uint64_t off = gpu_address - reinterpret_cast<uint64_t>(pg->base);
+    if (off >= pg->size) return out;
+    const uint64_t k = off / pg->stride;
+    if (k >= pg->chunks.size()) return out;
+    const PoolChunk& c0 = pg->chunks[static_cast<size_t>(k)];
+    if (!c0.tried || c0.failed || !c0.buffer || c0.copy.buffer) return out;   // not imported (or a copy buffer): the caller does without
+    const PoolChunk* c = &c0;
+    if (size && off + size > c->off + c->size) {
+        c = nullptr;
+        for (const PoolChunk& s : pg->spans)
+            if (off >= s.off && off + size <= s.off + s.size && !s.failed && s.buffer && !s.copy.buffer) { c = &s; break; }
+        if (!c) return out;
+    }
+    out.buffer = c->buffer;
+    out.offset = off - c->off + c->buffer_offset;
+    out.avail = c->off + c->size - off;
+    out.ok = size <= out.avail;
+    return out;
+}
+
 namespace {
 // out.buffer / out.offset name the chunk (or span) import holding the range; *pool_off_out receives the offset from the pool's aligned base
 // (what the mirror's pages count from). out.avail is what is left of that import, at least the chunk overlap for a chunked pool.

@@ -122,6 +122,8 @@ struct BufRef {
 // The buffer and offset of `size` bytes at a GPU address. When the address is in no pool (or size runs past the pool), ok is
 // false and the buffer is the dummy buffer (a zeroed 64 KiB buffer) so the draw can go on; this is logged once per address.
 BufRef resolve_buffer(uint64_t gpu_address, uint64_t size);
+// The same only when the range is in a pool part that is already imported (ok false otherwise): never imports, never waits.
+BufRef resolve_buffer_imported(uint64_t gpu_address, uint64_t size);
 VkBuffer dummy_buffer();
 // The last 32 bytes of the dummy buffer hold the default of an unset vertex attribute: float (0,0,0,1) and integer (0,0,0,1).
 constexpr VkDeviceSize kDummyAttrFloatOffset = 65504, kDummyAttrIntOffset = 65520;

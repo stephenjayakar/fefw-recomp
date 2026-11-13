@@ -1782,12 +1782,12 @@ bool untiler_init() {
 }
 
 // A pitch-linear texture whose rows are whole texels: the copy to the image reads the pool directly (no CPU copy, no staging).
-bool gpu_pitch_copy(Texture* t, TexGpu& g, Frame& f, const TexLayout& L) {
+bool gpu_pitch_copy(Texture* t, TexGpu& g, Frame& f, const TexLayout& L, bool may_import) {
     const uint32_t bpb = L.fmt->bytes;
     if (!bpb || L.pitch % bpb || L.fmt->block_w != 1 || L.fmt->block_h != 1 || g.base.depth != 1) return false;
     const uint64_t bytes = L.pitch * g.base.height;
     if (bytes > t->storage_size) return false;
-    const BufRef br = resolve_buffer(reinterpret_cast<uint64_t>(t->mem), bytes);
+    const BufRef br = may_import ? resolve_buffer(reinterpret_cast<uint64_t>(t->mem), bytes) : resolve_buffer_imported(reinterpret_cast<uint64_t>(t->mem), bytes);
     if (!br.ok || br.offset % std::max<uint32_t>(4, bpb)) return false;
     memory_barrier(f.cb);                          // earlier GPU writes to the storage
     VkBufferImageCopy r = {};
@@ -1801,10 +1801,14 @@ bool gpu_pitch_copy(Texture* t, TexGpu& g, Frame& f, const TexLayout& L) {
 }
 
 // True when the image now gets the storage's content from a GPU untile (or pitch copy) recorded into f.
-bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why);
-bool gpu_untile(Texture* t, TexGpu& g, Frame& f) {
+bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why, bool may_import);
+// may_import: the pool part holding the storage may be imported for it now (a streamed texture, read by the GPU every frame). Otherwise only
+// an import that already exists is used ([nvn] untile_import = false, default): a first upload untiled on the CPU costs well under a
+// millisecond, the import of the 64 MiB chunk around it 16 to 90 ms on the render thread (s1-stutter1, a 246 ms frame).
+bool gpu_untile(Texture* t, TexGpu& g, Frame& f, bool may_import = true) {
+    static const bool untile_import = nxrt::config_get_bool("nvn", "untile_import", false);
     const char* why = "";
-    if (gpu_untile_impl(t, g, f, &why)) return true;
+    if (gpu_untile_impl(t, g, f, &why, may_import || untile_import)) return true;
     static int logged = 0;
     if (t->storage_size >= (1u << 20) && logged < 12) {
         ++logged;
@@ -1813,7 +1817,7 @@ bool gpu_untile(Texture* t, TexGpu& g, Frame& f) {
     return false;
 }
 
-bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why) {
+bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why, bool may_import) {
     static const bool on = nxrt::config_get_bool("nvn", "gpu_untile", true);
     if (!on) return *why = "off", false;
     if (!t->mem || t->vpool || t->levels != 1 || t->layers != 1 || t->storage_size < (64u << 10)) return *why = "storage, levels or layers", false;
@@ -1821,7 +1825,7 @@ bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why) {
         return *why = "image format or usage", false;
     const TexLayout L = compute_texture_layout(t->b);
     if (!L.valid || !L.fmt || L.fmt->astc || L.levels != 1 || L.layers != 1) return *why = "layout", false;
-    if (!L.block_linear) return gpu_pitch_copy(t, g, f, L) || (*why = "pitch", false);
+    if (!L.block_linear) return gpu_pitch_copy(t, g, f, L, may_import) || (*why = "pitch", false);
     if (!t->block_linear || L.layout.levels.size() != 1) return *why = "layout levels", false;
     const tegra::LevelLayout& lv = L.layout.levels[0];
     const uint64_t row_bytes = static_cast<uint64_t>(lv.blocks_x) * L.desc.bytes_per_block;
@@ -1835,8 +1839,8 @@ bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why) {
     // the GOBs of every block row, whole blocks: what the shader may read
     const uint64_t tiled = static_cast<uint64_t>((lv.blocks_y + 8 * lv.gob_blocks_y - 1) / (8 * lv.gob_blocks_y)) * gobs_x * lv.gob_blocks_y * 512;
     if (tiled > t->storage_size) return *why = "storage size", false;
-    const BufRef br = resolve_buffer(reinterpret_cast<uint64_t>(t->mem), tiled);
-    if (!br.ok) return *why = "not in a pool", false;
+    const BufRef br = may_import ? resolve_buffer(reinterpret_cast<uint64_t>(t->mem), tiled) : resolve_buffer_imported(reinterpret_cast<uint64_t>(t->mem), tiled);
+    if (!br.ok) return *why = may_import ? "not in a pool" : "pool part not imported", false;
     if (!untiler_init()) return false;
     Untiler& u = g_untile;
     const VkDeviceSize boff = br.offset & ~(u.ssbo_align - 1);
@@ -1979,7 +1983,7 @@ void tex_ensure_current(Texture* t, Frame& f) {
     // the untile reads the pool when the GPU runs it: hashed now, armed after (only when the untile can take it: the image in the storage's format)
     if (arm_later && t->levels == 1 && t->layers == 1 && t->storage_size >= (64u << 10) && !g->transcoded && g->fmt && g->format == g->fmt->vk)
         have_hash = texprep::hash_storage(*t, content_hash);
-    if (gpu_untile(t, *g, f)) {
+    if (gpu_untile(t, *g, f, false)) {
         g_rt_gpu_untiles.fetch_add(1, std::memory_order_relaxed);
         if (arm_later) tex_ww_arm_later(t, *g, have_hash, content_hash);
         g->untiled = true;
