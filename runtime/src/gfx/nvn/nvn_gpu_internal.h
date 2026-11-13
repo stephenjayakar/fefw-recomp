@@ -77,6 +77,7 @@ struct Frame {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     uint64_t serial = 0;          // the timeline value this submission signals when the GPU has run it
     void* slot = nullptr;         // nvn_gpu.cpp: the submission slot (command pool, descriptor pools, upload memory)
+    bool split_ok = false;        // split_submission may hand the commands recorded so far to the GPU (a normal, signalled submission)
     // Host-visible memory valid until the submission has completed: small per-draw data (support buffer, driver constants,
     // inline uniform data). align is a power of two.
     UploadAlloc upload(VkDeviceSize size, VkDeviceSize align);
@@ -90,6 +91,14 @@ struct Frame {
     // A descriptor set of this submission's pool (freed when the slot is reused). Null on failure.
     VkDescriptorSet alloc_set(VkDescriptorSetLayout layout);
 };
+
+// [nvn] split_submit_ms: ends the command buffer being recorded, hands it to the GPU at once (no signal: the submission's final command
+// buffer signals its serial, and a queue submission's signal covers everything submitted before it) and continues the recording in a fresh
+// command buffer of the same slot, so the GPU starts on a long submission while the render thread still records the rest. f.cb changes:
+// the caller must treat all command buffer state (bound pipeline, sets, vertex buffers, dynamic state) as lost. Outside a render pass only.
+// False (nothing done) when the submission cannot be split (batched submits, a pending pool copy, a frame that is not a slot's).
+bool split_submission(Frame& f);
+uint64_t split_count();   // command buffers handed over early so far
 
 // Destruction: fn runs once every submission made so far (and the one being recorded) has completed.
 void defer_destroy(std::function<void()> fn);

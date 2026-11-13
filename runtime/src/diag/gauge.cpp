@@ -293,8 +293,21 @@ void budget_report() {
         else if (b >= c) ++by_render;
         else ++by_gpu;
     }
-    NXLOG_I("budget", "%zu frames, median %.2f ms | render thread ms: work %s; cpu %s; GPU/swapchain waits %s; limiter p50 %.1f; idle p50 %.1f",
-            dt.size(), mdt, pcts(work).c_str(), pcts(cpu).c_str(), pcts(gpu).c_str(), median_of(lim), midle);
+    std::string extra;
+    {   // split submissions ([nvn] split_submit_ms) per frame, when that gauge exists
+        static int64_t last_splits = -1;
+        for (auto& kv : gauge_read_all())
+            if (kv.first == "nvn.split_submits") {
+                if (last_splits >= 0 && kv.second > last_splits) {
+                    char b[64];
+                    snprintf(b, sizeof b, "; split submits/frame %.1f", (double)(kv.second - last_splits) / (double)dt.size());
+                    extra = b;
+                }
+                last_splits = kv.second;
+            }
+    }
+    NXLOG_I("budget", "%zu frames, median %.2f ms | render thread ms: work %s; cpu %s; GPU/swapchain waits %s; limiter p50 %.1f; idle p50 %.1f%s",
+            dt.size(), mdt, pcts(work).c_str(), pcts(cpu).c_str(), pcts(gpu).c_str(), median_of(lim), midle, extra.c_str());
     if (!gap.empty())
         NXLOG_I("budget", "game thread ms (%zu presents): frame %s; work (minus present back pressure) %s; cpu %s; waits p50 %.1f p99 %.1f; GPU sync waits p99 %.1f | "
                 "slow frames (over 1.2x the median): %zu = waiting for the game %zu, render thread work %zu, GPU/swapchain %zu",
