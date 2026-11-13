@@ -1247,11 +1247,6 @@ void prepare_textures(const ProgLayout& pl) {
     need.erase(std::remove_if(need.begin(), need.end(),
                               [&](Texture* t) { return std::any_of(storage_bound.begin(), storage_bound.end(), [&](Texture* s) { return shares_image(t, s); }); }),
                need.end());
-    if (need.empty() && need_storage.empty()) return;
-    for (Texture* t : need) out_texture_read(t);           // an upload reads game memory: compute results held there go back first
-    for (Texture* t : need_storage) out_texture_read(t);
-    end_pass(true);     // layout changes and uploads follow: each carries the dependency for its own image
-    counters().pass_breaks.fetch_add(1, std::memory_order_relaxed);
     // [nvn] pool_upload_ms (default 24; 0 = no limit): the first uploads of asset textures that a draw needs only because a texture pool holds
     // them (not bound by the draw itself) take at most this much render-thread time per presented frame; the rest stay not ready (their pool
     // elements are the dummy) and go in the next frames. A load-in registers thousands of textures and uploaded them all before its first
@@ -1266,10 +1261,25 @@ void prepare_textures(const ProgLayout& pl) {
         spent = std::chrono::steady_clock::duration::zero();
     }
     const auto cap = std::chrono::milliseconds(std::max<int64_t>(0, pool_ms));
-    // the textures whose background result is ready go first: an upload buffer to adopt costs far less than a stand-in or a CPU untile, and
-    // the others get more time for their jobs
-    if (pool_ms > 0 && pool_from + 1 < need.size())
-        std::stable_partition(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(), [](Texture* t) { return texprep::has_result(t); });
+    if (pool_ms > 0 && pool_from < need.size()) {
+        if (spent >= cap) {
+            // the frame's budget is spent: the held-back textures leave the list before the pass is ended for them (each draw that indexes
+            // the pools would otherwise break the render pass for uploads it then skips)
+            const size_t before = need.size();
+            need.erase(std::remove_if(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(), [](Texture* t) { return tex_first_upload_deferrable(t); }),
+                       need.end());
+            g_pool_uploads_deferred.fetch_add(before - need.size(), std::memory_order_relaxed);
+        } else if (pool_from + 1 < need.size()) {
+            // the textures whose background result is ready go first: an upload buffer to adopt costs far less than a stand-in or a CPU untile,
+            // and the others get more time for their jobs
+            std::stable_partition(need.begin() + static_cast<std::ptrdiff_t>(pool_from), need.end(), [](Texture* t) { return texprep::has_result(t); });
+        }
+    }
+    if (need.empty() && need_storage.empty()) return;
+    for (Texture* t : need) out_texture_read(t);           // an upload reads game memory: compute results held there go back first
+    for (Texture* t : need_storage) out_texture_read(t);
+    end_pass(true);     // layout changes and uploads follow: each carries the dependency for its own image
+    counters().pass_breaks.fetch_add(1, std::memory_order_relaxed);
     for (size_t i = 0; i < need.size(); ++i) {
         Texture* t = need[i];
         const bool slice = pool_ms > 0 && i >= pool_from && tex_first_upload_deferrable(t);
