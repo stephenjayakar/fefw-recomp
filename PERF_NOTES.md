@@ -223,6 +223,22 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
   and blit it into the game's output texture (two 4K images read, two written).
 - Pool copies (`pool_mirror`) keep vertex/uniform reads off PCIe; compute shadows and copy-backs move a few MB per second.
 
+### First profile (tester trace 13 Nov 09:50, 4K, render x1.0, `gpu_passes` so drains are included)
+
+`tmp/fefw-perf/gpu/gp_report.py` over the trace. Gameplay holds 60 fps; GPU 10-16 ms per frame with the profiler's drains.
+
+| what | ms/frame | notes |
+|---|---:|---|
+| probe-filter compute `cs 8ab94383` (+ `eaac1801`, `13a045cc`, `7419dc86`) | 2.2-3.8 | 24-48 dispatches x ~57 us; 8x8 groups, a cube-sampling loop writing a 2D image (prefiltered reflection probes); each followed by a full barrier, spread between unrelated passes |
+| full-screen 1-draw passes at 3840x2160 (RGBA16F, RGBA8, R11G11B10F) | ~4-5 | the game's post and lighting passes; one RGBA16F pass is ~1.2 ms |
+| G-buffer (5 targets + D32F) and depth pre-pass | 0.6-0.9 | 100-370 draws |
+| `copy texture` (the game's CopyTextureToTexture) | 1.0 | 13-18 a frame at ~70 us (full-screen sized) |
+| `write memory` (UpdateUniformBuffer) | 0.5 | 60 a frame in runs of 15, two full barriers each |
+| clustered light compute `cs ee541a5d` | 0.43 | one dispatch, 256-wide groups |
+| feedback copies (runtime) | 0.24 | 4 a frame, every level copied |
+| `dlss` step | 0.24 | |
+| shadow maps 2048 / 1024 | 0.2-0.4 | not resolution-bound |
+
 ### Changes
 
 | commit | what | toggle (default) |
@@ -231,6 +247,9 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 | `d4e3410` | tracked dispatch barriers: the full barrier after a dispatch is left open until something depends on it | `[nvn] dispatch_barriers = full` (`tracked` to try) |
 | `5d3e3e9` | tracked game barriers: `nvnCommandBufferBarrier` left out (pass kept open) when only attachment writes are unbarriered | `[nvn] game_barriers = full` (`tracked` to try) |
 | `5d3e3e9` | sticky read-only depth pass for draws that neither sample nor write depth/stencil | `[nvn] depth_ro_sticky = false` |
+| `4f41980` | UBO update runs: one barrier before and after a run of back-to-back `UpdateUniformBuffer` instead of two per update | `[nvn] batch_ubo_updates = false` |
+| `4f41980` | feedback copies hold only the sampled levels (bloom mip chains no longer copy level 0) | `[nvn] feedback_levels = false` |
+| `10e0b76` | draws that share nothing with open dispatches run without the barrier: compute overlaps graphics | `[nvn] dispatch_barriers = tracked_draws` |
 
 ### Test log
 
