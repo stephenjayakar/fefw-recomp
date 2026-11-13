@@ -239,6 +239,14 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 | `dlss` step | 0.24 | |
 | shadow maps 2048 / 1024 | 0.2-0.4 | not resolution-bound |
 
+### Reflection probes (traced title frame, g1)
+
+Per frame, per probe (two probes): relight `13a045cc` 6 faces (4x4 groups) -> mip chain `7419dc86` 6 faces x 3 levels -> irradiance
+`eaac1801` 6 faces (16x16) -> GGX prefilter `8ab94383` 6 faces x 4 levels (8x8 down to 1x1 groups of 8x8). The cubes are 64x64 R11G11B10F
+(independent of the output size). Each dispatch has a few thousand threads running a dependent texture loop: latency-bound at ~55 us,
+then a game barrier and a full barrier. Only the mip chain is a real chain; the faces, and the prefilter levels (they read the source
+cube and write their own level; the texture binding of the written cube is used only for `textureSize`), are independent.
+
 ### Changes
 
 | commit | what | toggle (default) |
@@ -250,9 +258,11 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 | `4f41980` | UBO update runs: one barrier before and after a run of back-to-back `UpdateUniformBuffer` instead of two per update | `[nvn] batch_ubo_updates = false` |
 | `4f41980` | feedback copies hold only the sampled levels (bloom mip chains no longer copy level 0) | `[nvn] feedback_levels = false` |
 | `10e0b76` | draws that share nothing with open dispatches run without the barrier: compute overlaps graphics | `[nvn] dispatch_barriers = tracked_draws` |
+| `a7df953` | dispatch tracking by image level/layer, size-only texture bindings ignored, game barriers keep dispatches open: probe faces/mips run concurrently | with `dispatch_barriers` + `game_barriers = tracked` |
 
 ### Test log
 
 | request | what | result |
 |---|---|---|
-| gpu-1 | baseline GPU ms/frame + pass profile at 4K; A/B of the three toggles together | queued 13 Nov (5d3e3e9) |
+| gpu-1 | baseline + toggles (62a508e) | g1 failed (my trace list: each traced frame stalls ~25 s); g2 (all toggles): real GPU 13.7-16.0 ms/frame hub/street, ~550 full barriers/frame, 170-185 dispatches; `tracked_draws` never engaged (game barrier after every dispatch closed them) |
+| gpu-2 | clean A/B + probe concurrency (a7df953) | queued 13 Nov |
