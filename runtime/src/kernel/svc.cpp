@@ -2,6 +2,7 @@
 // SVC table and dispatcher (see include/nxrt/svc.h). Dispatch pattern from SuperMarioWonderRecomp runtime/src/kernel.cpp (MIT).
 #include "nxrt/svc.h"
 #include <windows.h>
+#include "nxrt/tl_counts.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36,7 +37,10 @@ const NameEntry kNames[] = {
 #undef NXRT_SVC
 
 SvcHandler g_handlers[kSvcCount];
-std::atomic<uint64_t> g_calls[kSvcCount];
+// Per-thread counts (tl_counts.h): the wait and lock SVCs come from every guest thread at a high rate, and the shared counters (eight to a
+// cache line) moved between cores on each call.
+struct SvcCountTag {};
+TlCounts<kSvcCount, SvcCountTag> g_calls;
 std::once_flag g_init_once;
 
 std::mutex g_unk_lock;
@@ -104,9 +108,7 @@ struct GaugeHook {
     ~GaugeHook() { gauge_unregister(name); }
 };
 GaugeHook gauge_svc_calls("kernel.svc_calls", [] {   // SVCs answered since start (all numbers)
-    uint64_t n = 0;
-    for (auto& c : g_calls) n += c.load(std::memory_order_relaxed);
-    return static_cast<int64_t>(n);
+    return static_cast<int64_t>(g_calls.total());
 });
 GaugeHook gauge_svc_unknown_kinds("kernel.svc_unknown_kinds", [] {   // distinct unknown SVC numbers seen (the map only grows)
     std::lock_guard<std::mutex> lk(g_unk_lock);
@@ -192,7 +194,7 @@ void svc_dispatch(::Ctx* c, uint32_t number, uint64_t pc) {
     if (auto fn = g_busy_hook.load(std::memory_order_relaxed)) fn();
     if (tt::detail::svc_every.load(std::memory_order_relaxed)) tt::detail::on_svc(c);      // test tooling: frame_source = svc:N
     SvcHandler h = svc_handler(number);
-    if (number < kSvcCount) g_calls[number].fetch_add(1, std::memory_order_relaxed);
+    if (number < kSvcCount) g_calls.add(number);
     if (!h) {
         report_unknown(c, number, pc);
         c->x[0] = kernel::kNotImplemented;
@@ -225,26 +227,28 @@ std::vector<SvcUnknownRecord> svc_unknown_records() {
 }
 
 uint64_t svc_unknown_total() { return g_unknown_total.load(); }
-uint64_t svc_call_count(uint32_t number) { return number < kSvcCount ? g_calls[number].load() : 0; }
+uint64_t svc_call_count(uint32_t number) { return number < kSvcCount ? g_calls.sum(number) : 0; }
 
 void svc_reset_counters() {
     std::lock_guard<std::mutex> lk(g_unk_lock);
     g_unknown.clear();
     g_unknown_total = 0;
     g_log_limit = -1;
-    for (auto& c : g_calls) c = 0;
+    g_calls.clear();
 }
 
 std::string svc_summary() {
     uint64_t total = 0;
     size_t distinct = 0;
-    for (auto& c : g_calls)
-        if (c.load()) { total += c.load(); distinct++; }
+    std::vector<uint64_t> counts(kSvcCount);
+    for (uint32_t n = 0; n < kSvcCount; n++) counts[n] = g_calls.sum(n);
+    for (uint64_t c : counts)
+        if (c) { total += c; distinct++; }
     std::string s = "svc: " + std::to_string(total) + " calls, " + std::to_string(distinct) + " distinct, " + std::to_string(g_unknown_total.load()) + " unknown";
     // The busiest three, so a guest spinning on one SVC shows which.
     std::vector<std::pair<uint64_t, uint32_t>> top;
     for (uint32_t n = 0; n < kSvcCount; n++)
-        if (const uint64_t k = g_calls[n].load()) top.emplace_back(k, n);
+        if (const uint64_t k = counts[n]) top.emplace_back(k, n);
     std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     if (!top.empty()) {
         s += " (most:";

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <atomic>
+#include "nxrt/tl_counts.h"
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -125,6 +126,11 @@ struct Thunk {
     std::atomic<uint64_t> calls{0};
     std::atomic<int> ft_zone{-1};   // frame trace zone ("hle:<name>"), registered on the first slow call
 };
+// Calls of handled thunks are counted per thread (tl_counts.h: every guest thread calls the hot ones, and a shared counter bounced between
+// cores); thunks past the per-thread table and logging stubs count in Thunk::calls. hle_calls() adds both.
+struct ThunkCountTag {};
+constexpr size_t kTlThunks = 4096;
+TlCounts<kTlThunks, ThunkCountTag> g_thunk_tl;
 std::mutex g_hle_lock;
 std::vector<std::unique_ptr<Thunk>> g_thunks;        // index = (addr - kHleBase) / 16
 std::atomic<size_t> g_thunk_count{0};                // published size (thunks are never removed outside hle_clear)
@@ -283,12 +289,17 @@ size_t hle_stub_count() {
     return n;
 }
 
-uint64_t hle_calls(uint64_t addr) { return hle_is_thunk(addr) ? g_thunks[thunk_index(addr)]->calls.load() : 0; }
+uint64_t hle_calls(uint64_t addr) {
+    if (!hle_is_thunk(addr)) return 0;
+    const size_t i = thunk_index(addr);
+    return g_thunks[i]->calls.load() + (i < kTlThunks ? g_thunk_tl.sum(i) : 0);
+}
 
 std::vector<HleInfo> hle_list() {
     std::lock_guard<std::mutex> lk(g_hle_lock);
     std::vector<HleInfo> v;
-    for (auto& t : g_thunks) v.push_back({t->name, t->calls.load(), t->fn == nullptr});
+    for (size_t i = 0; i < g_thunks.size(); ++i)
+        v.push_back({g_thunks[i]->name, g_thunks[i]->calls.load() + (i < kTlThunks ? g_thunk_tl.sum(i) : 0), g_thunks[i]->fn == nullptr});
     return v;
 }
 
@@ -296,6 +307,7 @@ void hle_clear() {
     std::lock_guard<std::mutex> lk(g_hle_lock);
     g_thunk_count.store(0);
     g_thunks.clear();
+    g_thunk_tl.clear();
     g_thunk_by_name.clear();
 }
 
@@ -348,8 +360,10 @@ void dispatch_call(::Ctx* c, uint64_t addr) {
         }
     }
     if (hle_is_thunk(addr)) {
-        Thunk& t = *g_thunks[thunk_index(addr)];
-        t.calls.fetch_add(1, std::memory_order_relaxed);
+        const size_t ti = thunk_index(addr);
+        Thunk& t = *g_thunks[ti];
+        if (t.fn && ti < kTlThunks) g_thunk_tl.add(ti);
+        else t.calls.fetch_add(1, std::memory_order_relaxed);
         const char* saved = t_hle_name;
         t_hle_name = t.name.c_str();
         // [hle] trace: the line is written after the handler ran, so it carries the result (x0) next to the arguments

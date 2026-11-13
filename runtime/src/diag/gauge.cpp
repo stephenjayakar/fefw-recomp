@@ -15,6 +15,8 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <cstring>
+#include <intrin.h>
 
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
@@ -99,6 +101,26 @@ struct HitchEvent {
 std::mutex g_ev_mu;                               // taken by the presenting thread only for a frame over the limit
 std::vector<HitchEvent> g_pending;
 
+// ---- frame budget ([diag] budget, default true) ------------------------------------------------------------------------------
+// Per presented frame (render thread) and per game present (the game's presenting thread), what each thread spent, so the 10 s summary can
+// say whether the render thread and the game thread fit in the frame, with percentiles (the hitch line only sees frames over 50 ms).
+// Render thread work = replay - GPU slot waits - lock waits + present - limiter - acquire; its CPU time comes from QueryThreadCycleTime (TSC
+// cycles on the core). Game work = the gap between two presents - the present's back pressure (waiting for the render thread).
+struct RFrame { float dt = 0, work = 0, gpu = 0, idle = 0, lim = 0, kcyc = 0; };
+struct GFrame { float gap = 0, bp = 0, sync = 0, wait = 0, kcyc = 0; };
+constexpr size_t kBRing = 8192;
+std::atomic<bool> g_budget_on{false};
+RFrame g_rf[kBRing];
+std::atomic<uint64_t> g_rf_n{0};
+GFrame g_gf[kBRing];
+std::atomic<uint64_t> g_gf_n{0};
+
+uint64_t thread_cycles() {
+    ULONG64 c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return c;
+}
+
 // Called for every presented frame at tick t (previous frame's tick prev_t, 0 for the first), frame number n.
 void hitch_on_frame(uint64_t t, uint64_t prev_t, uint64_t n) {
     if (!g_hitch_on.load(std::memory_order_relaxed)) return;
@@ -107,6 +129,26 @@ void hitch_on_frame(uint64_t t, uint64_t prev_t, uint64_t n) {
     for (size_t i = 0; i < ns; i++) cur[i] = g_src[i].counter ? g_src[i].counter() : (uint64_t)g_src[i].level();
     uint64_t curp[kHpCount];
     for (int i = 0; i < kHpCount; i++) curp[i] = g_phase[i].load(std::memory_order_relaxed);
+    if (g_budget_on.load(std::memory_order_relaxed)) {
+        static thread_local uint64_t prev_cyc = 0;
+        const uint64_t cyc = thread_cycles();
+        if (prev_t && t > prev_t && prev_cyc) {
+            const double tm = 1000.0 / qpc_freq();
+            auto d = [&](int p) { return (double)(curp[p] - g_prev_phase[p]) * tm; };
+            RFrame f;
+            f.dt = (float)((double)(t - prev_t) * tm);
+            const double work = d(kHpRenderReplay) - d(kHpRenderGpuWait) - d(kHpRenderLockWait) + d(kHpRenderPresent) - d(kHpRenderLimiter) - d(kHpRenderAcquire);
+            f.work = (float)std::max(0.0, work);
+            f.gpu = (float)(d(kHpRenderGpuWait) + d(kHpRenderAcquire));
+            f.idle = (float)d(kHpRenderIdle);
+            f.lim = (float)d(kHpRenderLimiter);
+            f.kcyc = (float)((double)(cyc - prev_cyc) / 1000.0);
+            const uint64_t k = g_rf_n.load(std::memory_order_relaxed);
+            g_rf[k % kBRing] = f;
+            g_rf_n.store(k + 1, std::memory_order_release);
+        }
+        prev_cyc = cyc;
+    }
     const uint64_t gap = g_game_gap_max.exchange(0, std::memory_order_relaxed);
     const uint64_t thr = g_hitch_ticks.load(std::memory_order_relaxed);
     const uint64_t gc = game_cycles(), pf = process_faults();
@@ -236,6 +278,194 @@ std::string format_event(const HitchEvent& ev, size_t others) {
     return out;
 }
 
+// ---- frame budget report -----------------------------------------------------------------------------------------------------
+float pct(std::vector<float>& v, double p) {     // v sorted
+    if (v.empty()) return 0;
+    return v[std::min(v.size() - 1, (size_t)((double)v.size() * p))];
+}
+std::string pcts(std::vector<float> v) {
+    std::sort(v.begin(), v.end());
+    char b[96];
+    snprintf(b, sizeof b, "p50 %.1f p95 %.1f p99 %.1f max %.1f", pct(v, 0.5), pct(v, 0.95), pct(v, 0.99), v.empty() ? 0.0f : v.back());
+    return b;
+}
+float median_of(std::vector<float> v) {
+    std::sort(v.begin(), v.end());
+    return pct(v, 0.5);
+}
+
+// TSC cycles per ms, measured between two reports (QueryThreadCycleTime counts TSC cycles).
+double g_bud_tsc0 = 0, g_bud_qpc0 = 0;
+double tsc_per_ms_now() {
+    const double tsc = (double)__rdtsc(), q = (double)qpc();
+    double r = 0;
+    if (g_bud_qpc0 > 0 && q > g_bud_qpc0) r = (tsc - g_bud_tsc0) / ((q - g_bud_qpc0) * 1000.0 / qpc_freq());
+    g_bud_tsc0 = tsc, g_bud_qpc0 = q;
+    return r;
+}
+
+uint64_t g_bud_rf_last = 0, g_bud_gf_last = 0;
+
+void budget_report() {
+    const double tpm = tsc_per_ms_now();
+    const uint64_t rn = g_rf_n.load(std::memory_order_acquire), gn = g_gf_n.load(std::memory_order_acquire);
+    const uint64_t r0 = std::max(g_bud_rf_last, rn > kBRing - 64 ? rn - (kBRing - 64) : 0), g0 = std::max(g_bud_gf_last, gn > kBRing - 64 ? gn - (kBRing - 64) : 0);
+    g_bud_rf_last = rn, g_bud_gf_last = gn;
+    if (!(tpm > 0) || rn <= r0) return;
+    std::vector<float> dt, work, cpu, gpu, idle, lim;
+    for (uint64_t i = r0; i < rn; i++) {
+        const RFrame& f = g_rf[i % kBRing];
+        dt.push_back(f.dt), work.push_back(f.work), gpu.push_back(f.gpu), idle.push_back(f.idle), lim.push_back(f.lim);
+        cpu.push_back((float)((double)f.kcyc * 1000.0 / tpm));
+    }
+    std::vector<float> gap, gwork, gcpu, gwait, gsync;
+    for (uint64_t i = g0; i < gn; i++) {
+        const GFrame& f = g_gf[i % kBRing];
+        gap.push_back(f.gap);
+        gwork.push_back(std::max(0.0f, f.gap - f.bp));
+        gcpu.push_back((float)((double)f.kcyc * 1000.0 / tpm));
+        gwait.push_back(f.wait);
+        gsync.push_back(f.sync);
+    }
+    // slow frames: over 1.2x the median and 2 ms over it; the cause is the part that grew most against its own median
+    const float mdt = median_of(dt), mwork = median_of(work), mgpu = median_of(gpu), midle = median_of(idle);
+    size_t slow = 0, by_game = 0, by_render = 0, by_gpu = 0;
+    for (size_t i = 0; i < dt.size(); i++) {
+        if (!(dt[i] > 1.2f * mdt && dt[i] - mdt > 2.0f)) continue;
+        ++slow;
+        const float a = idle[i] - midle, b = work[i] - mwork, c = gpu[i] - mgpu;
+        if (a >= b && a >= c) ++by_game;
+        else if (b >= c) ++by_render;
+        else ++by_gpu;
+    }
+    std::string extra;
+    {   // split submissions ([nvn] split_submit_ms) per frame, when that gauge exists
+        static int64_t last_splits = -1;
+        for (auto& kv : gauge_read_all())
+            if (kv.first == "nvn.split_submits") {
+                if (last_splits >= 0 && kv.second > last_splits) {
+                    char b[64];
+                    snprintf(b, sizeof b, "; split submits/frame %.1f", (double)(kv.second - last_splits) / (double)dt.size());
+                    extra = b;
+                }
+                last_splits = kv.second;
+            }
+    }
+    NXLOG_I("budget", "%zu frames, median %.2f ms | render thread ms: work %s; cpu %s; GPU/swapchain waits %s; limiter p50 %.1f; idle p50 %.1f%s",
+            dt.size(), mdt, pcts(work).c_str(), pcts(cpu).c_str(), pcts(gpu).c_str(), median_of(lim), midle, extra.c_str());
+    if (!gap.empty())
+        NXLOG_I("budget", "game thread ms (%zu presents): frame %s; work (minus present back pressure) %s; cpu %s; waits p50 %.1f p99 %.1f; GPU sync waits p99 %.1f | "
+                "slow frames (over 1.2x the median): %zu = waiting for the game %zu, render thread work %zu, GPU/swapchain %zu",
+                gap.size(), pcts(gap).c_str(), pcts(gwork).c_str(), pcts(gcpu).c_str(), median_of(gwait),
+                [&] { std::vector<float> v = gwait; std::sort(v.begin(), v.end()); return pct(v, 0.99); }(),
+                [&] { std::vector<float> v = gsync; std::sort(v.begin(), v.end()); return pct(v, 0.99); }(), slow, by_game, by_render, by_gpu);
+}
+
+// CPU time of every thread of the process over the window, grouped by name: who uses the cores (oversubscription, driver threads).
+struct ThrSlot { HANDLE h = nullptr; uint64_t last = 0; std::string name; bool seen = false; };
+std::map<DWORD, ThrSlot> g_thr;
+uint64_t g_sys_idle = 0, g_sys_total = 0, g_thr_qpc = 0, g_thr_tsc = 0;
+
+std::string thread_name_of(HANDLE h, DWORD tid, const std::map<uint32_t, std::string>& reg_names) {
+    auto it = reg_names.find(tid);
+    if (it != reg_names.end() && !it->second.empty()) return it->second;
+    using GetDescFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    static const GetDescFn get_desc = reinterpret_cast<GetDescFn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+    if (get_desc) {
+        PWSTR w = nullptr;
+        if (SUCCEEDED(get_desc(h, &w)) && w) {
+            std::string s;
+            for (PWSTR p = w; *p && s.size() < 48; ++p) s += (*p < 128) ? (char)*p : '?';
+            LocalFree(w);
+            if (!s.empty()) return s;
+        }
+    }
+    // the module its start address is in: driver and system threads
+    using NtQit = LONG(WINAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const NtQit qit = reinterpret_cast<NtQit>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+    void* start = nullptr;
+    if (qit && qit(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, nullptr) == 0 && start) {
+        HMODULE m = nullptr;
+        char path[MAX_PATH];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)start, &m) &&
+            GetModuleFileNameA(m, path, sizeof path)) {
+            const char* base = strrchr(path, '\\');
+            return std::string("[") + (base ? base + 1 : path) + "]";
+        }
+    }
+    return "[?]";
+}
+
+void thread_cpu_report() {
+    const uint64_t q = qpc(), tsc = __rdtsc();
+    const double win_ms = g_thr_qpc ? (double)(q - g_thr_qpc) * 1000.0 / qpc_freq() : 0;
+    const double tpm = win_ms > 0 ? (double)(tsc - g_thr_tsc) / win_ms : 0;
+    g_thr_qpc = q, g_thr_tsc = tsc;
+    FILETIME fi, fk, fu;
+    uint64_t idle = 0, total = 0;
+    if (GetSystemTimes(&fi, &fk, &fu)) {
+        auto u = [](const FILETIME& f) { return (uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime; };
+        idle = u(fi), total = u(fk) + u(fu);     // kernel time includes idle
+    }
+    const double sys_busy = (total > g_sys_total && g_sys_total) ? 100.0 * (1.0 - (double)(idle - g_sys_idle) / (double)(total - g_sys_total)) : -1;
+    g_sys_idle = idle, g_sys_total = total;
+    std::map<uint32_t, std::string> reg_names;
+    for (const ThreadRecord& r : diag_threads()) reg_names[r.host_tid] = r.name;
+    for (auto& kv : g_thr) kv.second.seen = false;
+    std::map<std::string, std::pair<double, int>> groups;     // name -> (cpu ms, threads)
+    double total_ms = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        const DWORD pid = GetCurrentProcessId();
+        if (Thread32First(snap, &te)) do {
+            if (te.th32OwnerProcessID != pid) continue;
+            ThrSlot& s = g_thr[te.th32ThreadID];
+            const bool fresh = !s.h;
+            if (fresh) {
+                s.h = OpenThread(THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                if (!s.h) s.h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                if (!s.h) { g_thr.erase(te.th32ThreadID); continue; }
+            }
+            s.seen = true;
+            s.name = thread_name_of(s.h, te.th32ThreadID, reg_names);
+            ULONG64 c = 0;
+            QueryThreadCycleTime(s.h, &c);
+            if (!fresh && tpm > 0 && c >= s.last) {
+                const double ms = (double)(c - s.last) / tpm;
+                auto& gr = groups[s.name];
+                gr.first += ms, gr.second++;
+                total_ms += ms;
+            }
+            s.last = c;
+        } while (Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    for (auto it = g_thr.begin(); it != g_thr.end();) {
+        if (!it->second.seen) { CloseHandle(it->second.h); it = g_thr.erase(it); }
+        else ++it;
+    }
+    if (!(win_ms > 0) || groups.empty()) return;
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& kv : groups) {
+        char b[96];
+        if (kv.second.second > 1) snprintf(b, sizeof b, "%s x%d", kv.first.c_str(), kv.second.second);
+        else snprintf(b, sizeof b, "%s", kv.first.c_str());
+        v.emplace_back(kv.second.first, b);
+    }
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string line;
+    char b[128];
+    for (size_t i = 0; i < v.size() && i < 16; i++) {
+        if (v[i].first / win_ms < 0.005) break;
+        snprintf(b, sizeof b, "%s%s %.0f", i ? ", " : "", v[i].second.c_str(), 100.0 * v[i].first / win_ms);
+        line += b;
+    }
+    NXLOG_I("budget", "cpu %% of one core over %.1f s: process %.0f, machine busy %.0f%% of %u processors | %s", win_ms / 1000.0, 100.0 * total_ms / win_ms, sys_busy,
+            (unsigned)std::thread::hardware_concurrency(), line.c_str());
+}
+
 struct Monitor {
     std::mutex ctl;
     std::thread th;
@@ -297,6 +527,10 @@ void monitor_run(double summary_s) {
                         (unsigned long long)window_frames, st.span_s, st.mean_fps, st.low1_fps, st.worst_ms, st.over2x, st.median_ms);
             } else if (seen_frames) {
                 NXLOG_W("hitch", "no frame presented in the last %.1f s", summary_s);
+            }
+            if (g_budget_on.load(std::memory_order_relaxed)) {
+                if (!dt.empty()) budget_report();
+                thread_cpu_report();
             }
         }
     }
@@ -464,6 +698,25 @@ void hitch_note_game_present() {
     t_game_present_thread = true;
     const uint64_t t = qpc();
     const uint64_t prev = g_game_present_last.exchange(t, std::memory_order_relaxed);
+    if (g_budget_on.load(std::memory_order_relaxed)) {
+        static thread_local uint64_t p_cyc = 0, p_bp = 0, p_sync = 0, p_wait = 0;
+        const uint64_t cyc = thread_cycles();
+        const uint64_t bp = g_phase[kHpGameBackpressure].load(std::memory_order_relaxed), sy = g_phase[kHpGameSyncWait].load(std::memory_order_relaxed),
+                       wt = g_phase[kHpGameWait].load(std::memory_order_relaxed);
+        if (prev && t > prev && p_cyc) {
+            const double tm = 1000.0 / qpc_freq();
+            GFrame f;
+            f.gap = (float)((double)(t - prev) * tm);
+            f.bp = (float)((double)(bp - p_bp) * tm);
+            f.sync = (float)((double)(sy - p_sync) * tm);
+            f.wait = (float)((double)(wt - p_wait) * tm);
+            f.kcyc = (float)((double)(cyc - p_cyc) / 1000.0);
+            const uint64_t k = g_gf_n.load(std::memory_order_relaxed);
+            g_gf[k % kBRing] = f;
+            g_gf_n.store(k + 1, std::memory_order_release);
+        }
+        p_cyc = cyc, p_bp = bp, p_sync = sy, p_wait = wt;
+    }
     if (!prev || t <= prev) return;
     const uint64_t d = t - prev;
     uint64_t m = g_game_gap_max.load(std::memory_order_relaxed);
@@ -504,6 +757,7 @@ void hitch_start() {
         for (size_t i = 0; i < ns; i++) g_prev_val[i] = g_src[i].counter ? g_src[i].counter() : (uint64_t)g_src[i].level();
         for (int i = 0; i < kHpCount; i++) g_prev_phase[i] = g_phase[i].load(std::memory_order_relaxed);
     }
+    g_budget_on.store(config_get_bool("diag", "budget", true));
     g_hitch_on.store(true);
     s.stop = false;
     s.th = std::thread(monitor_run, summary_s);

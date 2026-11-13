@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -67,6 +68,8 @@ struct Slot {
     uint64_t sets_live = 0;               // descriptor sets allocated from this slot's pools since the last reset (vk.descriptor_sets)
     uint32_t gp_n = 0;                    // GPU pass profiler: timestamps written by the submission
     std::vector<std::pair<std::string, uint32_t>> gp_labels;   // label and argument of each interval (stamp i closes interval i)
+    // split_submission: command buffers of this slot's pool already handed to the GPU in this submission, and free ones (all reset with the pool)
+    std::vector<VkCommandBuffer> split_used, split_free;
     uint64_t frame = 0;                   // [prof] gpu_stats: presents counted when the submission was recorded (the frame it belongs to)
 };
 
@@ -234,8 +237,25 @@ LONG WINAPI render_throw_report(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// [sched] render_priority (default normal = left as created): the render thread's Windows priority. The process runs in the high priority
+// class and the game's job workers (nn::os priority 15 and up) sit at above normal or higher with the dynamic boost off, so under load they and
+// the background texture workers can take the core from the render thread, which is on the frame's critical path. above / highest lift it.
+void apply_render_priority() {
+    std::string v = nxrt::config_get_str("sched", "render_priority", "normal");
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    int p = THREAD_PRIORITY_NORMAL;
+    if (v == "above" || v == "above_normal") p = THREAD_PRIORITY_ABOVE_NORMAL;
+    else if (v == "highest") p = THREAD_PRIORITY_HIGHEST;
+    else if (v == "time_critical") p = THREAD_PRIORITY_TIME_CRITICAL;
+    else if (v != "normal" && v != "off") NXLOG_W(kTag, "[sched] render_priority = %s is not normal, above, highest or time_critical: normal", v.c_str());
+    if (p == THREAD_PRIORITY_NORMAL) return;
+    SetThreadPriority(GetCurrentThread(), p);
+    NXLOG_I(kTag, "render thread priority: %s ([sched] render_priority)", v.c_str());
+}
+
 void render_loop() {
     t_render_thread = true;
+    apply_render_priority();
     static void* veh = AddVectoredExceptionHandler(0, render_throw_report);
     (void)veh;
     g->tid = std::this_thread::get_id();
@@ -350,6 +370,61 @@ void flush_batch() {
     g->batch.clear();
     g->ctr.submits.fetch_add(1);
 }
+
+std::atomic<uint64_t> g_splits{0};
+
+}  // namespace
+
+bool split_submission(Frame& f) {
+    if (!g || !f.split_ok || !f.slot || g->frame_batch || g->batch_max > 1 || pool_copy_pending() || !on_render_thread()) return false;
+    Slot& s = *static_cast<Slot*>(f.slot);
+    if (f.cb != s.cb) return false;
+    VkCommandBuffer next = VK_NULL_HANDLE;     // the buffer for the rest first: without one nothing is split
+    if (!s.split_free.empty()) {
+        next = s.split_free.back();
+        s.split_free.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = s.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(g->dev->device(), &ai, &next) != VK_SUCCESS) return false;
+        vk_gauge_command_buffers().add(1);
+    }
+    if (!g->batch.empty()) flush_batch();       // keep the submission order
+    if (vkEndCommandBuffer(s.cb) != VK_SUCCESS) {
+        s.split_free.push_back(next);
+        return false;
+    }
+    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbi.commandBuffer = s.cb;
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = 1;
+    si.pCommandBufferInfos = &cbi;
+    VkResult r;
+    {
+        NXFT("split.submit");
+        nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
+        const uint64_t tl = nxrt::hitch_ticks();
+        std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
+        nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tl);
+        r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
+    }
+    if (r != VK_SUCCESS) NXLOG_E(kTag, "vkQueueSubmit2 of a split submission failed (%d)", static_cast<int>(r));
+    s.split_used.push_back(s.cb);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(next, &bi);
+    s.cb = next;
+    f.cb = next;
+    g->ctr.submits.fetch_add(1);
+    g_splits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+uint64_t split_count() { return g_splits.load(std::memory_order_relaxed); }
+
+namespace {
 
 // submit_batch = frame: a thread outside the render thread waits for a serial that may still sit in the batch (or not be recorded yet);
 // the render thread flushes it as soon as it is in the batch instead of with the next present (which that thread may be the one to queue).
@@ -490,6 +565,10 @@ Slot& acquire_slot() {
     s.gp_labels.clear();
     retire();
     vkResetCommandPool(g->dev->device(), s.pool, 0);
+    if (!s.split_used.empty()) {     // the reset made them free again; the slot's own cb is whichever was current at the end
+        s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
+        s.split_used.clear();
+    }
     for (VkDescriptorPool p : s.dpools) vkResetDescriptorPool(g->dev->device(), p, 0);
     vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));   // the reset freed them
     s.sets_live = 0;
@@ -827,6 +906,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     f.cb = s.cb;
     f.serial = serial;
     f.slot = &s;
+    f.split_ok = !unsignalled;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cb, &bi);
@@ -853,7 +933,16 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         NXLOG_E(kTag, "submission %llu: recording threw (%s): its commands are dropped, an empty submission signals it",
                 static_cast<unsigned long long>(serial), e.what());
         replay_abort_submit();
+        if (!s.split_used.empty()) {     // parts already handed to the GPU must finish before their pool is reset
+            std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
+            vkQueueWaitIdle(g->dev->queue());
+        }
         vkResetCommandPool(g->dev->device(), s.pool, 0);
+        if (!s.split_used.empty()) {
+            s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
+            s.split_used.clear();
+        }
+        f.cb = s.cb;
         vkBeginCommandBuffer(s.cb, &bi);
         s.timed = false;
         s.gp_n = 0;
@@ -1382,6 +1471,7 @@ void register_counter_gauges() {
     reg("nvn.cnt.descriptor_sets", &Counters::descriptor_sets);
     // What the hitch log (nxrt/gauge.h) shows for a slow frame: growth of these during the frame, read lock-free on the presenting thread.
     static const bool hitch_registered = [] {
+        nxrt::gauge_register("nvn.split_submits", [] { return static_cast<int64_t>(split_count()); });
         nxrt::hitch_add_counter("pipelines_created", []() -> uint64_t { Gpu* gp = g; return gp ? gp->ctr.pipelines_created.load(std::memory_order_relaxed) : 0; });
         nxrt::hitch_add_counter("texture_uploads", []() -> uint64_t { Gpu* gp = g; return gp ? gp->ctr.texture_uploads.load(std::memory_order_relaxed) : 0; });
         nxrt::hitch_add_counter("texture_upload_kb", []() -> uint64_t { Gpu* gp = g; return gp ? gp->ctr.texture_upload_bytes.load(std::memory_order_relaxed) >> 10 : 0; });
@@ -1440,7 +1530,7 @@ void tear_down() {
         if (s.pool) {
             vkDestroyCommandPool(d.device(), s.pool, nullptr);
             vk_gauge_command_pools().sub(1);
-            if (s.cb) vk_gauge_command_buffers().sub(1);
+            if (s.cb) vk_gauge_command_buffers().sub(1 + static_cast<int64_t>(s.split_free.size() + s.split_used.size()));
         }
     }
     if (gp->qpool) { vkDestroyQueryPool(d.device(), gp->qpool, nullptr); vk_gauge_query_pools().sub(1); }

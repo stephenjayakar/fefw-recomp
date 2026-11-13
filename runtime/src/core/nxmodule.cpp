@@ -38,20 +38,19 @@ std::unique_ptr<Entry> g_owned[kMaxListed];           // owns the entries, regis
 std::atomic<Entry*> g_list[kMaxListed];               // the same, for lock-free readers: entries [0, g_count) are valid
 std::atomic<size_t> g_count{0};
 std::atomic<Entry*> g_by_index[kMaxModules];
-// Calls through host_import, counted in cache-line-sized stripes, one per thread (round robin past 64 threads). One shared counter was a
-// contended atomic on every import call: in a 729 ms frame of a 4K load the main thread spent 340 ms and a worker 300 ms in its
-// fetch_add, both calling imports in tight loops (the slow-frame profiler, s1-stutter1).
-struct alignas(64) ImportStripe {
-    std::atomic<uint64_t> n{0};
-};
-constexpr uint32_t kImportStripes = 64;
-ImportStripe g_import_calls[kImportStripes];
+// Imports through the registry, counted in cache-line stripes (one per thread, round robin): every guest thread calls imports at a high rate,
+// and one shared counter made each call a cache-line transfer between cores (8.9 % of the game thread's busy samples sat on its fetch_add).
+struct alignas(64) ImportStripe { std::atomic<uint64_t> n{0}; };
+constexpr size_t kImportStripes = 64;
+ImportStripe g_import_stripes[kImportStripes];
 std::atomic<uint32_t> g_import_stripe_next{0};
-thread_local uint32_t t_import_stripe = ~0u;
 uint64_t import_calls_sum() {
-    uint64_t s = 0;
-    for (const ImportStripe& x : g_import_calls) s += x.n.load(std::memory_order_relaxed);
-    return s;
+    uint64_t t = 0;
+    for (const ImportStripe& s : g_import_stripes) t += s.n.load(std::memory_order_relaxed);
+    return t;
+}
+void import_calls_zero() {
+    for (ImportStripe& s : g_import_stripes) s.n.store(0, std::memory_order_relaxed);
 }
 std::mutex g_type_lock;                               // resolved imported typeinfo slots (ABI 3 NxEh.type_syms), keyed by slot address
 std::unordered_map<const uint64_t*, uint64_t> g_type_cache;
@@ -206,7 +205,7 @@ void nxmodules_clear() {
         g_list[k].store(nullptr);
         g_owned[k].reset();
     }
-    for (ImportStripe& x : g_import_calls) x.n.store(0, std::memory_order_relaxed);
+    import_calls_zero();
     std::lock_guard<std::mutex> tk(g_type_lock);
     g_type_cache.clear();
 }
@@ -243,6 +242,22 @@ const char* import_name(uint32_t import_id) {
     return nx && sym < static_cast<uint32_t>(nx->nsyms) && nx->syms[sym].name ? nx->syms[sym].name : "";
 }
 
+uint64_t import_resolve_named(uint32_t import_id, const char** name_out) {
+    Entry* e = by_index(NX_IMPORT_MODULE(import_id));
+    const uint32_t sym = NX_IMPORT_SYM(import_id);
+    if (e && sym < e->ncache) {
+        const char* name = e->nx->syms[sym].name;
+        if (name) {
+            if (const uint64_t hit = e->cache[sym].load(std::memory_order_acquire)) {
+                *name_out = name;
+                return hit;
+            }
+        }
+    }
+    *name_out = import_name(import_id);
+    return import_resolve(import_id);
+}
+
 uint64_t import_resolve(uint32_t import_id) {
     Entry* e = by_index(NX_IMPORT_MODULE(import_id));
     uint32_t sym = NX_IMPORT_SYM(import_id);
@@ -274,9 +289,8 @@ uint64_t import_calls() { return import_calls_sum(); }
 
 namespace detail {
 void count_import() {
-    uint32_t s = t_import_stripe;
-    if (s == ~0u) t_import_stripe = s = g_import_stripe_next.fetch_add(1, std::memory_order_relaxed) % kImportStripes;
-    g_import_calls[s].n.fetch_add(1, std::memory_order_relaxed);
+    thread_local ImportStripe* t_stripe = &g_import_stripes[g_import_stripe_next.fetch_add(1, std::memory_order_relaxed) % kImportStripes];
+    t_stripe->n.fetch_add(1, std::memory_order_relaxed);
 }
 }  // namespace detail
 

@@ -642,6 +642,44 @@ VkExtent2D viewport_extent() {
     return {px(w, lim.maxFramebufferWidth), px(h, lim.maxFramebufferHeight)};
 }
 
+// [nvn] split_submit_ms = N (default 0 = off): once N ms of a submission's recording have passed (and some draws were recorded) since it began
+// or was last split, the commands so far go to the GPU at the next render pass boundary (split_submission), so the GPU starts on a long
+// submission while the render thread still records the rest: the GPU's work of a frame ends sooner after the game submitted it, and the
+// game waits less on its fences of two frames back. Each split costs one vkQueueSubmit2. Render thread.
+uint64_t g_split_t0 = 0;
+uint32_t g_split_draws = 0;
+uint64_t split_ticks() {
+    static const uint64_t t = [] {
+        const double ms = nxrt::config_get_double("nvn", "split_submit_ms", 0.0);
+        if (ms > 0) NXLOG_I(kTag, "split_submit_ms %.2f: long submissions go to the GPU in parts at pass boundaries", ms);
+        return ms > 0 ? static_cast<uint64_t>(ms * 1e6) : 0;     // ns
+    }();
+    return t;
+}
+uint64_t qpc_now() {     // ns, steady
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void maybe_split() {
+    const uint64_t ticks = split_ticks();
+    static const uint32_t min_draws = static_cast<uint32_t>(std::max<int64_t>(0, nxrt::config_get_int("nvn", "split_min_draws", 16)));   // tests use 0
+    if (!ticks || P.open || g_split_draws < min_draws) return;
+    if (g_occ_active >= 0 || g_cw[0].active >= 0 || g_cw[1].active >= 0 || g_xfb_active || g_xfb_began) return;   // queries, stream-out: one buffer
+    const uint64_t now = qpc_now();
+    if (now - g_split_t0 < ticks) return;
+    const int labels = g_dbg_depth;
+    for (int i = 0; i < labels; ++i) vkCmdEndDebugUtilsLabelEXT(F->cb);     // labels cannot outlive their command buffer (later pops close nothing)
+    if (labels) g_dbg_depth = 0;
+    if (!split_submission(*F)) return;
+    // the new command buffer has no state: everything is bound again
+    g_bound_pipeline = VK_NULL_HANDLE;
+    g_dirty = kAllDirty;
+    g_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    g_restart_valid = false;
+    g_vb_bound_in_cb = false;
+    g_split_t0 = now;
+    g_split_draws = 0;
+}
+
 // Starts a pass on the current render targets if none is open for them. False when there is nothing to render to. `writes`: the program
 // writes images or buffers, so a draw without render targets still has an effect; it gets a pass without attachments over its viewports
 // (Fortune's Weave's SSAO deinterleaves depth and stores its occlusion into 2D arrays from such draws).
@@ -659,6 +697,7 @@ bool ensure_pass(bool depth_ro = false, bool writes = false) {
             g_pending.clear();
         }
     }
+    maybe_split();
     if (gpass_on()) gpass_stamp(*F, "gap", 0);      // copies, dispatches, barriers and layout changes since the previous pass
     g_pass_draws = 0;
     g_pass_verts = 0;
@@ -2961,6 +3000,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     *topo_out = topo;
     rs_mark(kRsVb);
     ++g_rs.draws;
+    ++g_split_draws;
     return true;
 }
 
@@ -4870,6 +4910,8 @@ void replay_begin_submit(Frame& f) {
     g_fb_use.clear();
     g_fb_seen = false;
     g_key_dummy_binding = 0;
+    g_split_t0 = qpc_now();
+    g_split_draws = 0;
     for (UploadAlloc& u : g_push_buf) u = UploadAlloc();   // the upload memory of the last submission
     g_cs_c0 = UploadAlloc();
     // one support buffer per submission (Ryujinx SupportBuffer: render scales 1.0, no BGRA remap)
