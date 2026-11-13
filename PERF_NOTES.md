@@ -241,4 +241,12 @@ render thread (1243 cache reads, 3.4 s). The same frame uploaded every registere
 | 1726755 | first uploads of pool-only asset textures limited to 24 ms of render thread per frame (pool dummy meanwhile) | `[nvn] pool_upload_ms = 24` |
 | 8f3df04 | within that budget, textures with a ready background result first | with the above |
 
-Test request `queue/stutter-1` (DLL a1ed3bd9).
+| 21a101e | frame trace written outside its lock: traced runs had a 33-46 ms frame every 60-61 presents (the writer held the zone-name lock while fprintf'ing a second of events); a measurement artifact only | `[prof] trace_flush_locked = false` |
+| a07e3e2 | held-back pool textures leave the draw's list before the pass is ended (no pass break per pool draw while streaming) | with 1726755 |
+
+Where the 8 s load-in frame of x2-explore went (its frame trace, render thread): `tex.prepare` 6.6 s of 3226 prepares, of which the
+textures read from the cache 5.7 s (1243 textures, each also had a stand-in) and stand-in-only textures 1.6 ms each; CPU untile of BCn and
+uncompressed textures 50 ms; image creation under the trace's 30 us floor. So the cost was the cache reads (fixed by 523706b) and stand-ins
+(575c10f), then the count (1726755).
+
+Test request `queue/stutter-1` (DLL 72f45f52, a07e3e2).
