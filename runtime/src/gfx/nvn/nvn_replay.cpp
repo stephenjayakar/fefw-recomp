@@ -1068,6 +1068,36 @@ Texture* feedback_clone(Texture* t) {
     return tex_gpu_scaled(c.get(), tex_scale(t)) ? c.get() : nullptr;
 }
 
+// [nvn] feedback_levels (default false): the copy holds only the levels the draw's views sample (all bindings of the texture together)
+// instead of every level. A draw that renders a small mip while it samples the next larger one (a bloom or blur chain over one mipmapped
+// texture) then copies that one small level, not the whole chain from the full-size level 0 down.
+bool fb_levels_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "feedback_levels", false);
+    return on;
+}
+
+// The image levels [lo, hi) of `t` that the draw's bindings sample through it (every level when one binding has no level range).
+void fb_level_range(const ProgLayout& pl, Texture* t, uint32_t* lo, uint32_t* hi) {
+    const uint32_t levels = tex_levels(t);
+    *lo = 0;
+    *hi = levels;
+    if (!fb_levels_on() || tex_level_drop(t) != 0 || levels <= 1) return;
+    uint32_t a = levels, z = 0;
+    for (const BindingDesc& d : pl.bindings) {
+        if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        if (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform) continue;
+        const TexResolved r = resolve_texture(d);
+        if (!r.tex || !shares_image(r.tex, t)) continue;
+        if (r.tex != t || !r.has_view || !r.view.has_levels || r.view.min_level < 0) return;
+        const uint32_t l0 = std::min<uint32_t>(static_cast<uint32_t>(r.view.min_level), levels - 1);
+        const uint32_t n = r.view.num_levels > 0 ? static_cast<uint32_t>(r.view.num_levels) : levels - l0;
+        a = std::min(a, l0);
+        z = std::max(z, std::min(levels, l0 + n));
+    }
+    if (a < z) { *lo = a; *hi = z; }
+}
+
 void feedback_prepare(const ProgLayout& pl) {
     g_fb_use.clear();
     bool any = false;
@@ -1080,12 +1110,14 @@ void feedback_prepare(const ProgLayout& pl) {
         any = true;
         Texture* c = feedback_clone(r.tex);
         if (!c) continue;
+        uint32_t lv_lo = 0, lv_hi = 0;
+        fb_level_range(pl, r.tex, &lv_lo, &lv_hi);
         end_pass();
         tex_ensure_exact(r.tex, *F);                                      // storage the game wrote since the image was made reaches the copy too
         tex_transition(r.tex, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);   // the next pass moves it back to the attachment layout and loads it
         tex_transition(c, *F, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         std::vector<VkImageCopy> regions;
-        for (uint32_t lv = 0; lv < tex_levels(r.tex); ++lv) {
+        for (uint32_t lv = lv_lo; lv < lv_hi; ++lv) {
             const VkExtent3D e = tex_image_extent(r.tex, lv);
             VkImageCopy rc = {};
             rc.srcSubresource = {tex_aspect(r.tex), lv, 0, tex_layers(r.tex)};
@@ -3853,15 +3885,72 @@ void do_downsample(const P_Downsample& p) {
     gstamp("downsample");
 }
 
-void do_write_memory(uint64_t gpu_addr, const void* data, uint32_t size) {
+// [nvn] batch_ubo_updates (default false): the game updates uniform buffers in runs (~15 nvnCommandBufferUpdateUniformBuffer back to
+// back, four runs a frame), and each update had a full barrier before and after it. With this on, an update directly after another one
+// (nothing recorded in between, ranges apart) needs no barrier before it, and the barrier after it waits for the next command that is not
+// an update (wm_close from the interpreter): a run costs two barriers instead of two per update.
+bool g_wm_open = false;                                    // updates recorded without their trailing barrier
+VkCommandBuffer g_wm_cb = VK_NULL_HANDLE;
+uint64_t g_wm_mark = 0;                                    // memory_barrier_count(g_wm_cb) after the last update
+std::vector<std::pair<uint64_t, uint64_t>> g_wm_ranges;     // the open updates' [addr, end)
+
+bool wm_batch_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "batch_ubo_updates", false);
+    return on;
+}
+
+void wm_close() {
+    if (!g_wm_open) return;
+    g_wm_open = false;
+    if (F && F->cb == g_wm_cb && memory_barrier_count(F->cb) == g_wm_mark) memory_barrier(F->cb);
+    g_wm_ranges.clear();
+}
+
+bool wm_keeps_open(Op op) {
+    if (op < Op::DrawArrays) return true;
+    switch (op) {
+        case Op::UpdateUniformBuffer: case Op::FenceSync: case Op::WaitSync: case Op::PushDebugGroup: case Op::PopDebugGroup: case Op::PushConstants:
+        case Op::DiscardColor: case Op::DiscardDepthStencil:
+            return true;
+        default: return false;
+    }
+}
+
+// `batch`: an UpdateUniformBuffer (see batch_ubo_updates); the other writes (counters, events) are followed by more commands of their op.
+void do_write_memory(uint64_t gpu_addr, const void* data, uint32_t size, bool batch = false) {
     // a GPU-ordered write of up to 64 KiB into pool memory (UpdateUniformBuffer, counters, events)
+    batch = batch && wm_batch_on();
+    const uint64_t before = memory_barrier_count(F->cb);
     end_pass();
-    memory_barrier(F->cb);
+    bool lead = memory_barrier_count(F->cb) == before;     // end_pass recorded none
+    if (lead && batch && g_wm_open && F->cb == g_wm_cb && g_wm_mark == before) {
+        lead = false;                                       // only other updates since the last full barrier: they do not overlap this one?
+        for (const auto& r : g_wm_ranges)
+            if (gpu_addr < r.second && r.first < gpu_addr + size) { lead = true; break; }
+    }
+    if (lead) {
+        memory_barrier(F->cb);
+        g_wm_open = false;
+        g_wm_ranges.clear();
+    }
     BufRef b = resolve_buffer(gpu_addr, size);
-    if (!b.ok) return;
+    if (!b.ok) {
+        if (g_wm_open) g_wm_mark = memory_barrier_count(F->cb);
+        return;
+    }
     gpu_wrote(gpu_addr, size, kWriteUpdate);
     vkCmdUpdateBuffer(F->cb, b.buffer, b.offset, size, data);
-    memory_barrier(F->cb);
+    if (batch) {
+        if (!g_wm_open) g_wm_ranges.clear();
+        g_wm_ranges.emplace_back(gpu_addr, gpu_addr + size);
+        g_wm_open = true;
+        g_wm_cb = F->cb;
+        g_wm_mark = memory_barrier_count(F->cb);
+    } else {
+        memory_barrier(F->cb);
+        g_wm_open = false;
+        g_wm_ranges.clear();
+    }
     gstamp("write memory");
 }
 
@@ -4039,6 +4128,7 @@ void run_list(const CmdList& list, int depth) {
     for (RecordReader r(list); r.next();) {
         mark_dirty(r);
         if (g_cs_open && !cs_keeps_open(r.op())) cs_close();
+        if (g_wm_open && !wm_keeps_open(r.op())) wm_close();
         {
             RsScope rs(kRsOut);
             if (out_lazy()) out_before_op(r);                                               // compute shadows: results back to the pool first
@@ -4227,7 +4317,7 @@ void run_list(const CmdList& list, int depth) {
                 const auto& p = r.payload<P_UpdateUniformBuffer>();
                 const uint8_t* data = r.blob<P_UpdateUniformBuffer>();
                 const uint32_t n = static_cast<uint32_t>(p.size & ~3ull);
-                if (n) do_write_memory(p.address + static_cast<uint64_t>(p.offset), data, n);
+                if (n) do_write_memory(p.address + static_cast<uint64_t>(p.offset), data, n, true);
                 break;
             }
             case Op::PushConstants: {
@@ -4540,6 +4630,8 @@ void replay_begin_submit(Frame& f) {
         g_pass_unsafe = false;
         g_cs_open = false;
         g_cs_open_set.clear();
+        g_wm_open = false;
+        g_wm_ranges.clear();
         mirror_begin_submit(f, on);
     }
     S.window_origin = window_origin_mode();
@@ -4614,6 +4706,7 @@ void fb_sweep(uint64_t serial) {
 void replay_end_submit(Frame& f) {
     F = &f;
     cs_close();
+    wm_close();
     if (out_any()) {         // every compute result is in game memory, or held and guarded, before the submission's serial signals
         end_pass();
         out_end_submit(F->cb, F->serial);
@@ -4643,6 +4736,8 @@ void replay_end_submit(Frame& f) {
 // submission end a pass, query or label it never began is cleared.
 void replay_abort_submit() {
     P.open = false;
+    g_wm_open = false;
+    g_wm_ranges.clear();
     g_cs_open = false;
     g_cs_open_set.clear();
     g_xfb_began = false;
