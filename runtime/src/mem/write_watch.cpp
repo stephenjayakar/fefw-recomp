@@ -855,6 +855,18 @@ ImportFreeze::ImportFreeze(const void* p, uint64_t n) {
 
 uint64_t freeze_table_hits() { return g_freeze_table_hits.load(std::memory_order_relaxed); }
 
+bool any_guarded(uint64_t lo, uint64_t hi) {
+    bool any = false;
+    g_busy.fetch_add(1, std::memory_order_seq_cst);
+    for (RegionCursor cursor; Region* r = cursor.next();) {
+        if (any) break;
+        const uint64_t a = std::max(lo, r->base), e = std::min(hi, r->base + r->npages * kPage);
+        if (a < e) any = any_set(r->guard.get(), (a - r->base) / kPage, (e - a + kPage - 1) / kPage);
+    }
+    g_busy.fetch_sub(1, std::memory_order_seq_cst);
+    return any;
+}
+
 ImportFreeze::~ImportFreeze() {
     if (slot_ < 0) return;
     AcquireSRWLockExclusive(&g_transitions);

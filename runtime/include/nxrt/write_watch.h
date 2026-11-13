@@ -70,6 +70,8 @@ private:
 // Pages that are no-access (guarded) or read-only already are left as they are; their writes fault and wait the same way.
 // ImportFreezes that found their read-write runs from the heap's page table ([memory] freeze_table) rather than VirtualQuery (tests).
 uint64_t freeze_table_hits();
+// Any thread: some page of [lo, hi) is guarded (no access) by a region.
+bool any_guarded(uint64_t lo, uint64_t hi);
 class ImportFreeze {
 public:
     ImportFreeze(const void* p, uint64_t n);
