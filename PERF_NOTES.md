@@ -229,9 +229,11 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 |---|---|---|
 | `d4e3410` | `[prof] gpu_stats`: GPU ms per frame (submission timestamps), commands and barriers per frame, pass profile in the log (`gpu_passes` without the trace) | `[prof] gpu_stats = 0` |
 | `d4e3410` | tracked dispatch barriers: the full barrier after a dispatch is left open until something depends on it | `[nvn] dispatch_barriers = full` (`tracked` to try) |
+| `5d3e3e9` | tracked game barriers: `nvnCommandBufferBarrier` left out (pass kept open) when only attachment writes are unbarriered | `[nvn] game_barriers = full` (`tracked` to try) |
+| `5d3e3e9` | sticky read-only depth pass for draws that neither sample nor write depth/stencil | `[nvn] depth_ro_sticky = false` |
 
 ### Test log
 
 | request | what | result |
 |---|---|---|
-| gpu-1 | baseline GPU ms/frame + pass profile at 4K; tracked dispatch barriers A/B | queued 13 Nov |
+| gpu-1 | baseline GPU ms/frame + pass profile at 4K; A/B of the three toggles together | queued 13 Nov (5d3e3e9) |
