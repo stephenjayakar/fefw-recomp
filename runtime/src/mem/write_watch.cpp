@@ -137,6 +137,8 @@ OsRange g_frz[kFreezeSlots];
 std::atomic<int> g_frz_n{0};
 std::mutex g_scope_mu;
 
+std::atomic<uint64_t> g_freeze_table_hits{0};   // ImportFreeze constructions that found their runs from the page table (no VirtualQuery)
+
 bool freeze_overlaps(uint64_t lo, uint64_t hi) {
     if (!g_frz_n.load(std::memory_order_seq_cst)) return false;
     for (OsRange& f : g_frz) {
@@ -792,9 +794,53 @@ ImportFreeze::ImportFreeze(const void* p, uint64_t n) {
         }
         if (slot_ < 0) Sleep(i < 1000 ? 0 : 1);
     }
+    // [memory] freeze_table (default on): when the heap's page table says every page of the range is committed read-write (the guest's own
+    // protection), the read-write runs are the pages no region has armed or guarded (our read-only pages, by their bits), and no VirtualQuery
+    // is needed. Each VirtualQuery on the heap's section view walks the whole run of identical pages after the address (5 to 85 ms on a 10 GiB
+    // heap), and this loop ran under the exclusive lock that arm() and every write fault wait for: render-thread frames of 200-500 ms with
+    // "write-watch arming" 180 ms next to each pool import. The table is read before the lock (memory.cpp takes its lock first and the
+    // tracker's inside it); a change since shows in the epoch, and then, or with another freeze over the range, the walk is done as before.
+    const bool use_table = config_get_bool("memory", "freeze_table", true);   // read per freeze (imports are rare): the tests switch it
+    const uint64_t epoch = use_table ? heap_epoch() : 0;
+    const int table = use_table ? heap_rw_pages(lo, hi - lo) : -1;
     // Exclusive against arm() and region destruction: the read-write runs found here are ours until the destructor gives them back.
     AcquireSRWLockExclusive(&g_transitions);
-    for (uint64_t a = lo; a < hi;) {
+    bool done = false;
+    if (table == 1 && heap_epoch() == epoch) {
+        bool other = false;
+        for (int k = 0; k < kFreezeSlots && !other; ++k) {
+            if (k == slot_) continue;
+            const uint64_t h = g_frz[k].hi.load(std::memory_order_seq_cst);
+            other = h && g_frz[k].lo.load(std::memory_order_seq_cst) < hi && lo < h;
+        }
+        if (!other) {
+            const uint64_t np = (hi - lo) / kPage;
+            std::vector<uint64_t> ours((np + 63) / 64, 0);   // pages read-only (or no-access) because a region armed or guarded them
+            g_busy.fetch_add(1, std::memory_order_seq_cst);
+            for (RegionCursor cursor; Region* r = cursor.next();) {
+                const uint64_t rlo = std::max(lo, r->base), rhi = std::min(hi, r->base + r->npages * kPage);
+                for (uint64_t a = rlo; a < rhi; a += kPage)
+                    if (test(r->prot.get(), (a - r->base) / kPage)) {
+                        const uint64_t q = (a - lo) / kPage;
+                        ours[q >> 6] |= uint64_t{1} << (q & 63);
+                    }
+            }
+            g_busy.fetch_sub(1, std::memory_order_seq_cst);
+            for (uint64_t q = 0; q < np;) {
+                while (q < np && (ours[q >> 6] >> (q & 63) & 1)) ++q;
+                const uint64_t s = q;
+                while (q < np && !(ours[q >> 6] >> (q & 63) & 1)) ++q;
+                if (q > s) {
+                    DWORD was = 0;
+                    const uint64_t a = lo + s * kPage, e = lo + q * kPage;
+                    if (VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(e - a), PAGE_READONLY, &was)) runs_.emplace_back(a, e);
+                }
+            }
+            done = true;
+            g_freeze_table_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (uint64_t a = lo; !done && a < hi;) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) != sizeof mbi) break;
         const uint64_t end = std::min<uint64_t>(hi, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
@@ -806,6 +852,8 @@ ImportFreeze::ImportFreeze(const void* p, uint64_t n) {
     }
     ReleaseSRWLockExclusive(&g_transitions);
 }
+
+uint64_t freeze_table_hits() { return g_freeze_table_hits.load(std::memory_order_relaxed); }
 
 ImportFreeze::~ImportFreeze() {
     if (slot_ < 0) return;

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Vulkan device layer: GPU choice (default discrete, override honoured), image-format checks before creation, validation as an
 // oracle (it really reports), buffers and one-shot submits, leak-free create/destroy.
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
@@ -298,6 +301,41 @@ NXTEST(create_and_destroy_many_images_does_not_leak) {
     CHECK_EQ(after.allocations, before.allocations);
     CHECK_EQ(after.bytes, before.bytes);
     CHECK_EQ(dev->validation_stats().errors, 0ull);
+}
+
+// Measurement (no checks beyond success): the time of each image creation for 600 BC7 textures of 2048x2048 with mips (3.3 GB): new memory
+// blocks show as the slow ones. Prints the distribution and the slowest creations.
+NXTEST(image_creation_times_bc7_area_load) {
+    auto dev = make_device("", 0);
+    REQUIRE(dev != nullptr);
+    std::vector<Image> imgs;
+    std::vector<double> ms;
+    for (int i = 0; i < 600; ++i) {
+        ImageDesc d;
+        d.format = VK_FORMAT_BC7_SRGB_BLOCK;
+        d.width = 2048;
+        d.height = 2048;
+        d.mip_levels = 12;
+        d.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        d.name = "timing probe";
+        Image img;
+        std::string why;
+        const auto t0 = std::chrono::steady_clock::now();
+        const VkResult r = dev->create_image(d, &img, &why);
+        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (r != VK_SUCCESS) break;
+        imgs.push_back(img);
+    }
+    std::vector<double> s = ms;
+    std::sort(s.begin(), s.end());
+    double tot = 0;
+    for (double v : s) tot += v;
+    std::printf("    %zu images: total %.1f ms, median %.3f, p90 %.3f, p99 %.3f, max %.1f ms; slow (>1 ms):", ms.size(), tot, s[s.size() / 2],
+                s[s.size() * 9 / 10], s[s.size() * 99 / 100], s.back());
+    for (size_t i = 0; i < ms.size(); ++i)
+        if (ms[i] > 1.0) std::printf(" #%zu %.1f", i, ms[i]);
+    std::printf("\n");
+    for (Image& img : imgs) dev->destroy_image(img);
 }
 
 NXTEST(repeated_device_create_and_destroy) {

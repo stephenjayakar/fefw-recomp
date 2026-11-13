@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "nxrt/config.h"
 #include "nxrt/memory.h"
 #include "nxrt/write_watch.h"
 #include "test_framework.h"
@@ -414,15 +415,22 @@ NXTEST(guarded_pages_boundaries_and_mapping_changes) {
 
 // ImportFreeze (issue 97): while a range is frozen for a Vulkan import, a CPU write to it waits and lands after the freeze (the driver
 // rewrites each imported page and would have lost it); pages the tracker armed stay armed, and arm() leaves the range alone meanwhile.
+// Both ways of finding the read-write runs: the heap's page table with the tracker's bits ([memory] freeze_table, default) and the
+// VirtualQuery walk.
 NXTEST(import_freeze_holds_writes_until_it_ends) {
+  for (const char* table : {"1", "0"}) {
+    nxrt::config_set("memory", "freeze_table", table);
+    std::printf("    [memory] freeze_table = %s\n", table);
     ww::Region* r = setup();
     REQUIRE(r != nullptr);
     CHECK(ww::arm(r, 6, 1));                                   // an armed page inside the frozen range
+    const uint64_t hits0 = ww::freeze_table_hits();
     std::atomic<bool> wrote{false};
     std::thread writer;
     {
         const ww::ImportFreeze fz(reinterpret_cast<void*>(mem::kHeapBase + 4 * kPg), 4 * kPg);
         CHECK_EQ(prot_of(mem::kHeapBase + 4 * kPg), static_cast<DWORD>(PAGE_READONLY));
+        CHECK_EQ(prot_of(mem::kHeapBase + 6 * kPg), static_cast<DWORD>(PAGE_READONLY));    // armed, left to the tracker
         CHECK_EQ(prot_of(mem::kHeapBase + 8 * kPg), static_cast<DWORD>(PAGE_READWRITE));   // outside the range
         CHECK(!ww::arm(r, 5, 1));                              // no arming while frozen
         writer = std::thread([&] {
@@ -435,6 +443,7 @@ NXTEST(import_freeze_holds_writes_until_it_ends) {
         CHECK_EQ(*reinterpret_cast<volatile uint8_t*>(mem::kHeapBase + 5 * kPg), 0u);   // reads go on
     }
     writer.join();
+    CHECK_EQ(ww::freeze_table_hits() - hits0, std::string(table) == "1" ? 1ull : 0ull);   // the way under test was taken
     CHECK(wrote.load());
     CHECK_EQ(*reinterpret_cast<volatile uint8_t*>(mem::kHeapBase + 5 * kPg), 0x5au);
     CHECK_EQ(*reinterpret_cast<volatile uint8_t*>(mem::kHeapBase + 6 * kPg), 0x6bu);
@@ -444,4 +453,6 @@ NXTEST(import_freeze_holds_writes_until_it_ends) {
     CHECK(std::find(w.begin(), w.end(), 6u) != w.end());      // the armed page's write was tracked as usual
     CHECK(ww::arm(r, 5, 1));                                   // the freeze ended
     teardown(r);
+  }
+  nxrt::config_set("memory", "freeze_table", "1");
 }
