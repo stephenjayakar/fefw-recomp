@@ -202,3 +202,36 @@ A/B toggles, one at a time against the default:
 3. `controls.ini` `[display] astc_quality = fast`: one cache lookup per texture instead of two, and no background re-encode writing to
    the disk. Textures are slightly less sharp (bc7e preset 1 instead of 3).
 4. Keep RAM free while playing (the session had 1.5 GB free): the OS file cache is what makes revisits cheap.
+
+## 6. GPU track (branch `perf/gpu`)
+
+Goal: GPU time per frame comfortably under 16.6 ms at native 3840x2160 (render ratio 1.0, no upscaler) on the RTX 3080 10 GB, in
+Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-perf/queue/gpu-<n>/`; only the tester runs the game.
+
+### What the back end does per frame (static reading, 13 Nov)
+
+- Dynamic rendering. A pass is (re)opened whenever the targets change, a draw samples a texture that needs a layout change or upload
+  (`prepare_textures`: the pass breaks), the depth attachment switches between writable and read-only (a draw samples the depth target),
+  and around every dispatch, copy, clear-texture, fill, query and game barrier. Load op is LOAD (CLEAR only for a never-used image),
+  store op STORE; on an immediate-mode GPU like the 3080 that costs next to nothing, so load/store ops are not a lever here.
+- Barriers: with `[nvn] pass_barriers = tracked` (default) a pass that only wrote its attachments ends without a barrier and layout
+  changes use narrow stage masks. Every dispatch is followed by a full barrier (all commands, all memory), every copy/fill/clear-texture
+  too, and every `nvnCommandBufferBarrier` of the game becomes a full barrier that also ends the pass.
+- Shadow maps: the game's own base size (2048 docked, `[fefw] shadow_size`), independent of the output size.
+- Present: one full-screen draw of the 3840x2160 window texture into the swapchain image plus the (empty) overlay pass; ~0.1-0.2 ms.
+- Upscaler step at render ratio 1.0: `[dlss] upscaler` decides; `taau`/`bilinear` run a 4K compute pass into an RGBA16F history image
+  and blit it into the game's output texture (two 4K images read, two written).
+- Pool copies (`pool_mirror`) keep vertex/uniform reads off PCIe; compute shadows and copy-backs move a few MB per second.
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| `d4e3410` | `[prof] gpu_stats`: GPU ms per frame (submission timestamps), commands and barriers per frame, pass profile in the log (`gpu_passes` without the trace) | `[prof] gpu_stats = 0` |
+| `d4e3410` | tracked dispatch barriers: the full barrier after a dispatch is left open until something depends on it | `[nvn] dispatch_barriers = full` (`tracked` to try) |
+
+### Test log
+
+| request | what | result |
+|---|---|---|
+| gpu-1 | baseline GPU ms/frame + pass profile at 4K; tracked dispatch barriers A/B | queued 13 Nov |
