@@ -304,3 +304,9 @@ The menu_to_world load-in upload frame 295 ms (stutter-3 397), but street_cold r
 street (stutter-3: 20), render thread 14.4 ms/frame (11.5): the in-frame burst trigger at 64 distinct first uploads also fired while
 walking into the cold street. stutter-5 (afc5697): that trigger at 256 (`pool_upload_burst_firsts`); the previous-frame backlog trigger
 stays at 64.
+
+#### stutter-5 result (s5-default, 309d84a) and stutter-6
+
+street_cold clean again: 12 frames over 33 ms (stutter-4 531, stutter-3 20); hub_cold 542 frames over 20 ms, worst 40 ms; the load-in
+upload frame 361 ms (426 uploads; stutter-4 295 ms / 173 uploads): the 256 trigger starts the burst later. stutter-6 (ea6cb89): the
+in-frame trigger is 64 for 30 presents after a loading screen ends, 256 otherwise.
