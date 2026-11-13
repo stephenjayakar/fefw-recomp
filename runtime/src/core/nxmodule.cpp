@@ -38,7 +38,21 @@ std::unique_ptr<Entry> g_owned[kMaxListed];           // owns the entries, regis
 std::atomic<Entry*> g_list[kMaxListed];               // the same, for lock-free readers: entries [0, g_count) are valid
 std::atomic<size_t> g_count{0};
 std::atomic<Entry*> g_by_index[kMaxModules];
-std::atomic<uint64_t> g_import_calls{0};
+// Calls through host_import, counted in cache-line-sized stripes, one per thread (round robin past 64 threads). One shared counter was a
+// contended atomic on every import call: in a 729 ms frame of a 4K load the main thread spent 340 ms and a worker 300 ms in its
+// fetch_add, both calling imports in tight loops (the slow-frame profiler, s1-stutter1).
+struct alignas(64) ImportStripe {
+    std::atomic<uint64_t> n{0};
+};
+constexpr uint32_t kImportStripes = 64;
+ImportStripe g_import_calls[kImportStripes];
+std::atomic<uint32_t> g_import_stripe_next{0};
+thread_local uint32_t t_import_stripe = ~0u;
+uint64_t import_calls_sum() {
+    uint64_t s = 0;
+    for (const ImportStripe& x : g_import_calls) s += x.n.load(std::memory_order_relaxed);
+    return s;
+}
 std::mutex g_type_lock;                               // resolved imported typeinfo slots (ABI 3 NxEh.type_syms), keyed by slot address
 std::unordered_map<const uint64_t*, uint64_t> g_type_cache;
 
@@ -50,7 +64,7 @@ struct GaugeHook {
     ~GaugeHook() { nxrt::gauge_unregister(name); }
 };
 GaugeHook gauge_nx_modules("core.nx_modules", [] { return static_cast<int64_t>(g_count.load(std::memory_order_acquire)); });
-GaugeHook gauge_import_calls("core.import_calls", [] { return static_cast<int64_t>(g_import_calls.load(std::memory_order_relaxed)); });
+GaugeHook gauge_import_calls("core.import_calls", [] { return static_cast<int64_t>(import_calls_sum()); });
 GaugeHook gauge_type_cache("core.type_cache", [] {   // resolved typeinfo slots (only grows)
     std::lock_guard<std::mutex> lk(g_type_lock);
     return static_cast<int64_t>(g_type_cache.size());
@@ -192,7 +206,7 @@ void nxmodules_clear() {
         g_list[k].store(nullptr);
         g_owned[k].reset();
     }
-    g_import_calls = 0;
+    for (ImportStripe& x : g_import_calls) x.n.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> tk(g_type_lock);
     g_type_cache.clear();
 }
@@ -256,10 +270,14 @@ void import_cache_invalidate() {
     invalidate_caches_locked();
 }
 
-uint64_t import_calls() { return g_import_calls.load(std::memory_order_relaxed); }
+uint64_t import_calls() { return import_calls_sum(); }
 
 namespace detail {
-void count_import() { g_import_calls.fetch_add(1, std::memory_order_relaxed); }
+void count_import() {
+    uint32_t s = t_import_stripe;
+    if (s == ~0u) t_import_stripe = s = g_import_stripe_next.fetch_add(1, std::memory_order_relaxed) % kImportStripes;
+    g_import_calls[s].n.fetch_add(1, std::memory_order_relaxed);
+}
 }  // namespace detail
 
 }  // namespace nxrt
