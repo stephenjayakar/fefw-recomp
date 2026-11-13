@@ -73,6 +73,21 @@ struct Deferred {
     std::function<void()> fn;
 };
 
+// [nvn] staging_ring_mb (default 256, 0 = off): texture upload data goes into one persistent host-visible buffer used as a ring, released
+// as the submissions that read it complete, instead of a new staging buffer per texture. A first visit uploads hundreds of megabytes to
+// gigabytes in a frame: each new buffer could take a fresh block of pinned system memory (vkAllocateMemory) that was freed again a few
+// frames later, and the copy into new memory paid its page faults. An upload that does not fit (the ring is full of data the GPU has not
+// read yet, or it is over half the ring) gets its own buffer as before. Render thread only.
+struct StagingRing {
+    gfx::Buffer buf;
+    VkDeviceSize size = 0, head = 0, tail = 0;
+    std::deque<std::pair<uint64_t, VkDeviceSize>> live;   // (serial, end offset) of each allocation, oldest first
+    bool tried = false;
+};
+std::atomic<uint64_t> g_ring_bytes{0}, g_ring_fallback_bytes{0};
+const bool g_ring_hitch = (nxrt::hitch_add_counter("staging_ring_kb", []() -> uint64_t { return g_ring_bytes.load(std::memory_order_relaxed) >> 10; }),
+                           nxrt::hitch_add_counter("staging_own_kb", []() -> uint64_t { return g_ring_fallback_bytes.load(std::memory_order_relaxed) >> 10; }), true);
+
 struct Gpu {
     gfx::Device* dev = nullptr;
     gfx::Renderer* rend = nullptr;
@@ -108,6 +123,7 @@ struct Gpu {
     int last_index = -1;
     std::chrono::steady_clock::time_point last_present{};
     Slot slots[kSlots];
+    StagingRing ring;
     VkQueryPool qpool = VK_NULL_HANDLE;   // frame trace: two timestamps per slot
     VkQueryPool gpool = VK_NULL_HANDLE;   // GPU pass profiler ([prof] gpu_passes): kGpMax timestamps per slot
     uint32_t next_slot = 0;
@@ -417,8 +433,70 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     return staging(size + align);
 }
 
+// The ring's allocation of `size` bytes for submission `serial` (aligned to 256: copies, uniform and storage offsets), or an empty one.
+UploadAlloc ring_alloc(VkDeviceSize size, uint64_t serial) {
+    StagingRing& r = g->ring;
+    if (!r.tried) {
+        r.tried = true;
+        const int64_t mb = config_get_int("nvn", "staging_ring_mb", 256);
+        if (mb > 0) {
+            const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(std::min<int64_t>(mb, 4096)) << 20;
+            if (g->dev->create_buffer(bytes, usage, gfx::MemoryUse::Staging, &r.buf, "nvn staging ring") == VK_SUCCESS && r.buf.mapped) {
+                std::memset(r.buf.mapped, 0, static_cast<size_t>(bytes));   // the pages are touched now, not by the first big upload
+                r.size = bytes;
+                NXLOG_I(kTag, "staging ring: %llu MB of host memory for texture uploads ([nvn] staging_ring_mb)", static_cast<unsigned long long>(bytes >> 20));
+            } else {
+                if (r.buf.buffer) g->dev->destroy_buffer(r.buf);
+                r.buf = gfx::Buffer{};
+                NXLOG_W(kTag, "staging ring: no buffer of %lld MB: every upload gets its own staging buffer", static_cast<long long>(mb));
+            }
+        }
+    }
+    if (!r.size || size > r.size / 2) return {};
+    if (size == 0) size = 16;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const uint64_t done = attempt ? poll_completed() : completed_serial();
+        while (!r.live.empty() && r.live.front().first <= done) {
+            r.tail = r.live.front().second;
+            r.live.pop_front();
+        }
+        VkDeviceSize off = 0;
+        bool fits = false;
+        if (r.live.empty()) {                       // nothing in flight: from the start
+            r.head = r.tail = 0;
+            fits = true;
+        } else if (r.head > r.tail) {               // live data in [tail, head): after the head, or wrapped into [0, tail)
+            off = (r.head + 255) & ~VkDeviceSize{255};
+            if (off + size > r.size) {
+                off = 0;
+                fits = size <= r.tail;
+            } else {
+                fits = true;
+            }
+        } else {                                    // wrapped: live data in [tail, end) and [0, head); head == tail is full
+            off = (r.head + 255) & ~VkDeviceSize{255};
+            fits = off + size <= r.tail;
+        }
+        if (!fits) continue;
+        r.head = off + size;
+        r.live.emplace_back(serial, r.head);
+        UploadAlloc a;
+        a.buffer = r.buf.buffer;
+        a.offset = off;
+        a.ptr = static_cast<uint8_t*>(r.buf.mapped) + off;
+        a.size = size;
+        g_ring_bytes.fetch_add(size, std::memory_order_relaxed);
+        return a;
+    }
+    return {};
+}
+
 UploadAlloc Frame::staging(VkDeviceSize size) {
     Slot& s = *static_cast<Slot*>(slot);
+    if (UploadAlloc a = ring_alloc(size, serial)) return a;
+    g_ring_fallback_bytes.fetch_add(size, std::memory_order_relaxed);
     gfx::Buffer b;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -1252,6 +1330,7 @@ void tear_down() {
     if (gp->th.joinable()) gp->th.join();
     gfx::Device& d = *gp->dev;
     vkDeviceWaitIdle(d.device());
+    if (gp->ring.buf.buffer) d.destroy_buffer(gp->ring.buf);
     for (Slot& s : gp->slots) {
         for (auto& b : s.extra) d.destroy_buffer(b);
         vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));
