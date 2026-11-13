@@ -79,6 +79,8 @@ struct TexGpu {
     bool scale_blocked = false;                         // was scaled, brought back to 1 (bound as a storage image, or paired with an unscaled target)
     std::map<std::array<uint32_t, 12>, VkImageView> views;
     std::map<VkFormat, bool> sampled_formats;
+    VkFormat last_sampled_fmt = VK_FORMAT_UNDEFINED;   // the last answer of sampled_formats (most images are sampled in one format)
+    bool last_sampled_ok = false;
     std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
     VkImageView last_view = VK_NULL_HANDLE;
     int refs = 1;                                      // texture objects over the same storage share one image (render thread)
@@ -2178,13 +2180,17 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     // Check the actual alias format, rather than only the image's original format. view_for
     // can restrict inherited usages, but a descriptor must still have sampled-image usage.
     // Cache per image/device; this is also called for every pool descriptor refresh.
-    auto [feature, inserted] = g->sampled_formats.try_emplace(fmt, false);
-    if (inserted) {
-        VkFormatProperties fp = {};
-        vkGetPhysicalDeviceFormatProperties(device().physical(), fmt, &fp);
-        feature->second = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+    if (fmt != g->last_sampled_fmt || fmt == VK_FORMAT_UNDEFINED) {     // a map lookup per descriptor was 1.6 % of the render thread
+        auto [feature, inserted] = g->sampled_formats.try_emplace(fmt, false);
+        if (inserted) {
+            VkFormatProperties fp = {};
+            vkGetPhysicalDeviceFormatProperties(device().physical(), fmt, &fp);
+            feature->second = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        }
+        g->last_sampled_fmt = fmt;
+        g->last_sampled_ok = feature->second;
     }
-    if (!feature->second) return bad_view(*t, "view format does not support sampling");
+    if (!g->last_sampled_ok) return bad_view(*t, "view format does not support sampling");
     return view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
 }
 
