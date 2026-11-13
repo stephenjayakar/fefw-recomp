@@ -1464,7 +1464,30 @@ bool out_memo_on() {
     return on;
 }
 struct OutSlot { uint64_t addr = 0, size = 0, gen = ~0ull; };
-OutSlot g_out_slot[16 + kCompute * 32 + 4];
+constexpr int kOutSlots = 16 + kCompute * 32 + 4;
+OutSlot g_out_slot[kOutSlots];
+// [nvn] out_memo_dirty (default on): on top of the memo, out_draw_bindings only looks at the slots a BindBuffers changed since the last draw
+// while out_gen() is the same and no slot is unmemoised; any program bind, generation change or reset checks every slot as before. The full
+// pass was 1.1 us per draw (2.8 ms a frame at 2600 draws on the street), most of it confirming unchanged slots (run B, nvn.rstats).
+bool g_out_all = true;                 // the next draw checks every slot
+uint64_t g_out_last_gen = ~0ull;       // out_gen() at the last check
+bool g_out_unmemo = false;             // a slot ended unmemoised (it held a result): the next draw checks every slot
+uint8_t g_out_dirty[kOutSlots] = {};
+uint16_t g_out_dirty_list[kOutSlots];
+int g_out_dirty_n = 0;
+bool out_memo_dirty_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "out_memo_dirty", true);
+    return on;
+}
+void out_slot_changed(int idx) {
+    if (idx < 0 || idx >= kOutSlots || g_out_dirty[idx]) return;
+    g_out_dirty[idx] = 1;
+    g_out_dirty_list[g_out_dirty_n++] = static_cast<uint16_t>(idx);
+}
+void out_dirty_clear() {
+    for (int i = 0; i < g_out_dirty_n; ++i) g_out_dirty[g_out_dirty_list[i]] = 0;
+    g_out_dirty_n = 0;
+}
 void out_draw_read_slot(OutSlot& m, const GState::Bind& b, bool copy_ok, int why, uint64_t gen) {
     if (!b.addr) return;
     if (m.gen != ~0ull && m.addr == b.addr && m.size == b.size &&
@@ -1483,19 +1506,59 @@ void out_draw_read_slot(OutSlot& m, const GState::Bind& b, bool copy_ok, int why
     out_draw_read(b.addr, b.size, copy_ok, why);
 }
 
+// One slot of out_draw_bindings by index (the same order as its full pass).
+void out_check_slot(int idx, uint64_t gen, VkDeviceSize ua) {
+    const GState::Bind* b;
+    bool copy_ok;
+    int why;
+    if (idx < 16) {
+        b = &S.vtx[idx], copy_ok = true, why = kOutDrawBuffer;
+    } else if (idx < 16 + kCompute * 32) {
+        const int st = (idx - 16) / 32, j = (idx - 16) % 32;
+        if (!S.stage[st]) return;                   // as the full pass: an inactive stage's slots are not read by the draw
+        if (j < 16) b = &S.ubo[st][j], copy_ok = ua && (b->addr % ua) == 0, why = kOutDrawBuffer;
+        else b = &S.ssbo[st][j - 16], copy_ok = true, why = kOutStorageXfb;
+    } else {
+        b = &S.xfb[idx - 16 - kCompute * 32], copy_ok = false, why = kOutStorageXfb;
+    }
+    OutSlot& m = g_out_slot[idx];
+    out_draw_read_slot(m, *b, copy_ok, why, gen);
+    if (b->addr && m.gen == ~0ull) g_out_unmemo = true;
+}
+
 // The reads of a draw's bound buffers (out_before_op).
 void out_draw_bindings() {
     if (out_memo_on()) {
         const uint64_t gen = out_gen();
         const VkDeviceSize ua = device().properties().limits.minUniformBufferOffsetAlignment;
+        if (out_memo_dirty_on() && !g_out_all && !g_out_unmemo && gen == g_out_last_gen) {
+            for (int i = 0; i < g_out_dirty_n; ++i) out_check_slot(g_out_dirty_list[i], gen, ua);
+            if (rt_check()) {     // [nvn] rt_check: a slot the fast path skipped must have nothing held in its range
+                for (int idx = 0; idx < kOutSlots; ++idx) {
+                    if (g_out_dirty[idx]) continue;
+                    const GState::Bind* b = idx < 16 ? &S.vtx[idx] : idx >= 16 + kCompute * 32 ? &S.xfb[idx - 16 - kCompute * 32]
+                                          : !S.stage[(idx - 16) / 32] ? nullptr : (idx - 16) % 32 < 16 ? &S.ubo[(idx - 16) / 32][(idx - 16) % 32]
+                                                                                                        : &S.ssbo[(idx - 16) / 32][(idx - 16) % 32 - 16];
+                    if (b && b->addr) chk(!out_overlaps(b->addr, b->size ? b->size : 65536), "out memo dirty");
+                }
+            }
+            out_dirty_clear();
+            if (out_gen() != gen) g_out_all = true;     // a flush in it moved the generation
+            return;
+        }
+        g_out_unmemo = false;
         OutSlot* m = g_out_slot;
-        for (const GState::Bind& b : S.vtx) out_draw_read_slot(*m++, b, true, kOutDrawBuffer, gen);
+        for (const GState::Bind& b : S.vtx) { out_draw_read_slot(*m, b, true, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
         for (int st = 0; st < kCompute; ++st) {
             if (!S.stage[st]) { m += 32; continue; }
-            for (const GState::Bind& b : S.ubo[st]) out_draw_read_slot(*m++, b, ua && (b.addr % ua) == 0, kOutDrawBuffer, gen);
-            for (const GState::Bind& b : S.ssbo[st]) out_draw_read_slot(*m++, b, true, kOutStorageXfb, gen);
+            for (const GState::Bind& b : S.ubo[st]) { out_draw_read_slot(*m, b, ua && (b.addr % ua) == 0, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+            for (const GState::Bind& b : S.ssbo[st]) { out_draw_read_slot(*m, b, true, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
         }
-        for (const GState::Bind& b : S.xfb) out_draw_read_slot(*m++, b, false, kOutStorageXfb, gen);
+        for (const GState::Bind& b : S.xfb) { out_draw_read_slot(*m, b, false, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+        g_out_all = false;
+        g_out_last_gen = out_gen();     // after the pass: a flush in it may have moved the generation
+        if (g_out_last_gen != gen) g_out_all = true;
+        out_dirty_clear();
         return;
     }
     for (const GState::Bind& b : S.vtx) out_draw_read(b.addr, b.size, true, kOutDrawBuffer);
@@ -3729,6 +3792,7 @@ void do_write_memory(uint64_t gpu_addr, const void* data, uint32_t size) {
 
 // ---- the interpreter ----------------------------------------------------------------------------------------------------------
 void apply_bind_program(const P_BindProgram& p) {
+    g_out_all = true;     // out_draw_bindings: the active stages may change
     for (int st = 0; st < 6; ++st)
         if (p.stages & (1u << st)) S.stage[st] = p.program ? p.program->stage[st] : nullptr;
     if (g_trace && (p.stages & (1u << kCompute))) {
@@ -3913,10 +3977,14 @@ void run_list(const CmdList& list, int depth) {
                 const NVNbufferRange* rg = reinterpret_cast<const NVNbufferRange*>(r.blob<P_BindBuffers>());
                 for (uint32_t i = 0; i < p.count; ++i) {
                     const uint32_t k = p.first + i;
-                    if (p.kind == kBufVertex && k < 16) S.vtx[k] = {rg[i].address, rg[i].size};
-                    else if (p.kind == kBufUniform && p.stage < 6 && k < 16) S.ubo[p.stage][k] = {rg[i].address, rg[i].size};
-                    else if (p.kind == kBufStorage && p.stage < 6 && k < 16) S.ssbo[p.stage][k] = {rg[i].address, rg[i].size};
-                    else if (p.kind == kBufXfb && k < 4) S.xfb[k] = {rg[i].address, rg[i].size};
+                    if (p.kind == kBufVertex && k < 16) { S.vtx[k] = {rg[i].address, rg[i].size}; out_slot_changed(static_cast<int>(k)); }
+                    else if (p.kind == kBufUniform && p.stage < 6 && k < 16) {
+                        S.ubo[p.stage][k] = {rg[i].address, rg[i].size};
+                        if (p.stage < kCompute) out_slot_changed(16 + static_cast<int>(p.stage) * 32 + static_cast<int>(k));
+                    } else if (p.kind == kBufStorage && p.stage < 6 && k < 16) {
+                        S.ssbo[p.stage][k] = {rg[i].address, rg[i].size};
+                        if (p.stage < kCompute) out_slot_changed(16 + static_cast<int>(p.stage) * 32 + 16 + static_cast<int>(k));
+                    } else if (p.kind == kBufXfb && k < 4) { S.xfb[k] = {rg[i].address, rg[i].size}; out_slot_changed(16 + kCompute * 32 + static_cast<int>(k)); }
                 }
                 break;
             }
@@ -4522,6 +4590,7 @@ void replay_shutdown() {
     pipeline_shutdown();
     g_pl = nullptr;                // the layouts are gone with the pipelines
     S = GState();
+    g_out_all = true;
     raw_binds_reset();
     P = Pass();
     g_pending.clear();
