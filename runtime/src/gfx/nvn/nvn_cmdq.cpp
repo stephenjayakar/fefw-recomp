@@ -49,6 +49,8 @@ struct Queue {
     uint8_t* mem = nullptr;
     uint64_t head = 0;                        // producer: bytes written
     uint64_t rec_start = 0;                   // producer: where the record being written starts
+    uint64_t tail_seen = 0;                   // producer: the consumer's progress as last read (re-read only when the ring looks full)
+    uint32_t unpublished = 0;                 // producer: records written since the last publish
     alignas(64) std::atomic<uint64_t> pub{0}; // bytes the consumer may run
     alignas(64) std::atomic<uint64_t> tail{0};// bytes the consumer has run
     alignas(64) std::atomic<uint32_t> sleeping{0};
@@ -77,11 +79,17 @@ uint8_t* q_begin(Exec exec, size_t payload) {
     const size_t total = align16(sizeof(Hdr) + payload);
     uint64_t pos = q.head % kRingBytes;
     const size_t pad = pos + total > kRingBytes ? kRingBytes - static_cast<size_t>(pos) : 0;
-    if (q.head + pad + total - q.tail.load(std::memory_order_acquire) > kRingBytes) {
-        ++q.full_waits;
-        q.pub.store(q.head, std::memory_order_seq_cst);
-        wake_worker();
-        while (q.head + pad + total - q.tail.load(std::memory_order_acquire) > kRingBytes) { _mm_pause(); SwitchToThread(); }
+    // the consumer's tail is read only when the space it was last known to leave runs out (it is written by the worker: reading it for
+    // every record moved its cache line between the two cores every time)
+    if (q.head + pad + total - q.tail_seen > kRingBytes) {
+        q.tail_seen = q.tail.load(std::memory_order_acquire);
+        if (q.head + pad + total - q.tail_seen > kRingBytes) {
+            ++q.full_waits;
+            q.unpublished = 0;
+            q.pub.store(q.head, std::memory_order_seq_cst);
+            wake_worker();
+            while (q.head + pad + total - (q.tail_seen = q.tail.load(std::memory_order_acquire)) > kRingBytes) { _mm_pause(); SwitchToThread(); }
+        }
     }
     if (pad) {
         Hdr* h = reinterpret_cast<Hdr*>(q.mem + pos);
@@ -100,9 +108,16 @@ uint8_t* q_begin(Exec exec, size_t payload) {
     return reinterpret_cast<uint8_t*>(h + 1);
 }
 
-void q_commit() {
+// Records are published in batches: each publish is a store the spinning worker's core must fetch (a cache line moving between cores per
+// record cost about as much as the call it carried). [nvn] replay_batch (default 16): records per publish; every sync publishes the rest.
+uint32_t g_batch = 16;
+void q_publish() {
+    g_q->unpublished = 0;
     g_q->pub.store(g_q->head, std::memory_order_seq_cst);
     wake_worker();
+}
+inline void q_commit() {
+    if (++g_q->unpublished >= g_batch) q_publish();
 }
 
 void worker_main() {
@@ -139,8 +154,8 @@ void worker_main() {
             const Hdr* h = reinterpret_cast<const Hdr*>(q.mem + t % kRingBytes);
             if (h->exec) h->exec(reinterpret_cast<const uint8_t*>(h + 1));
             t += h->size;
-            q.tail.store(t, std::memory_order_release);
         }
+        q.tail.store(t, std::memory_order_release);   // once per batch: the producer reads it only at a sync or when the ring looks full
         q.worker_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count()),
                               std::memory_order_relaxed);
     }
@@ -150,10 +165,9 @@ void worker_main() {
 void do_sync() {
     Queue& q = *g_q;
     const uint64_t want = q.head;
+    if (q.unpublished) q_publish();
     if (q.tail.load(std::memory_order_acquire) >= want) return;
     const auto t0 = std::chrono::steady_clock::now();
-    q.pub.store(want, std::memory_order_seq_cst);
-    wake_worker();
     for (int i = 0; q.tail.load(std::memory_order_acquire) < want; ++i) {
         if (i < 4000) _mm_pause();
         else {
@@ -684,7 +698,9 @@ void install() {
 #undef CMDQ_WRAP_DEEP
 #undef CMDQ_WRAP_SYNC
     }
-    q.head = q.rec_start = 0;
+    q.head = q.rec_start = q.tail_seen = 0;
+    q.unpublished = 0;
+    g_batch = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "replay_batch", 16), 1, 256));
     q.pub.store(0);
     q.tail.store(0);
     q.stop.store(false);

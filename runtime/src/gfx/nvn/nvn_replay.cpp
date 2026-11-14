@@ -1069,10 +1069,30 @@ bool samples_depth_target(const ProgLayout& pl) {
 // A colour attachment cannot be sampled in the pass that renders to it (no feedback loops): the binding gets the dummy view.
 bool is_color_feedback(Texture* t) {
     if (!t) return false;
+    static const bool fast = nxrt::config_get_bool("nvn", "feedback_fast", true);
+    if (!fast) {
+        for (uint32_t i = 0; i < S.ncolor; ++i) {
+            Texture* a = S.color_tex[i].get();
+            if (a && !a->gpu) tex_gpu_attachment(a);   // an attachment gets its image (or the one it shares) here, not later in ensure_pass: the check runs before the pass begins (S4g)
+            if (shares_image(t, a)) return true;
+        }
+        return false;
+    }
+    // [nvn] feedback_fast (default on): the same answer with one image lookup of t instead of one per attachment (shares_image looked t's
+    // image up for every colour target; with five G-buffer targets and three calls a binding per draw that was ~15 lookups of a cold
+    // object). Every attachment gets its image first, so t finds an attachment it aliases exactly as before.
+    bool any = false;
     for (uint32_t i = 0; i < S.ncolor; ++i) {
         Texture* a = S.color_tex[i].get();
-        if (a && !a->gpu) tex_gpu_attachment(a);   // an attachment gets its image (or the one it shares) here, not later in ensure_pass: the check runs before the pass begins (S4g)
-        if (shares_image(t, a)) return true;
+        if (!a) continue;
+        if (!a->gpu) tex_gpu_attachment(a);   // an attachment gets its image (or the one it shares) here, not later in ensure_pass (S4g)
+        if (a == t) return true;
+        any = true;
+    }
+    if (!any || !tex_gpu(t) || !t->gpu) return false;
+    for (uint32_t i = 0; i < S.ncolor; ++i) {
+        const Texture* a = S.color_tex[i].get();
+        if (a && a->gpu == t->gpu) return true;
     }
     return false;
 }
