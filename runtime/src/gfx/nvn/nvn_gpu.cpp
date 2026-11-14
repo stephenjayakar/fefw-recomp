@@ -61,6 +61,8 @@ struct Slot {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> dpools;
     size_t dpool_cur = 0;
+    // [nvn] set_batch: sets allocated ahead, by layout (Frame::alloc_set); emptied with the pools at the slot's reset
+    std::unordered_map<VkDescriptorSetLayout, std::vector<VkDescriptorSet>> spare_sets;
     gfx::Buffer upload;
     VkDeviceSize upload_off = 0;
     std::vector<gfx::Buffer> extra;       // staging / overflow buffers of the submission
@@ -572,6 +574,7 @@ Slot& acquire_slot() {
         s.split_free.insert(s.split_free.end(), s.split_used.begin(), s.split_used.end());
         s.split_used.clear();
     }
+    for (auto& kv : s.spare_sets) kv.second.clear();   // freed by the resets below
     for (VkDescriptorPool p : s.dpools) vkResetDescriptorPool(g->dev->device(), p, 0);
     vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));   // the reset freed them
     s.sets_live = 0;
@@ -699,6 +702,42 @@ void Frame::defer(std::function<void()> fn) {
 
 VkDescriptorSet Frame::alloc_set(VkDescriptorSetLayout layout) {
     Slot& s = *static_cast<Slot*>(slot);
+    // [nvn] set_batch = N (default 8; 1 = one set per call as before): a layout's sets are allocated N at a time, so the driver's per-call
+    // cost (~1.5 % of the render thread at 2600 draws) is paid once per N sets. The spares are this slot's, freed with its pools.
+    static const uint32_t batch = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "set_batch", 8), 1, 64));
+    if (batch > 1) {
+        std::vector<VkDescriptorSet>& spare = s.spare_sets[layout];
+        if (spare.empty()) {
+            VkDescriptorSetLayout layouts[64];
+            for (uint32_t i = 0; i < batch; ++i) layouts[i] = layout;
+            VkDescriptorSet sets[64] = {};
+            for (int attempt = 0; attempt < 2 && spare.empty(); ++attempt) {
+                if (s.dpool_cur >= s.dpools.size()) {
+                    VkDescriptorPool p = new_dpool();
+                    if (!p) break;
+                    s.dpools.push_back(p);
+                }
+                VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                ai.descriptorPool = s.dpools[s.dpool_cur];
+                ai.descriptorSetCount = batch;
+                ai.pSetLayouts = layouts;
+                if (vkAllocateDescriptorSets(g->dev->device(), &ai, sets) == VK_SUCCESS) {
+                    g->ctr.descriptor_sets.fetch_add(batch, std::memory_order_relaxed);
+                    s.sets_live += batch;
+                    vk_gauge_descriptor_sets().add(batch);
+                    for (uint32_t i = batch; i-- > 0;) spare.push_back(sets[i]);
+                } else {
+                    ++s.dpool_cur;   // exhausted or fragmented: the next pool (created on demand); a failed batch allocates nothing
+                }
+            }
+        }
+        if (!spare.empty()) {
+            const VkDescriptorSet set = spare.back();
+            spare.pop_back();
+            return set;
+        }
+        // fall through: one at a time (a pool near its end may still hold a single set)
+    }
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s.dpool_cur >= s.dpools.size()) {
             VkDescriptorPool p = new_dpool();

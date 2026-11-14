@@ -355,7 +355,7 @@ enum RsZone : int { kRsHead, kRsPrep, kRsFb, kRsPass, kRsPipe, kRsDyn, kRsSets, 
 struct RStats {
     uint64_t cyc[kRsN] = {};
     uint64_t draws = 0, draws_desc = 0, draws_pipe = 0, sets = 0, set_hits = 0, set_writes = 0, res_tex = 0, res_img = 0, res_memo = 0;
-    uint64_t binds = 0, binds_same = 0, layouts = 0, keys = 0, dispatches = 0, sets_skipped = 0;
+    uint64_t binds = 0, binds_same = 0, layouts = 0, keys = 0, dispatches = 0, sets_skipped = 0, preps_skipped = 0;
     uint64_t miss_first = 0, miss_uboofs = 0, miss_ubo = 0, miss_tex = 0, miss_other = 0;   // set cache misses by what differs from the last set of that layout
 };
 RStats g_rs;
@@ -413,12 +413,12 @@ void rs_report() {
     for (int z = kRsHead; z <= kRsVb; ++z) setup += fms(z);
     const double pf = 1.0 / frames;
     NXLOG_I("nvn.rstats", "%.0f frames: replay %.2f ms/frame = draw setup %.2f + call %.2f + out %.2f + dispatch %.2f + rest %.2f | %.0f draws/frame "
-            "(%.0f desc, %.0f pipe, %.0f layouts, %.0f keys), %.0f dispatches | per draw us: head %.2f prep %.2f fb %.2f pass %.2f pipe %.2f dyn %.2f "
+            "(%.0f desc, %.0f prep left out, %.0f pipe, %.0f layouts, %.0f keys), %.0f dispatches | per draw us: head %.2f prep %.2f fb %.2f pass %.2f pipe %.2f dyn %.2f "
             "sets %.2f (alloc+update %.2f) vb %.2f call %.2f out %.2f | sets/frame %.0f (%.1f%% cached, %.0f writes, %.0f left bound) | resolves/frame tex %.0f img %.0f (memo %.0f) | "
             "binds/frame %.0f (%.1f%% same) | set misses/frame: new layout or submission %.0f, only uniform offsets %.0f, only uniform buffers %.0f, "
             "textures %.0f, other %.0f | pool looks/frame %.1f, full scans/frame %.2f | rt_check %llu checked, %llu mismatches",
             frames, fms(kRsAll), setup, fms(kRsCall), fms(kRsOut), fms(kRsDispatch),
-            fms(kRsAll) - setup - fms(kRsCall) - fms(kRsOut) - fms(kRsDispatch), s.draws * pf, s.draws_desc * pf, s.draws_pipe * pf, s.layouts * pf,
+            fms(kRsAll) - setup - fms(kRsCall) - fms(kRsOut) - fms(kRsDispatch), s.draws * pf, s.draws_desc * pf, s.preps_skipped * pf, s.draws_pipe * pf, s.layouts * pf,
             s.keys * pf, s.dispatches * pf, dus(kRsHead), dus(kRsPrep), dus(kRsFb), dus(kRsPass), dus(kRsPipe), dus(kRsDyn), dus(kRsSets), dus(kRsAlloc), dus(kRsVb),
             dus(kRsCall), dus(kRsOut), s.sets * pf, s.sets ? 100.0 * static_cast<double>(s.set_hits) / static_cast<double>(s.sets) : 0.0,
             s.set_writes * pf, s.sets_skipped * pf, s.res_tex * pf, s.res_img * pf, s.res_memo * pf, s.binds * pf,
@@ -2476,7 +2476,7 @@ struct LastGfxSets {
     VkDescriptorSet ds[kPoolSet + 1] = {};
 };
 LastGfxSets g_last_gfx;
-struct SkipMaskSlot { const ProgLayout* pl = nullptr; uint32_t mask = 0; };
+struct SkipMaskSlot { const ProgLayout* pl = nullptr; uint32_t mask = 0; bool uniform_handles = false; };
 SkipMaskSlot g_skip_mask[256];
 bool tex_set_skip_on() {
     static const bool on = nxrt::config_get_bool("nvn", "tex_set_skip", true);
@@ -2498,16 +2498,34 @@ uint32_t skippable_sets(const ProgLayout& pl) {
     SkipMaskSlot& sl = g_skip_mask[(reinterpret_cast<uintptr_t>(&pl) >> 4) & 255];
     if (sl.pl == &pl) return sl.mask;
     uint32_t ok = 0, bad = 0;
+    bool uh = false;
     for (const BindingDesc& d : pl.bindings) {
         if (d.set > kPoolSet) continue;
         const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        uh |= b.nvn.source == NvnSource::HandleInUniform;
         const bool plain = d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b.nvn.source == NvnSource::SamplerBinding;
         (plain ? ok : bad) |= 1u << d.set;
     }
     uint32_t mask = ok & ~bad & ~1u;                 // never set 0 (the buffers)
     if (pl.has_set[kPoolSet]) mask |= 1u << kPoolSet;
-    sl = {&pl, mask};
+    sl = {&pl, mask, uh};
     return mask;
+}
+// The layout reads a texture or image handle from a uniform block (a buffer bind can change what it samples).
+bool uniform_handles(const ProgLayout& pl) {
+    skippable_sets(pl);
+    return g_skip_mask[(reinterpret_cast<uintptr_t>(&pl) >> 4) & 255].uniform_handles;
+}
+// [nvn] prep_skip (default on): the texture preparation of a draw (attachments, samples_depth_target, prepare_textures, the scene
+// upscaler check, feedback_prepare) is left out when only buffer bindings changed since the last draw that ran it with the same layout in the
+// same command buffer: textures, pools, programs and targets are what it looks at, and any change to them (or a pass end, an upload, a
+// dispatch: kAllDirty) runs it again. A draw with nothing dirty already skipped it; this extends that to draws that rebind uniform buffers.
+// Not for layouts that read handles from uniform blocks.
+const ProgLayout* g_prep_pl = nullptr;
+VkCommandBuffer g_prep_cb = VK_NULL_HANDLE;
+bool prep_skip_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "prep_skip", true);
+    return on;
 }
 
 void bind_sets(const ProgLayout& pl, VkPipelineBindPoint bp) {
@@ -3039,7 +3057,12 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     if (pl->has_set[kPoolSet] && pool_state_moved(S.tpool.get(), S.spool.get())) g_dirty |= kDesc;   // registrations or layout moves since
     if (extras::temporal_wanted()) temporal_gbuffer_note();
     rs_mark(kRsHead);
-    if (g_dirty & (kDesc | kPipe)) {
+    const bool full_prep = !prep_skip_on() || (g_dirty & (kDescTex | kPipe)) || pl != g_prep_pl || F->cb != g_prep_cb || g_trace || g_fb_seen ||
+                           uniform_handles(*pl);
+    if ((g_dirty & (kDesc | kPipe)) && !full_prep) ++g_rs.preps_skipped;
+    if ((g_dirty & (kDesc | kPipe)) && full_prep) {
+        g_prep_pl = pl;
+        g_prep_cb = F->cb;
         ++g_rs.draws_desc;
         g_prog_writes = false;
         for (const BindingDesc& d : pl->bindings) g_prog_writes |= d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -3068,7 +3091,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
         cmdq::Direct direct;   // frame generation SDKs record through their own entry points
         fg_hudless_capture(*F, S.color_tex[0].get());
     }
-    if (g_fb_seen || (g_dirty & (kDesc | kPipe))) feedback_prepare(*pl);
+    if (g_fb_seen || (full_prep && (g_dirty & (kDesc | kPipe)))) feedback_prepare(*pl);
     rs_mark(kRsFb);
     if (!ensure_pass(depth_ro_for_draw(), g_prog_writes)) {
         // which draw, and what its targets are (the first of each vertex/fragment shader pair)
@@ -5361,6 +5384,8 @@ void replay_shutdown() {
     for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
     for (SkipMaskSlot& sl : g_skip_mask) sl = SkipMaskSlot();
     g_last_gfx = LastGfxSets();
+    g_prep_pl = nullptr;
+    g_prep_cb = VK_NULL_HANDLE;
     S = GState();
     g_out_all = true;
     raw_binds_reset();
