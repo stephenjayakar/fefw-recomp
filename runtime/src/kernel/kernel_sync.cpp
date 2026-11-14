@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <atomic>
@@ -112,9 +113,33 @@ std::unordered_map<const KThread*, int64_t> g_woken_at;   // g_k held; only whil
 
 // [kernel] spin_us (env NXRT_KERNEL_SPIN_US, default 0 = off): a thread about to sleep in one of those waits first polls its wake flag
 // this long with g_k released, so a signal that comes within it reaches the thread without the host's sleep and wake-up.
+// [kernel] spin_threads / lock_spin_threads (comma lists of game thread name prefixes, `main` = the main thread; empty = every thread): only
+// those threads spin (spin_us) or poll a held mutex (lock_spin_us). spin_us for every thread was a loss in Dagsion (cpu-1 H: the job workers
+// and the GFX workers spin each time they go idle, on the processors and SMT siblings the game and render threads need); the waits that the
+// frame waits for are main's and the job workers' it waits on.
 struct WaitTuning {
     int64_t hz = 1, spin = 0, stats_s = 0, lock_spin = 0;
+    std::vector<std::string> spin_names, lock_names;      // empty: every thread
 };
+std::vector<std::string> name_list(const std::string& csv) {
+    std::vector<std::string> v;
+    size_t i = 0;
+    while (i <= csv.size()) {
+        size_t j = csv.find(',', i);
+        if (j == std::string::npos) j = csv.size();
+        std::string w = csv.substr(i, j - i);
+        while (!w.empty() && w.front() == ' ') w.erase(w.begin());
+        while (!w.empty() && w.back() == ' ') w.pop_back();
+        if (!w.empty()) v.push_back(w);
+        i = j + 1;
+    }
+    return v;
+}
+bool name_listed(const std::vector<std::string>& v, const char* name) {
+    for (const std::string& w : v)
+        if (!std::strncmp(name, w.c_str(), w.size())) return true;
+    return false;
+}
 void stats_report_loop(int64_t seconds);
 const WaitTuning& wait_tuning() {      // first called before g_k is taken (config reads log)
     static const WaitTuning w = [] {
@@ -130,8 +155,12 @@ const WaitTuning& wait_tuning() {      // first called before g_k is taken (conf
         // handed the mutex and owns it until the host wakes it (5-10 us), so contended locks convoy; a spinner never makes that hand-over.
         const int64_t lus = config_get_int("kernel", "lock_spin_us", 0);
         v.lock_spin = lus > 0 ? lus * v.hz / 1000000 : 0;
-        if (v.lock_spin) NXLOG_I("kernel", "ArbitrateLock polls the mutex word %lld us before queueing ([kernel] lock_spin_us)", static_cast<long long>(lus));
-        if (v.spin) NXLOG_I("kernel", "waits spin %lld us before sleeping ([kernel] spin_us)", static_cast<long long>(us));
+        const std::string sl = config_get_str("kernel", "spin_threads", ""), ll = config_get_str("kernel", "lock_spin_threads", "");
+        v.spin_names = name_list(sl);
+        v.lock_names = name_list(ll);
+        if (v.lock_spin) NXLOG_I("kernel", "ArbitrateLock polls the mutex word %lld us before queueing ([kernel] lock_spin_us), threads: %s", static_cast<long long>(lus),
+                                 ll.empty() ? "all" : ll.c_str());
+        if (v.spin) NXLOG_I("kernel", "waits spin %lld us before sleeping ([kernel] spin_us), threads: %s", static_cast<long long>(us), sl.empty() ? "all" : sl.c_str());
         if (v.stats_s > 0) {
             g_stats.store(new std::unordered_map<const KThread*, WaitStats>, std::memory_order_release);
             std::thread(stats_report_loop, v.stats_s).detach();
@@ -198,10 +227,11 @@ bool block_on_wake(KThread& t, int64_t timeout_ns, int kind) {
     if (t.wake) return true;
     const WaitTuning& wt = wait_tuning();
     auto* stats = g_stats.load(std::memory_order_relaxed);
-    const int64_t t0 = stats || wt.spin ? qpc_now() : 0;
+    const bool spin_me = wt.spin && (wt.spin_names.empty() || t.spin_ok);
+    const int64_t t0 = stats || spin_me ? qpc_now() : 0;
     bool spun = false, slept = false;
     if (g_occ_on) occ_block(t, kind);
-    if (wt.spin && timeout_ns != 0) {
+    if (spin_me && timeout_ns != 0) {
         int64_t end = t0 + wt.spin;
         if (timeout_ns > 0 && timeout_ns < 1000000000) end = std::min(end, t0 + timeout_ns * wt.hz / 1000000000);
         ReleaseSRWLockExclusive(&g_k);
@@ -214,7 +244,7 @@ bool block_on_wake(KThread& t, int64_t timeout_ns, int kind) {
         if (stats) {
             const int64_t now = qpc_now();
             WaitStats& s = (*stats)[&t];
-            if (s.name.empty()) s.name = t.name;
+            if (s.name.empty() || (t.game_name[0] && s.name == t.name)) s.name = t.game_name[0] ? std::string(t.game_name) + " (" + t.name + ")" : t.name;
             s.prio = t.prio, s.ideal = t.ideal_core, s.mask = t.core_mask;
             s.waits[kind]++;
             s.blocked[kind] += static_cast<uint64_t>(now - t0);
@@ -246,8 +276,8 @@ bool block_on_wake(KThread& t, int64_t timeout_ns, int kind) {
 }
 
 void wake_thread(KThread& t, uint32_t result) {
+    t.wait_result = result;                                // before the flag: a spinner reads the result once it sees the flag
     __atomic_store_n(&t.wake, true, __ATOMIC_RELEASE);     // read without g_k by a thread spinning in block_on_wake
-    t.wait_result = result;
     if (g_stats.load(std::memory_order_relaxed)) g_woken_at[&t] = qpc_now();
     if (g_occ_on && t.occ_group == 1) occ_main_woken();
     WakeConditionVariable(thread_cv(t));
@@ -296,7 +326,7 @@ std::string sync_wait_report() {
 uint32_t arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
     if (addr & 3) return kInvalidAddress;
     const WaitTuning& wt = wait_tuning();
-    if (wt.lock_spin) {
+    if (wt.lock_spin && (wt.lock_names.empty() || self().lock_spin_ok)) {
         const int64_t end = qpc_now() + wt.lock_spin;
         for (uint32_t i = 0; load32(addr) == (owner | kHandleWaitMask); i++) {
             if ((i & 15) == 15 && qpc_now() >= end) break;
@@ -516,6 +546,20 @@ uint32_t cancel_synchronization(uint32_t thread_handle) {
 void notify_waitable_changed() {
     Guard g;
     for (KThread* t : g_sync_waiters) WakeConditionVariable(thread_cv(*t));
+}
+
+bool kernel_names_wanted() {
+    const WaitTuning& wt = wait_tuning();
+    return wt.stats_s > 0 || !wt.spin_names.empty() || !wt.lock_names.empty();
+}
+
+void kernel_thread_named(KThread& t, const char* game_name) {
+    if (!game_name) return;
+    const WaitTuning& wt = wait_tuning();
+    Guard g;
+    std::snprintf(t.game_name, sizeof t.game_name, "%s", game_name);
+    t.spin_ok = wt.spin && name_listed(wt.spin_names, game_name);
+    t.lock_spin_ok = wt.lock_spin && name_listed(wt.lock_names, game_name);
 }
 
 // ---- gauges (include/nxrt/gauge.h): wait-queue lengths ----

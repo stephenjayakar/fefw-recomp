@@ -89,6 +89,7 @@ enum HitchPhase : int {
     kHpRenderTexPrep,       // render thread, of the uploads: prepare_texture run there (stand-ins, CPU untile, cache reads, transcodes)
     kHpRenderTexStaging,    // render thread, of the uploads: the upload buffer (allocation and the copy of the prepared data into it)
     kHpRenderImage,         // render thread: image creation (create_texture_gpu: format checks, vmaCreateImage), inside or outside the uploads
+    kHpRenderSplit,         // render thread, of the replay: split submissions ([nvn] split_submit_ms: end, vkQueueSubmit2, begin of the next buffer)
     kHpCount
 };
 uint64_t hitch_ticks();                                  // QueryPerformanceCounter
