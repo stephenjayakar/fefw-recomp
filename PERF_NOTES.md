@@ -571,3 +571,52 @@ What render-1 showed about the limiter (r1-t, street at 140 s, 2585 draws): rend
 game); game thread work p50 18.0 with no present back pressure = CPU 12.8 + waits 4.7, GPU sync waits only p99 3.2. Main's blocked time
 is ended by guest threads (Basic_Worker1-4, GFX_Worker0, MOCull_Leader in wt1-diag), never by the render thread: the game does not wait
 on the render hand-off. At p50 the dense street is now game-thread bound; render work sets the tail (41 of 53 slow frames).
+
+### Design: parallel recording (`perf/render-mt`, `[nvn] pass_threads`)
+
+Goal: render p99 <= 15 ms at 2600 draws (now 17-20). The render thread replays a submission as one state machine over globals (`S` bind
+state, `P` pass state, `g_dirty`, the texture layout of every image, held compute results, the mirror's page state, the per-submission set
+cache, the slot's descriptor pools and upload ring, `F->cb`). Recording is already off it (`replay_threads = 2`), so what is left is CPU
+logic: ~25 % descriptor building, ~15 % held-result checks, ~10 % dispatch setup, ~6 % texture preparation, the rest a long tail.
+
+What may run out of order and what may not:
+- **Serial by nature** (side effects later commands depend on, or game memory state read at that moment): texture uploads and layout
+  transitions (`prepare_textures`, `tex_transition`: each image has one tracked layout), held-result flushes and copy-backs
+  (`out_draw_bindings`, `compute_out_guard`), mirror page decisions (`resolve_read`: valid / want / used bits), pass begin / end and split
+  decisions (`ensure_pass`, `maybe_split`), dispatch barrier tracking (`cs_*`), write tracking (`gpu_wrote`), pipeline key building, and
+  the bind state `S` itself (derived op by op).
+- **Pure functions of values captured in order**: the content of a texture descriptor set (view, sampler, layout per binding: views and
+  samplers are cached objects, the layout is the tracked one at that point), the set cache lookup, set allocation and vkUpdateDescriptorSets,
+  push descriptor writes, and every vkCmd* call.
+
+So the partition is not "whole render passes replayed in parallel": two passes share texture layouts and held results, and replaying pass
+k+1 needs `S` and the layouts after pass k. Instead the frame stays one serial walk (the render thread, cheaper every step) that emits, per
+draw, a compact packet of resolved values, and the expensive pure part runs on recorder threads:
+
+1. **Stage 1, descriptor sets on the recorder (`[nvn] desc_on_recorder`, one recorder = the existing `nvn-rec`).** For a set that holds
+   only plain bound textures (the common texture set), the render thread captures per binding the resolved texture, view request, sampler,
+   dummy parameters and the tracked layout at that point (all serial decisions: feedback / waiting / upscaler substitution included), and
+   queues one "build and bind" record. The recorder makes the views and samplers (their caches get a lock: today only the render thread
+   touches them), hashes, looks the set up in its own per-submission cache, allocates from its own descriptor pools per slot (reset when the
+   slot comes back; the render thread syncs with the recorder at every submission end, so the slot's GPU work is done by then), updates and
+   binds. Order is kept by the queue. Expected: the ~10-13 % of the render thread that is view / sampler lookup, hashing, set cache,
+   allocation and update moves to the recorder (which is busy ~9 of 16.6 ms).
+2. **Stage 2, several recorders by render pass (`[nvn] pass_threads = N`).** The serial walk already knows where passes begin and end
+   (`ensure_pass` / `end_pass`). Each pass (or each run of draws up to a size cap) gets its own primary command buffer from the slot's pool
+   set, recorded by one of N recorders; everything between passes (transitions, uploads, copies, dispatches, barriers) goes to a "glue"
+   command buffer recorded by recorder 0 in order. Per-recorder state: its command pool (Vulkan needs one per thread), descriptor pools
+   and set cache, a queue. Merge: the submission's command buffers are handed to vkQueueSubmit2 in walk order (glue0, pass0, glue1, pass1,
+   ...); a split submission (`split_submit_ms`) submits the finished prefix in the same order. The render thread waits for all recorders at
+   the submission end, as it waits for `nvn-rec` now. Cross-pass dependencies stay explicit: every barrier and layout change is recorded in
+   the glue in walk order, never inside a pass buffer, and dynamic state / pipeline / sets are bound again at the start of each pass buffer
+   (a new command buffer has no state: `g_dirty = kAllDirty` per pass buffer, as a split does today).
+3. **Stage 3, shadow passes first.** Shadow-map passes (depth-only, many draws, few textures) are the first pass buffers sent to a second
+   recorder: the smallest state, the biggest draw counts. Then G-buffer passes.
+
+Validation (`rt_check`): stage 1 builds the set the old way as well and compares the content key; stage 2 has a debug mode that records
+every pass buffer on recorder 0 in order (same result as one thread) and one that records it on two threads and compares the per-pass call
+streams (count and arguments of every vkCmd* call, hashed) between the two.
+
+Limits: the serial walk keeps ~60 % of today's render-thread time (texture preparation, held-result checks, mirror decisions, pass logic,
+bind state); stages 1-2 take the rest. Lowering the serial part further needs the held-result checks to get cheaper (`servable_memo`,
+render-6) and the per-draw cold reads of Texture / TexGpu to go (a flat per-draw texture cache keyed by pool id).
