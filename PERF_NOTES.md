@@ -273,6 +273,38 @@ What the profile (`tools/perf/prof_hitch.py`) showed and what followed (stutter-
 - Fast-travel arrival frames of 300-740 ms: the game's main thread is on the CPU for 95% of them ("presenting thread on the CPU" in the
   hitch line), in game code (`f_71000cd800`, `f_71000d3ee0` under romfs reads: probably decompression). Game-side; open.
 
+#### stutter-2 result (s2-default, 47ab015)
+
+hub_cold 57.2 fps avg, 1% low 38.5, 482 frames over 20 ms (s1 906, upstream b3 415), 4 over 33 ms, worst 36 ms (upstream 192). The
+menu_to_world load-in frame 582 ms (s1 892, upstream 3828, perf-stutter 17942); the load frame that lost 340 ms to the import counter
+went from 729 to 452 ms. street_cold / hub_warm / street_warm worst frames 457 / 278 / 421 ms: game code at fast-travel arrivals.
+
+stutter-3 (58d4987): during a burst, first uploads of textures the draws bind themselves wait too (the dummy is sampled meanwhile), and a
+draw needing more than 64 first uploads starts the burst at once.
+
+stutter-3 also has: 14be59c (the render thread's prepared data reuses one buffer: load-in frames showed 190k-540k page faults) and
+10cf072 (a 64 MiB pool-copy chunk made ahead on a worker; the 277 ms street_warm arrival frame spent ~54 ms making one).
+
+What is left after stutter-2, by the profile: the area-transition frames (street_cold 457 ms at the hub -> street change, hub_warm 278,
+street_warm 421 + loading-screen frames of 436-695 ms) are the game's main thread on the CPU in game code, 85-95% of the samples in lifted
+guest functions (f_71000cd800 / f_71000d3ee0 under romfs reads in several of them, which look like zstd decompression; zstd is statically
+linked into `main`). A runtime-only fix would need an entry hook site at those functions, i.e. a relift of fefw.exe: out of scope for a
+drop-in DLL.
+
+#### stutter-3 result (s3-default, 10cf072)
+
+menu_to_world load-in frame 397 ms (stutter-2 583, stutter-1 892, upstream 3828); hub_cold 56.3 / 35.3 fps, 591 frames over 20 ms, worst
+37 ms; area-transition frames 414-499 ms (game code). The load-in frame still made 576 uploads: its first uploads were spread over many
+draws, none above the per-draw trigger. stutter-4 (da103d3): the burst starts once the frame's draws needed more than 64 distinct first
+uploads.
+
+#### stutter-4 result (s4-default, a121890) and stutter-5
+
+The menu_to_world load-in upload frame 295 ms (stutter-3 397), but street_cold regressed: 531 frames over 33 ms in the first minute of the
+street (stutter-3: 20), render thread 14.4 ms/frame (11.5): the in-frame burst trigger at 64 distinct first uploads also fired while
+walking into the cold street. stutter-5 (afc5697): that trigger at 256 (`pool_upload_burst_firsts`); the previous-frame backlog trigger
+stays at 64.
+
 ## 6. GPU track (branch `perf/gpu`)
 
 Goal: GPU time per frame comfortably under 16.6 ms at native 3840x2160 (render ratio 1.0, no upscaler) on the RTX 3080 10 GB, in
@@ -357,6 +389,9 @@ pacing. Test requests go to `tmp/fefw-perf/queue/cpu-<n>/`.
 | same | `[nvn] tex_prep_priority = normal / below`: background texture workers below the game and render threads. | `normal` (unchanged) |
 | `sched: [sched] render_place = reserve ...` | One physical core with no console core on it (3700X: core 7 = CPUs 14-15, the CCX of main's core 6) is kept for nvn-render alone, and main's SMT sibling is kept free; guest threads get the smaller pool, and a sweeper moves every other host thread (runtime workers, driver threads) to that pool every 2 s. | `[sched] render_place = off` (unchanged) |
 | `nvn: [nvn] split_submit_ms ...` | At a render pass boundary, once N ms of a submission's recording have passed (16+ draws, `split_min_draws`), the command buffer so far goes to the GPU (no signal; the final buffer signals the serial) and recording continues in a fresh command buffer of the slot, with all command buffer state rebound. Not with queries or stream-out active, batched submits or a pending pool copy. The GPU starts on a long submission while the render thread still records it. | `0` (off) |
+| `core: import, HLE thunk and SVC call counters per thread ...` + `core: host_import resolves target and name in one lookup` + `d50e1ac` (import counter as a plain per-thread block) | Every cross-module call, HLE thunk call and SVC bumped a shared atomic; now each thread counts into its own block (`include/nxrt/tl_counts.h`), summed on read, and host_import resolves target and name in one lookup. | always on (same counts in reports) |
+| `nvn: command lists reserve their last size up front ...` | A command buffer's next list reserves the bytes and held objects of its last one (decaying hint, capped), so a big list is not grown and copied a dozen times while main records it. | always on |
+| `nvn: tex_sampled_view remembers the last sampled-format check ...` | The per-image `std::map<VkFormat,bool>` lookup per descriptor is skipped when the format is the last one checked. | always on |
 
 Tools: `tmp/fefw-perf/cpu/prof_fold.py <folded> <fefw_rt.map>` resolves sampled `fefw_rt.dll` offsets and prints per-thread self and
 inclusive tables.
@@ -438,3 +473,112 @@ Checks: `recomp/tests/nxflags_test.cpp` (23.7 M cases, the NxFlags helpers again
 - How to build the PGO exe again: build4-style package (perf/codegen sources), `fefw_build.py --pgo-gen <libclang_rt_profile.a>` into a
   folder F, run the game with LLVM_PROFILE_FILE=<dir>/x-%p.profraw, merge with LLVM 22's llvm-profdata, then
   `fefw_build.py --pgo-use <profdata> [--mcpu znver2]` into the SAME folder F. Scripts: tmp/fefw-perf/codegen/{pgogen,pgouse}.sh.
+
+- cpu-1 A/D (tester window 2): the game thread is the limiter at 4K: work p50 16.7 ms (hub) / 20.7 ms (street), its CPU p50
+  14.5-17 ms plus 3.6-5 ms of waits on its job workers; render thread work 9.6 / 13.0 ms; GPU 15 ms. `render_place = reserve`: no
+  win (render work a little lower, game work the same, p99s worse), stays off.
+- stutter-1's slow-frame samples, resolved with its map (`tmp/fefw-perf/cpu/prof_fold.py`, `rt_from_guest.py`, `label_main.py`):
+  79 % of main's busy samples are lifted game code; **8.9 % (23.7 % in the post-fast-travel stalls) sit on one `fetch_add`: the
+  import-call counter `host_import` bumps on every cross-module call**, and the job workers guest-82..85 spend 46-52 % of their busy
+  samples there. A shared counter written by ~20 threads at millions of calls a second: the cache line moves on every call.
+  Fixed: per-thread counters (`tl_counts.h`) for imports, HLE thunks and SVCs, and one lookup per import (`import_resolve_named`).
+- cpu-1 window 3: A2 (per-thread counters) = A within noise in steady state (main CPU unchanged: the counter only hurts under
+  load-time contention); H (`[kernel] spin_us = 40`) is a loss (street_cold 43.5 vs 50.9 fps, main CPU up, waits not down).
+- Run B (sampler, steady state, 4K, `tmp/fefw-perf/runs/c1-cpu1-B`): main's busy samples are **85.8 % lifted game code**, NVN
+  recording 5 % (a fifth of it vector growth, fixed), the import path ~3.5 %, SVCs ~2.5 %. The render thread at 2586 draws/frame
+  (street) replays 16.8 ms = 6.5 us/draw: descriptor sets 1.9, compute-out checks 1.1, texture prep 0.6, pipeline key 0.6, vertex
+  buffers 0.4, the draw call 0.2 (`nvn.rstats`); the hottest single leaves: run_list, build_set, tex_or_null, out_overlaps.
+- **The `-O1` in `tools/build/fefw_build.py` is not what it looks like:** the bundled Zig maps `-O1`, `-O2` and `-O3` all to clang
+  `-O2 -vectorize-loops -vectorize-slp` (`zig cc -###`). An `-O2` exe built at 4 jobs (1073 s) came out with every section the same
+  size as 0.1.7's. The game code is already -O2. Remaining compiler levers for the game thread: a profile-guided build (instrumented
+  exe, a profiling run of the real scenes, rebuild with the profile; typical 10-20 % on branchy code; several hours of build and
+  test time), or a native-ISA variant (`-mcpu=znver2`: LZCNT for the guest's CLZ, BMI2 shifts; a few % at most).
+
+## Waits track (branch `perf/waits`)
+
+Goal: the game thread (main) spends about 12 ms of a ~17.7 ms street frame on the CPU; the rest is waiting. This track measures what it
+waits on and cuts the waits that are the runtime's (guest sync, wake-ups, placement, submission cost), not the render thread's replay
+speed (RENDER track) or GPU cost (GPU2 track). Test requests go to `tmp/fefw-perf/queue/waits-<n>/`; scratch and tools in
+`tmp/fefw-perf/waits/`.
+
+### What main waits on (best stack: b59bc62 + gpu set + split 2 + PGO exe; tester runs w11-pgo-b, c3-cpu3-O, w8-cg2-prof)
+
+Per presented frame, from the budget lines (`waits` = main's own system-call waits; GPU sync = nvnSyncWait of any thread):
+
+| street window | frame p50 | main CPU p50 | main svc waits p50 | GPU sync waits | render work p50 |
+|---|---:|---:|---:|---:|---:|
+| light (800-1300 draws) | 16.7 | 10.9-11.8 | 2.5-2.8 | 0-0.5 ms (p99 0.5-3) | 8.6-12 |
+| dense (2400-2640 draws, 130-160 s, 290-320 s) | 18.3-19.1 | 12.0-13.5 | 3.6-4.8 | ~1.7 ms (464 waits / 914 ms in 10 s) | 16.6-17.4 |
+
+- **GPU sync waits** are all on fences two presents old ("sync waits by fence age: 2"), and all "on the GPU only" (the render thread had
+  already submitted the fenced work). In the dense windows they exist because the render thread (16.6-17.4 ms) is the limiter: the GPU
+  finishes frame N-2 late because its replay finished late. Deeper game/render pipelining cannot help there (throughput-bound, not
+  latency-bound: `present_ahead` 1 already lets the game record N+1 while the render thread replays N, and the game's own fence is two
+  frames back). In light windows they are near 0. Not a game-side lever: they go away when the RENDER track shortens replay.
+- **Main's system-call waits** (occupancy run c3-cpu3-O, hub, ~600 frames per 10 s; "who woke main"):
+
+  | woken by | waits / frame | blocked / frame | per wait |
+  |---|---:|---:|---:|
+  | Basic_Worker1-4, address (job completion) | ~8 | ~1.5 ms | ~185 us |
+  | Basic_Worker1-4, mutex hand-over | ~25 | ~0.5 ms | ~20 us |
+  | GFX_Worker0, address | ~11 | ~0.25 ms | ~23 us |
+  | GFX_Worker1-4, address | ~15 | ~0.12 ms | ~8 us |
+  | SND_Update, mutex | ~1 | 0.1-0.18 ms | ~150 us |
+  | PX_Executor, address | ~1 | ~0.08 ms | ~85 us |
+
+  While main waits on an address, on average only 1.0-1.5 of the 4 Basic workers run, and none for 25-45 % of that time (the sampler
+  counts a thread as blocked until it runs again, so that share includes the host's wake-up of the worker and of main): main waits on
+  short chains of jobs, not on a saturated pool. The Basic workers are idle 85 % of the time (98.7 % of their waits are the job
+  condition variable).
+- **Sampled stacks** (w8-cg2-prof, main, whole run): of main's waiting samples 38 % are WaitForAddress (17 % from one call site of the
+  frame loop, f_7100a99ae0 < f_710180b3a0; 15 % from a job-wait helper f_7100a86a90 called from many places), 37 % present back
+  pressure (pacing in light frames), 12 % ArbitrateLock (most through the lock wrapper f_7101979ee0), 6 % nvnSyncWait, and 2.8 %
+  *inside* SignalToAddress / ArbitrateUnlock (the waker side: the kernel lock or the wake system call).
+- **Wake-up latency on this PC** (tmp/fefw-perf/waits/bench/wakebench.cpp, idle machine, two pinned threads, sleeper really asleep):
+  SRW + condition variable woken under the lock (what kernel_sync.cpp does) p50 6.0 us / p99 11 us; woken after the unlock 4.0 / 8.5;
+  WaitOnAddress 4.0 / 8.7; a spin 0.1. Same CCX, other CCX and SMT sibling all within 1-2 us of each other. So one host wake-up is
+  ~5 us: at ~60 blocking waits of main per frame plus the job wake-ups in its chains, the host's wake-up latency is a few tenths of a
+  ms per frame, not milliseconds. The rest of main's ~2.6-4.5 ms is the jobs' and lock holders' own run time.
+- **Placement**: console cores 0..5 -> processors 12, 10, 8, 6, 4, 2 (physical cores 6, 5, 4 on CCX1; 3, 2, 1 on CCX0), soft affinity
+  on 0xfffc. Main is core 0; the Basic job pool runs on cores 1..4 ([sched] core_number_at note), so two of the four workers sit on
+  the other CCX.
+- **Starvation guard**: its thread polls NtQuerySystemInformation(SystemProcessInformation) every 50 ms at THREAD_PRIORITY_HIGHEST and
+  costs 1.4-1.6 ms of CPU per frame (8-9 % of a core, more than any GFX worker), all of it a snapshot of every process on the PC.
+- **Arrival frames** (~320 ms): only 8-12 ms of system calls and 100-400 page faults per arrival frame (w11-pgo-b hitch lines); the
+  allocator share (~14 %) is the lifted SDK allocator itself (s5-default samples under f_7100652310: 97 % lifted SDK code, ~10 % the
+  cross-module call path host_import / import_resolve, 1.4 % write-watch faults; no virtual-memory or kernel memory service on the
+  path). Nothing for the runtime's memory services there.
+
+### Large pages for guest memory: feasibility (item 4)
+
+- **What a TLB miss costs here** (tmp/fefw-perf/waits/bench/tlbbench.cpp: a random pointer chase over the same number of cache lines,
+  packed 64 B apart vs one line per 4 KiB page; Zen 2's L2 DTLB holds 2048 4 KiB entries = 8 MB of reach):
+
+  | lines | packed | one per page | per-load cost of the page walk |
+  |---:|---:|---:|---:|
+  | 4096 (256 KB, L2) | 2.8 ns | 14.4 ns | +11.6 ns |
+  | 16384 (1 MB, L3) | 8.9 ns | 23.0 ns | +14 ns |
+  | 65536 (4 MB, L3) | 10.5 ns | 32.3 ns | +22 ns |
+  | 262144 (16 MB, past one CCX's L3) | 72 ns | 137 ns | +65 ns |
+
+  With 2 MiB pages a few hundred MB of game objects need a few hundred TLB entries instead of tens of thousands, so most of that walk
+  cost goes. The game thread's samples sit ~48 % on guest loads (codegen track); how many of them miss the DTLB is not known without
+  hardware counters (AMD uProf's "L2 DTLB miss" events would say it in one run; not installed here). Plausible range: a few percent to
+  ~15 % of main's CPU.
+- **Why it is not a toggle yet:**
+  - The heap is ONE pagefile-backed section (SEC_RESERVE, primary view at kHeapBase plus alias views for pool imports; memory.cpp).
+    Large pages need `SEC_LARGE_PAGES | SEC_COMMIT` (committed and non-pageable up front: the game's ~11 GB heap would be locked RAM on a
+    24 GB PC), 2 MiB-aligned views, and a section is either large-paged or not.
+  - Write-watch (write_watch.cpp) arms single 4 KiB pages read-only with VirtualProtect to see CPU writes to GPU pools that lie inside
+    that heap; a large page cannot be protected per 4 KiB page. So only heap ranges that never hold a watched pool could use large pages,
+    and the game decides where its pools go after the heap is committed at boot. A workable design: the heap as many 2 MiB-granular
+    sections, large ones only for ranges a recorded pool map of earlier runs says stay unwatched, with a fallback to 4 KiB sections when
+    the large allocation fails (it can take seconds or fail outright on a fragmented system). That is a substantial rework of memory.cpp
+    and the alias/import paths, for a gain not yet measured.
+  - Allocating ~10 GB of large pages at boot needs Windows to find contiguous 2 MiB physical runs; after hours of uptime it may fail or
+    take many seconds.
+- **The privilege step the user would need** (only if this is ever built and wanted): run `secpol.msc` -> Local Policies -> User Rights
+  Assignment -> "Lock pages in memory" -> add your own account -> sign out and back in. `whoami /priv` then lists
+  SeLockMemoryPrivilege. Nothing was changed on this PC; the benchmark reports the privilege as not held.
+- Recommendation: first measure DTLB misses on main in the street with AMD uProf (free) on the current build. Only if they are a large
+  share of its loads is the heap rework worth it.

@@ -688,6 +688,8 @@ void pool_copy_end() {
     }
 }
 
+void spare_shutdown();   // below: the mirror chunk made ahead
+
 void pool_shutdown() {
     {   // stop the importer first: a pool it is working on finishes, queued ones are dropped
         std::unique_lock<std::mutex> lk(g_pf_mu);
@@ -706,6 +708,7 @@ void pool_shutdown() {
         left.assign(g_live.begin(), g_live.end());
     }
     for (PoolGpu* p : left) pool_gpu_destroy(p);
+    spare_shutdown();
     { std::lock_guard<std::mutex> lock(g_slabs_mu); g_slabs.clear(); g_rejected_slabs.clear(); }
     if (g_dummy_buf.buffer) buffer_views_forget(g_dummy_buf.buffer);
     if (g_dummy_buf.buffer) device().destroy_buffer(g_dummy_buf);
@@ -1009,6 +1012,74 @@ void out_log();
 
 bool mirror_enabled() { return mirror_mode() != MirrorMode::Off; }
 
+// [nvn] mirror_spare (default on): one full-size chunk of device-local memory is kept made ahead on a worker thread, so the render thread
+// takes it instead of allocating (a new 64 MiB chunk took it 20-50 ms, mostly waits in the driver's allocation path, at area arrivals,
+// s2-default). Made after the first chunk, only while the copies' budget leaves room for it; another one is made when it is taken.
+constexpr VkBufferUsageFlags kMirrorUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+struct SpareChunk {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread th;
+    gfx::Buffer buf;
+    bool want = false, stop = false, failed = false;
+};
+SpareChunk g_spare;
+std::atomic<uint64_t> g_spare_taken{0};
+
+void spare_loop() {
+    std::unique_lock<std::mutex> lk(g_spare.mu);
+    for (;;) {
+        g_spare.cv.wait(lk, [] { return g_spare.stop || (g_spare.want && !g_spare.buf.buffer); });
+        if (g_spare.stop) return;
+        g_spare.want = false;
+        lk.unlock();
+        gfx::Buffer b;
+        const bool ok = device().create_buffer(kChunkBytes, kMirrorUsage, gfx::MemoryUse::GpuOnly, &b, "nvn pool mirror (made ahead)") == VK_SUCCESS;
+        lk.lock();
+        if (ok && !g_spare.stop) g_spare.buf = b;
+        else {
+            if (ok) device().destroy_buffer(b);
+            g_spare.failed = !ok;            // out of video memory: no more spares this session
+            if (!ok) return;
+        }
+    }
+}
+
+// Render thread: the spare chunk if one is ready (and another is asked for); asks for one either way while the budget has room for two more.
+gfx::Buffer spare_take(uint64_t budget_left) {
+    static const bool on = config_get_bool("nvn", "mirror_spare", true);
+    gfx::Buffer got;
+    if (!on) return got;
+    std::lock_guard<std::mutex> lk(g_spare.mu);
+    if (g_spare.failed || g_spare.stop) return got;
+    if (g_spare.buf.buffer) {
+        got = g_spare.buf;
+        g_spare.buf = gfx::Buffer{};
+        g_spare_taken.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (budget_left >= 2 * kChunkBytes) {
+        if (!g_spare.th.joinable()) g_spare.th = std::thread(spare_loop);
+        g_spare.want = true;
+        g_spare.cv.notify_one();
+    }
+    return got;
+}
+
+void spare_shutdown() {
+    {
+        std::lock_guard<std::mutex> lk(g_spare.mu);
+        g_spare.stop = true;
+    }
+    g_spare.cv.notify_all();
+    if (g_spare.th.joinable()) g_spare.th.join();
+    std::lock_guard<std::mutex> lk(g_spare.mu);
+    if (g_spare.buf.buffer) device().destroy_buffer(g_spare.buf);
+    g_spare.buf = gfx::Buffer{};
+    g_spare.stop = g_spare.want = g_spare.failed = false;   // a later back end (tests) starts clean
+}
+
 // The chunk of the copy that holds page `page`, made now if it is not yet (null: over the budget or out of video memory).
 VkBuffer mirror_chunk(Mirror& m, uint64_t page) {
     const size_t ci = static_cast<size_t>(page * kPageBytes / kChunkBytes);
@@ -1024,10 +1095,17 @@ VkBuffer mirror_chunk(Mirror& m, uint64_t page) {
     }
     // texel buffer and transfer source usage: compute dispatches bind the copy directly as storage and texel buffers, and their results go
     // back to the pool from it (nvn_replay.cpp, compute shadows)
-    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
-    if (device().create_buffer(bytes, usage, gfx::MemoryUse::GpuOnly, &c, "nvn pool mirror") != VK_SUCCESS) {
+    if (bytes == kChunkBytes) {
+        gfx::Buffer s = spare_take(budget - g_mirror_bytes - bytes);
+        if (s.buffer) {
+            c = s;
+            g_mirror_bytes += c.size;
+            g_st_chunk_bytes_made.fetch_add(c.size, std::memory_order_relaxed);
+            g_st_live_bytes.store(static_cast<int64_t>(g_mirror_bytes), std::memory_order_relaxed);
+            return c.buffer;
+        }
+    }
+    if (device().create_buffer(bytes, kMirrorUsage, gfx::MemoryUse::GpuOnly, &c, "nvn pool mirror") != VK_SUCCESS) {
         c = gfx::Buffer{};
         static bool logged = false;
         if (!logged) { logged = true; NXLOG_W(kTag, "a device-local chunk of %llu MiB could not be made: those pages stay in the pool", static_cast<unsigned long long>(bytes >> 20)); }

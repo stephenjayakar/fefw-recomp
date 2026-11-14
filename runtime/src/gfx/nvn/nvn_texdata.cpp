@@ -601,7 +601,13 @@ VkFormat cache_entry_format(const Texture& t, bool no_disk) {
 }
 
 bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out) {
-    out = PreparedTexture();
+    {   // the output's data buffer is kept (its capacity): a caller that reuses `out` writes into memory that is already paged in
+        std::vector<uint8_t> keep;
+        keep.swap(out.data);
+        out = PreparedTexture();
+        keep.clear();
+        out.data.swap(keep);
+    }
     const auto fail = [&out, &t](std::string msg) {
         NXLOG_W(kTag, "texture %u: %s", t.id, msg.c_str());
         out.error = std::move(msg);
@@ -841,7 +847,9 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     // ---- the source image: tight linear buffer --------------------------------------------------------------------------
     // A stand-in reads only the small levels it encodes (solid_src and after): untiling the big ones, which it never looks at, was most of its cost.
     // The buffer then starts at the first of those levels (lin_base): the big levels' space was allocated and zeroed for nothing.
-    std::vector<uint8_t> lin;
+    // A pass-through texture is untiled straight into the output's buffer (out.data, whose capacity a reusing caller keeps).
+    std::vector<uint8_t> lin_own;
+    std::vector<uint8_t>& lin = mode == Mode::Passthrough && solid_src >= geo.size() ? out.data : lin_own;
     uint64_t lin_base = 0;
     if (solid_src < geo.size() && L.block_linear) {
         const LevelGeom& last = geo.back();
@@ -862,7 +870,7 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
         if (fmt.vk == VK_FORMAT_BC7_SRGB_BLOCK && L.levels == 1 && L.layers == 1 && geo[0].d == 1 && geo[0].w <= 128 &&
             geo[0].h <= 128 && texture_override_active() && texture_override_apply(t, geo[0].w, geo[0].h, lin))
             NXLOG_I(kTag, "texture %u: content replaced by the host (%ux%u BC7)", t.id, geo[0].w, geo[0].h);
-        out.data = std::move(lin);
+        if (&lin != &out.data) out.data = std::move(lin);
         return true;
     }
 

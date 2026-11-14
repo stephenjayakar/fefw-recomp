@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include "nxrt/tl_counts.h"
 #include <unordered_map>
 
 #include "nxrt/dispatch.h"
@@ -38,20 +39,13 @@ std::unique_ptr<Entry> g_owned[kMaxListed];           // owns the entries, regis
 std::atomic<Entry*> g_list[kMaxListed];               // the same, for lock-free readers: entries [0, g_count) are valid
 std::atomic<size_t> g_count{0};
 std::atomic<Entry*> g_by_index[kMaxModules];
-// Imports through the registry, counted in cache-line stripes (one per thread, round robin): every guest thread calls imports at a high rate,
-// and one shared counter made each call a cache-line transfer between cores (8.9 % of the game thread's busy samples sat on its fetch_add).
-struct alignas(64) ImportStripe { std::atomic<uint64_t> n{0}; };
-constexpr size_t kImportStripes = 64;
-ImportStripe g_import_stripes[kImportStripes];
-std::atomic<uint32_t> g_import_stripe_next{0};
-uint64_t import_calls_sum() {
-    uint64_t t = 0;
-    for (const ImportStripe& s : g_import_stripes) t += s.n.load(std::memory_order_relaxed);
-    return t;
-}
-void import_calls_zero() {
-    for (ImportStripe& s : g_import_stripes) s.n.store(0, std::memory_order_relaxed);
-}
+// Imports through the registry, counted per thread (tl_counts.h: a relaxed load and store into the thread's own block): every guest thread calls
+// imports at a high rate, and one shared counter made each call a cache-line transfer between cores (8.9 % of the game thread's busy samples,
+// 46-52 % of the job workers', sat on its fetch_add in stutter-1's slow-frame samples).
+struct ImportCountTag {};
+TlCounts<1, ImportCountTag> g_import_counts;
+uint64_t import_calls_sum() { return g_import_counts.total(); }
+void import_calls_zero() { g_import_counts.clear(); }
 std::mutex g_type_lock;                               // resolved imported typeinfo slots (ABI 3 NxEh.type_syms), keyed by slot address
 std::unordered_map<const uint64_t*, uint64_t> g_type_cache;
 
@@ -288,10 +282,7 @@ void import_cache_invalidate() {
 uint64_t import_calls() { return import_calls_sum(); }
 
 namespace detail {
-void count_import() {
-    thread_local ImportStripe* t_stripe = &g_import_stripes[g_import_stripe_next.fetch_add(1, std::memory_order_relaxed) % kImportStripes];
-    t_stripe->n.fetch_add(1, std::memory_order_relaxed);
-}
+void count_import() { g_import_counts.add(0); }
 }  // namespace detail
 
 }  // namespace nxrt

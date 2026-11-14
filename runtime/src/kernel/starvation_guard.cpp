@@ -157,7 +157,25 @@ void log_starvation(const KThread& t, const std::string& where, int ready_ms, co
             static_cast<unsigned long long>(boost_no), busy.empty() ? "none" : busy.c_str(), other.empty() ? "none" : other.c_str());
 }
 
-void loop(Guard* g, int poll_ms, int need_polls) {
+// [sched] starvation_lean (default false): the guard costs 1.4-1.6 ms of CPU per frame at THREAD_PRIORITY_HIGHEST in a clean run (a
+// snapshot of every process on the PC every 50 ms, with each process's name copied) and boosted nothing in any tester run. Lean: process
+// names are read only for a log line, and while no guest thread was ready-and-unscheduled at the last poll the next one comes after
+// [sched] starvation_idle_poll_ms (default 200) instead of starvation_poll_ms; once one is seen, polls are starvation_poll_ms apart again.
+// A starvation is then caught after up to idle_poll + starvation_ms instead of poll + starvation_ms.
+void fill_names(const std::vector<uint8_t>& buf, CpuSnap& snap) {
+    for (size_t off = 0;;) {
+        const ProcRec* p = reinterpret_cast<const ProcRec*>(buf.data() + off);
+        const uint8_t* rec = buf.data() + off;
+        const uint64_t ppid = *reinterpret_cast<const uint64_t*>(rec + 0x50);
+        const USHORT len = *reinterpret_cast<const USHORT*>(rec + 0x38);
+        const wchar_t* nm = *reinterpret_cast<const wchar_t* const*>(rec + 0x40);
+        if (nm && len && snap.procs.count(ppid)) snap.names[ppid].assign(nm, len / sizeof(wchar_t));
+        if (!p->next_entry_offset) break;
+        off += p->next_entry_offset;
+    }
+}
+
+void loop(Guard* g, int poll_ms, int need_polls, bool lean, int idle_poll_ms) {
     log_set_thread_name("starve-guard");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);        // it must run when everything else is starved
     NtQuery nt_query = reinterpret_cast<NtQuery>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation"));
@@ -169,11 +187,14 @@ void loop(Guard* g, int poll_ms, int need_polls) {
     std::deque<CpuSnap> hist;                      // the last need_polls snapshots, oldest first
     ULONGLONG last_line = 0;
     uint64_t quiet = 0;                            // boosts not logged since the last line (at most one line per second)
+    bool watching = true;                          // lean: some guest thread was ready without a switch at the last poll (or a boost runs)
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(g->m);
-            if (g->cv.wait_for(lk, std::chrono::milliseconds(poll_ms), [g] { return g->stop; })) return;
+            const int wait_ms = lean && !watching ? idle_poll_ms : poll_ms;
+            if (g->cv.wait_for(lk, std::chrono::milliseconds(wait_ms), [g] { return g->stop; })) return;
         }
+        watching = false;
         ULONG need = 0;
         LONG st = nt_query(kSystemProcessInformation, buf.data(), static_cast<ULONG>(buf.size()), &need);
         if (st < 0) {
@@ -193,9 +214,11 @@ void loop(Guard* g, int poll_ms, int need_polls) {
                 nthreads = p->number_of_threads;
             } else {
                 snap.procs[ppid] = *reinterpret_cast<const uint64_t*>(rec + 0x28) + *reinterpret_cast<const uint64_t*>(rec + 0x30);
-                const USHORT len = *reinterpret_cast<const USHORT*>(rec + 0x38);
-                const wchar_t* nm = *reinterpret_cast<const wchar_t* const*>(rec + 0x40);
-                if (nm && len) snap.names[ppid].assign(nm, len / sizeof(wchar_t));
+                if (!lean) {
+                    const USHORT len = *reinterpret_cast<const USHORT*>(rec + 0x38);
+                    const wchar_t* nm = *reinterpret_cast<const wchar_t* const*>(rec + 0x40);
+                    if (nm && len) snap.names[ppid].assign(nm, len / sizeof(wchar_t));
+                }
             }
             if (!p->next_entry_offset) break;
             off += p->next_entry_offset;
@@ -220,6 +243,7 @@ void loop(Guard* g, int poll_ms, int need_polls) {
             const bool ready = r.thread_state == kStateReady || r.thread_state == kStateStandby;
             if (ready && r.context_switches == s.switches) s.ready_polls++;
             else s.ready_polls = ready ? 1 : 0;
+            if (s.ready_polls >= 1 || s.boosted) watching = true;   // ready now: poll again soon
             s.switches = r.context_switches;
             HANDLE h = static_cast<HANDLE>(t->host_handle);
             if (s.boosted) {                                    // boosted: keep it for boost_polls polls, then back to its band
@@ -246,6 +270,7 @@ void loop(Guard* g, int poll_ms, int need_polls) {
                     last_line = now;
                     if (quiet) NXLOG_W("sched", "(%llu more starvation boosts since the last line)", static_cast<unsigned long long>(quiet));
                     quiet = 0;
+                    if (lean) fill_names(buf, hist.back());
                     log_starvation(*t, where, (s.ready_polls - 1) * poll_ms, hist.front(), hist.back(), n);
                 } else {
                     ++quiet;
@@ -272,9 +297,11 @@ void starvation_guard_start() {
     const int poll = static_cast<int>(std::clamp<int64_t>(config_get_int("sched", "starvation_poll_ms", 50), 10, 1000));
     const int need = (ms + poll - 1) / poll + 1;
     g.stop = false;
-    g.th = std::thread(loop, &g, poll, need);
-    NXLOG_I("sched", "starvation guard on: a guest thread ready for %d ms without running (polled every %d ms) is boosted to top priority on the whole processor pool for %d ms (debug note 422)",
-            (need - 1) * poll, poll, kBoostMs);
+    const bool lean = config_get_bool("sched", "starvation_lean", false);
+    const int idle = static_cast<int>(std::clamp<int64_t>(config_get_int("sched", "starvation_idle_poll_ms", 200), poll, 1000));
+    g.th = std::thread(loop, &g, poll, need, lean, idle);
+    NXLOG_I("sched", "starvation guard on: a guest thread ready for %d ms without running (polled every %d ms%s) is boosted to top priority on the whole processor pool for %d ms (debug note 422)",
+            (need - 1) * poll, poll, lean ? ", every starvation_idle_poll_ms while nothing is ready: [sched] starvation_lean" : "", kBoostMs);
 }
 
 void starvation_guard_stop() {

@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -33,6 +34,7 @@
 #include "nxrt/log.h"
 #include "nxrt/lowlat.h"
 #include "vk_gauges.h"
+#include "nvn_cmdq.h"
 #include "nvn_gpu_internal.h"
 #include "nvn_impl.h"
 #include "nvn_pipeline.h"
@@ -379,6 +381,7 @@ bool split_submission(Frame& f) {
     if (!g || !f.split_ok || !f.slot || g->frame_batch || g->batch_max > 1 || pool_copy_pending() || !on_render_thread()) return false;
     Slot& s = *static_cast<Slot*>(f.slot);
     if (f.cb != s.cb) return false;
+    nxrt::HitchTimer split_timer(nxrt::kHpRenderSplit);   // the budget's "split submissions" per frame
     VkCommandBuffer next = VK_NULL_HANDLE;     // the buffer for the rest first: without one nothing is split
     if (!s.split_free.empty()) {
         next = s.split_free.back();
@@ -910,6 +913,9 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cb, &bi);
+    // [nvn] replay_threads = 2: from here to vkEndCommandBuffer the Vulkan calls of this thread are made by the worker (nvn_cmdq.h)
+    std::optional<cmdq::Scope> qscope;
+    qscope.emplace();
     const uint32_t qi = static_cast<uint32_t>(&s - g->slots) * 2;
     if (g->gpool) {
         vkCmdResetQueryPool(s.cb, g->gpool, static_cast<uint32_t>(&s - g->slots) * kGpMax, kGpMax);
@@ -951,6 +957,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     }
     if (g->gpool && !aborted) gpass_stamp(f, "tail", 0);
     if (g->qpool && !aborted) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qi + 1);
+    qscope.reset();       // every queued call made
     vkEndCommandBuffer(s.cb);
     if (!unsignalled) {
         s.serial = serial;
@@ -1440,6 +1447,7 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     static const bool report_registered = (diag_add_report(gpu_report), true);   // the freeze dump shows the GPU state
     (void)report_registered;
     register_counter_gauges();
+    cmdq::install();      // [nvn] replay_threads: before the render thread records anything
     gp->th = std::thread(render_loop);
     // wait for the thread id to be published
     for (int i = 0; i < 1000 && gp->tid == std::thread::id(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1515,6 +1523,7 @@ void tear_down() {
     }
     gp->qcv.notify_all();
     if (gp->th.joinable()) gp->th.join();
+    cmdq::shutdown();
     gfx::Device& d = *gp->dev;
     vkDeviceWaitIdle(d.device());
     if (gp->ring.buf.buffer) d.destroy_buffer(gp->ring.buf);
