@@ -631,3 +631,38 @@ main CPU ms/frame (avg of 2): hub_cold 12.0 -> 10.85 (-9.6 %), street_cold 13.26
 street_warm 13.82 -> 12.56 (-9.1 %); Basic workers ~-10 %. Dense street windows (2400-2640 draws, `tools_tester/limiter.py`): frame
 median 17.1-18.1 -> 16.7-17.0 ms, game CPU p50 13.3-14.7 -> 12.2-13.9, game waits p50 4.4-4.6 -> 2.8-4.0 (the job chains got faster
 too). Street 1% lows: street_cold 43.8 -> 44.8, street_warm 41.2 -> 45.1; frames > 20 ms street_warm 318 -> 109 (avg of 2).
+
+### codegen2-3 = codegen2-1 + tregs + a fresh PGO profile (window 24, 2 pairs vs codegen2-1, same DLL e0eba73)
+Instrumented exe built from 3de6bff (`build_gen.sh 2`, the zstd unit uninstrumented), profiled by the tester (hub 874 MB + battle
+266 MB, window 23), PGO exe `build_use2.sh 3` into `C:/Games/fefw-pgo2` (profile `codegen2/pgo/fefw2.profdata`). main CPU ms/frame
+(avg of 2): hub_cold 10.98 -> 10.59 (-3.6 %), street_cold 12.28 -> 11.88 (-3.3 %), hub_warm 11.07 -> 10.83 (-2.2 %), street_warm
+12.50 -> 12.11 (-3.1 %); Basic workers about the same. Dense street windows: game CPU p50 at the same moments 12.2-12.6 -> 11.9-12.0,
+waits unchanged (3.6-4.0), frame median ~16.8 ms in both.
+
+### Where it stands (14 Nov, 09:30)
+- **Codegen-2 total** (live PGO exe 184d72de -> codegen2-3, same DLL): main CPU per frame -11 to -13 % in every town scene (street_cold
+  13.26 -> 11.88 ms, street_warm 13.82 -> 12.11, hub_cold 12.0 -> 10.6); Basic workers ~-12 %; dense-street game CPU p50
+  13.3-14.7 -> ~12.0, game waits 4.4-4.6 -> 3.6-4.0, so **game work p50 in the dense street ~18 -> ~15.9 ms**; dense frame median
+  17.1-18.1 -> 16.7-17.0 ms; street 1% lows 40-44 -> 44-47; arrivals -25..-35 ms. codegen2-1 is live (tester, 07:14).
+- **Target not met**: game work p50 <= 14.5 needs another ~1.4 ms. Of main's ~12 ms CPU in those windows ~78 % is lifted code (cg21-prof:
+  78.4 % of main's busy samples, the rest runtime: NVN recording, import calls, SVCs, spin-waiting) and the profile stays flat (top 40
+  functions 25 %). The waits are the job chains' own run time (Basic workers' f_7101980580 / f_71005ef6e0 / f_7100a831a0, the
+  MOCull Leader) plus wake-ups.
+- What is left in the lifted code, with honest sizes:
+  - callee-saved x19..x28 reloaded after every call: keeping them in locals needs dirty tracking (store only what changed since the last
+    call); a naive version (store all before every call) came out +11 % larger. The codegen track's 'xregs' data-flow is the base for a
+    proper one; expect a few %.
+  - v16..v31 (AAPCS64 vector temporaries) never written back at calls/returns: ~900 of 3,560 vector context stores in the hot set (~1 %).
+  - HLE of hot SDK routines on main: std::__shared_weak_count::lock 0.8 %, the nlibsdk heap cache 1.0 %, __hash_memory 0.2 %:
+    under 1 % even if they were free.
+  - dropping the `c->fn` store per call: -0.3 % static, costs crash-report precision; not done.
+  - f_7101980580 (box vs planes, 8 % of the Basic workers now): a native version could skip the NaN checks and the lane shuffles, maybe
+    3-4x faster, ~0.2-0.3 ms of worker time per frame; not done (bit-exact float order work).
+- **LLVM 22 / 23**: zig's bundled clang IS 22.1.8 (= the LLVM 22 release; its codegen is the same). The installed clang 23.1.2, with
+  zig's mingw/libc++ headers and the same flags, gives -1.1 % static instructions on the hot set: not worth a toolchain switch (PGO
+  profile format, reproducibility of the release build). Not used.
+- **Large pages: assessment only.** No DTLB counter is reachable here: ETW exposes only the Timer PMC source on this PC (`wpr
+  -pmcsources`), and AMD uProf (driver install) was not installed. The waits track's tlbbench gives the cost per miss (+11..+22 ns per
+  dependent load within L2/L3, +65 ns beyond); the codegen track found ~48 % of main's lifted-code samples on guest loads. Without a
+  miss rate the gain stays a range (a few % to ~15 % of main's CPU), and it needs the heap rework + "Lock pages in memory" (see the
+  waits track's notes). Measuring it first (uProf, one street run) is the right next step if anyone picks it up.
