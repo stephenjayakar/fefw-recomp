@@ -582,3 +582,52 @@ Per presented frame, from the budget lines (`waits` = main's own system-call wai
   SeLockMemoryPrivilege. Nothing was changed on this PC; the benchmark reports the privilege as not held.
 - Recommendation: first measure DTLB misses on main in the street with AMD uProf (free) on the current build. Only if they are a large
   share of its loads is the heap rework worth it.
+
+## Codegen-2 track (branch `perf/codegen2`, 14 Nov)
+
+Goal: the dense street (2400-2640 draws) at 4K60 needs ~18 ms of main-thread work per frame: ~12.8 ms CPU in lifted game code plus
+~4.7 ms waiting on the game's own job chains (Basic_Worker x4, GFX_Worker0, MOCull). Target: game work p50 <= ~14.5 ms (CPU <= ~11).
+Tools and scratch: `tmp/fefw-perf/codegen2/` (`tools/extract.py` = codegen's with section/fi_ support, `tools/cc.sh` compiles one
+unit like fefw_build.py, `tools/treg_live.py` checks the AAPCS64 temporaries over the lifted output, `build.sh <n>` / `build_gen.sh <n>`
+package the worktree and build a PGO-use / PGO-instrumented fefw.exe with a window watcher).
+
+### Hot functions by thread (r1-tprof, PGO exe, whole hub scenario; `codegen2/hot_*_r1.txt`)
+- main: flat as before (top 40 = 37 % of busy), led by f_7100a94da0 3.2 %, f_7101980580 3.0 %, f_71014d16e0 1.9 %.
+- Basic_Worker1-4 (guest-82..85, 95 % in lifted code): **f_7101980580 12.3 %** (a box-vs-planes test: matrix x vector with FMUL/FMLA
+  by element), f_71005ef6e0 6.8 %, f_7100a831a0 4.4 %, f_7100a9bb60 3.9 %, f_7101978d50 3.8 %; top 10 = 45 %.
+- MOCull_Worker1/2 + Leader (guest-109..111, 99 % lifted): **f_71019730e0 80-84 % of the workers** (a 16k-instruction NEON
+  rasterizer: masked occlusion culling), f_7101977500, f_7101976dc0 61 % of the Leader.
+- GFX_Worker0-4: only ~42 % in lifted code (f_7100a7c620 19 %); the rest is the runtime's NVN work.
+
+### Finding: the host compiler reloaded the context after every guest store
+Lifted code keeps guest registers in the context (`c->x[n]`, `c->v[n]`) and reaches guest memory through integer-to-pointer casts.
+`Ctx *__restrict c` should let clang keep context values in host registers across guest loads and stores, but LLVM only uses that
+while it can prove `c` uncaptured, and (1) `c` was passed to every call without `noescape`, (2) LLVM's capture tracking gives up after
+100 uses of a pointer (`-capture-tracking-max-uses-to-explore`, default 100) and every lifted function uses `c` hundreds of times. So
+after the first call, and in every function with more than ~100 context accesses, each guest store forced every context register in
+use to be reloaded and kept every pending context store in place. Shown on a 20-line unit (cap2.cpp) and bisected on f_7100a94da0
+(the reloads appear exactly when the function passes ~100 uses of `c`).
+
+### Changes
+| commit | what | static effect (85 hottest functions of main + workers, x86 instructions) |
+|---|---|---|
+| 35c1284 | ctx.h `NX_NOESC` (= `noescape` when `NX_NOESCAPE_CTX`, defined only for the lifted code by fefw_build.py / NxRecomp.cmake) on the context parameter of every lifted function and every runtime entry the lifted code calls; `-mllvm -capture-tracking-max-uses-to-explore=100000` | -4.2 % (context loads -20 %, stores -17 %); a cold unit -11 % |
+| 35c1284 | neon.h lane access by 16-byte load + insert + 16-byte store, helper results by `nx_vst`; opt vstore: MOVI pairs and every `c->v[n] = <V128>` as one 16-byte store | another -4.8 %; no more partial writes read back whole (store-forwarding stalls) |
+| 35c1284, a522b91 | opt 'tregs' (`opt.temps_local`): x8..x17 in function locals in functions that make calls; not written back at calls (x9..x17) or returns (x8..x17); x8 synced around calls (indirect result address; an HLE handler reads it), everything around SVCs and site callouts | another -3.8 % (context stores -20 %); leaves excluded (the hottest leaf grew 20 % from register pressure) |
+| 1f117ac | fefw_build.py `--pgo-gen`: the unit holding the lifted zstd fallback is compiled without instrumentation (its instrumented compile hung in codegen-2) | - |
+
+Total static: 97,886 -> 85,706 instructions (-12.4 %), context stores -41 %, loads -34 %. e2e oracle 30/30 identical (with
+NXRECOMP_OPT tregs/flags the final x8..x17 / NZCV, undefined after a return, are not compared; memory and every other register are).
+
+ABI check for tregs (`tools/treg_live.py` over main + sdk): no function in main reads x8..x17 before writing them except on paths
+through noreturn calls or jump-table defaults, and none relies on a value in them after a call; in the sdk the only live-in reads
+are hand-written routines saving x16/x17 to restore them (bignum multiply-add, the TLS descriptor resolver), which tregs keeps
+correct: a caller's temporaries live in its own locals across the call, so a callee that preserves them (TLSDESC) still works.
+**tregs and PGO**: tregs changes the control flow clang profiles in ~40 % of the functions it touches (hash mismatch: 160 of 408 in
+the hottest unit), so it needs its own profile; codegen2-1 was built without it (profile intact: 1 of 619 functions changed).
+
+### codegen2-1 measured (window 22, 2 pairs vs the live PGO exe, same DLL e0eba73)
+main CPU ms/frame (avg of 2): hub_cold 12.0 -> 10.85 (-9.6 %), street_cold 13.26 -> 12.19 (-8.1 %), hub_warm 11.93 -> 11.02 (-7.6 %),
+street_warm 13.82 -> 12.56 (-9.1 %); Basic workers ~-10 %. Dense street windows (2400-2640 draws, `tools_tester/limiter.py`): frame
+median 17.1-18.1 -> 16.7-17.0 ms, game CPU p50 13.3-14.7 -> 12.2-13.9, game waits p50 4.4-4.6 -> 2.8-4.0 (the job chains got faster
+too). Street 1% lows: street_cold 43.8 -> 44.8, street_warm 41.2 -> 45.1; frames > 20 ms street_warm 318 -> 109 (avg of 2).
