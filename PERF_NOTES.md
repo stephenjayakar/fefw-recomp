@@ -560,6 +560,8 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 | render-3 | `tex_set_skip` (on 9635cb3) | window 19: NEUTRAL, correct (0 rt_check mismatches, visuals identical). Only 148-175 sets/frame left bound (3.5 %): textures change between almost every draw in this game; not merged |
 | render-4 | `prep_skip`, `set_batch` (on render-3) | window 20 (prep_skip fires as rarely as tex_set_skip) |
 | render-5 | render-3/4 + `view_memo` | queued |
+| render-6 | `servable_memo` (off by default; write-watch clear epoch + pool epoch + pool generation; rt_check compares) | queued: rt_check runs first, then A/B |
+| render-7 | render-mt stage 1: `desc_on_recorder` (texture sets on the recorder; off by default; rt_check compares content keys) | queued: rt_check runs first, then A/B (perf/render-mt 893c4a7) |
 
 Clean profile r3-prof (render-3, no rt_check), render thread: run_list = begin_draw 59 % (build_set 25 %, prepare_textures 6 %, vertex
 buffer resolve_read 5 %, resolve_texture 3 %, graphics_pipeline 2 %), out_draw_bindings 15 % (out_servable 5 %: bound uniform buffers keep
