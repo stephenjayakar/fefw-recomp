@@ -512,3 +512,32 @@ Per presented frame, from the budget lines (`waits` = main's own system-call wai
   SeLockMemoryPrivilege. Nothing was changed on this PC; the benchmark reports the privilege as not held.
 - Recommendation: first measure DTLB misses on main in the street with AMD uProf (free) on the current build. Only if they are a large
   share of its loads is the heap rework worth it.
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| 27f34a9 | `[kernel] spin_threads` / `lock_spin_threads`: comma lists of game thread name prefixes (`main` = the main thread) that spin `spin_us` before sleeping in WaitForAddress / ArbitrateLock / WaitProcessWideKey, or poll a held mutex `lock_spin_us` instead of queueing for a hand-over; empty list = every thread (the old meaning). Game thread names in `[kernel] wait_stats`; every named thread logs its nn priority, ideal core and core mask. New budget line `waits per present` (main's system-call waits, GPU sync waits, back pressure; render thread queue-submit and split-submission ms per frame). | `spin_us = 0`, `lock_spin_us = 0` (off) |
+| 531d0ed | `[sched] starvation_lean`: the guard reads process names only for a log line and polls every `starvation_idle_poll_ms` (200) while no guest thread is ready-and-unscheduled | `false` |
+
+### Measurements
+
+- **waits-1 (window 14, 7 runs, clean: 0.9-1.3 background cores in steady state)**, game work p50 / p99 per scene (ms), hub and street
+  1% lows:
+
+  | run | hub_cold | street_cold | hub_warm | street_warm | 1% low hub_cold / hub_warm / street_cold / street_warm |
+  |---|---|---|---|---|---|
+  | base | 13.8 / 20.3 | 16.2 / 22.5 | 14.4 / 20.8 | 16.5 / 23.2 | 45.4 / 46.3 / 40.8 / 40.9 |
+  | base-b | 14.0 / 19.6 | 16.1 / 22.5 | 14.1 / 20.6 | 16.5 / 22.7 | 45.2 / 46.4 / 41.7 / 42.0 |
+  | spin (main only, 30 us + lock poll) | 12.9 / 19.0 | 15.7 / 22.3 | 14.2 / 20.0 | 16.5 / 24.1 | 46.8 / 47.0 / 41.5 / 39.9 |
+  | **spinjobs (main + Basic workers)** | **12.8 / 18.8** | **15.1 / 21.4** | **13.2 / 19.4** | **16.2 / 22.3** | **48.4 / 48.5** / 41.4 / 41.3 |
+  | noguard | 13.6 / 19.7 | 16.0 / 21.7 | 14.1 / 20.5 | 16.4 / 23.2 | 46.5 / 46.5 / 41.2 / 40.4 |
+  | ccx (host_cpus fff0) | 13.7 / 19.8 | 16.1 / 21.7 | 14.4 / 20.1 | 16.6 / 22.6 | 46.7 / 47.7 / 42.1 / 41.3 |
+
+  spinjobs: frames over 20 ms -20 to -35 %; +0.3 ms CPU per frame on main and on each Basic worker. The street 1% lows do not move:
+  their slow frames are the render thread's (RENDER track). Split submissions cost the render thread 0.10-0.18 ms per frame and all
+  its queue submits 0.36-0.43 ms: the split is cheap.
+- **In-game wake-up latency** (wt1-diag, dense street, per 10 s): main blocked 35,832 times (~65 per frame) for 2.6 s (address 2.1 s,
+  mutex 0.48 s), host wake-up mean 6.9 us (79 % in 5-10 us); Basic workers 14,400 blocks each (9,400 on the job condition variable),
+  5.9 us; GFX workers 6,430 each, 7-8 us. Who ended main's blocks there: GFX_Worker0 ~6,100 x 64 us (~0.7 ms/frame), the Basic workers'
+  job completions ~1.7-2 ms/frame and mutex hand-overs ~0.65 ms/frame, MOCull_Leader ~0.55 ms/frame (one ~600 us wait), SND_Update ~0.08.
