@@ -429,3 +429,12 @@ Checks: `recomp/tests/nxflags_test.cpp` (23.7 M cases, the NxFlags helpers again
   22.1.8's lib/profile built with zig (codegen/pgo/rt). The instrumented compile of main/c_004 (the zstd unit) hung (>45 CPU-min);
   that unit is built uninstrumented. pgogen exe: C:/Games/fefw-test-pgogen (300 MB). The PGO-use build must use the same game
   folder as the instrumented one (static functions' profile names include the source path).
+- **codegen-3 = PGO measured** (window 11, 2 clean runs each vs cg2): main CPU -4.5 % (street_cold 12.69 -> 12.11 ms; pgo-zn the
+  same, street_warm 13.38 -> 12.38), arrivals ~-4..-7 % (pgo-zn ~320 / 282 / 322 ms), game work p50 street 16.25 -> 16.0-16.15, fps and
+  1% lows unchanged. Battle fine. pgo-zn (-mcpu=znver2) = pgo within noise. The street frame is no longer limited by main's CPU time
+  (~12.1 of ~17.7 ms); the rest of game work is waiting on job workers, GPU sync and the render thread.
+- Total, codegen (0.1.7 exe -> pgo-zn, same DLL stack): main CPU street_cold 14.70 -> 12.1 ms (-18 %), job workers ~-15 %, arrival
+  frames 485 -> ~320 ms (-34 %), one ~250 ms zstd loading frame per run replaced by native decoding.
+- How to build the PGO exe again: build4-style package (perf/codegen sources), `fefw_build.py --pgo-gen <libclang_rt_profile.a>` into a
+  folder F, run the game with LLVM_PROFILE_FILE=<dir>/x-%p.profraw, merge with LLVM 22's llvm-profdata, then
+  `fefw_build.py --pgo-use <profdata> [--mcpu znver2]` into the SAME folder F. Scripts: tmp/fefw-perf/codegen/{pgogen,pgouse}.sh.
