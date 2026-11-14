@@ -478,3 +478,37 @@ Per presented frame, from the budget lines (`waits` = main's own system-call wai
   allocator share (~14 %) is the lifted SDK allocator itself (s5-default samples under f_7100652310: 97 % lifted SDK code, ~10 % the
   cross-module call path host_import / import_resolve, 1.4 % write-watch faults; no virtual-memory or kernel memory service on the
   path). Nothing for the runtime's memory services there.
+
+### Large pages for guest memory: feasibility (item 4)
+
+- **What a TLB miss costs here** (tmp/fefw-perf/waits/bench/tlbbench.cpp: a random pointer chase over the same number of cache lines,
+  packed 64 B apart vs one line per 4 KiB page; Zen 2's L2 DTLB holds 2048 4 KiB entries = 8 MB of reach):
+
+  | lines | packed | one per page | per-load cost of the page walk |
+  |---:|---:|---:|---:|
+  | 4096 (256 KB, L2) | 2.8 ns | 14.4 ns | +11.6 ns |
+  | 16384 (1 MB, L3) | 8.9 ns | 23.0 ns | +14 ns |
+  | 65536 (4 MB, L3) | 10.5 ns | 32.3 ns | +22 ns |
+  | 262144 (16 MB, past one CCX's L3) | 72 ns | 137 ns | +65 ns |
+
+  With 2 MiB pages a few hundred MB of game objects need a few hundred TLB entries instead of tens of thousands, so most of that walk
+  cost goes. The game thread's samples sit ~48 % on guest loads (codegen track); how many of them miss the DTLB is not known without
+  hardware counters (AMD uProf's "L2 DTLB miss" events would say it in one run; not installed here). Plausible range: a few percent to
+  ~15 % of main's CPU.
+- **Why it is not a toggle yet:**
+  - The heap is ONE pagefile-backed section (SEC_RESERVE, primary view at kHeapBase plus alias views for pool imports; memory.cpp).
+    Large pages need `SEC_LARGE_PAGES | SEC_COMMIT` (committed and non-pageable up front: the game's ~11 GB heap would be locked RAM on a
+    24 GB PC), 2 MiB-aligned views, and a section is either large-paged or not.
+  - Write-watch (write_watch.cpp) arms single 4 KiB pages read-only with VirtualProtect to see CPU writes to GPU pools that lie inside
+    that heap; a large page cannot be protected per 4 KiB page. So only heap ranges that never hold a watched pool could use large pages,
+    and the game decides where its pools go after the heap is committed at boot. A workable design: the heap as many 2 MiB-granular
+    sections, large ones only for ranges a recorded pool map of earlier runs says stay unwatched, with a fallback to 4 KiB sections when
+    the large allocation fails (it can take seconds or fail outright on a fragmented system). That is a substantial rework of memory.cpp
+    and the alias/import paths, for a gain not yet measured.
+  - Allocating ~10 GB of large pages at boot needs Windows to find contiguous 2 MiB physical runs; after hours of uptime it may fail or
+    take many seconds.
+- **The privilege step the user would need** (only if this is ever built and wanted): run `secpol.msc` -> Local Policies -> User Rights
+  Assignment -> "Lock pages in memory" -> add your own account -> sign out and back in. `whoami /priv` then lists
+  SeLockMemoryPrivilege. Nothing was changed on this PC; the benchmark reports the privilege as not held.
+- Recommendation: first measure DTLB misses on main in the street with AMD uProf (free) on the current build. Only if they are a large
+  share of its loads is the heap rework worth it.
