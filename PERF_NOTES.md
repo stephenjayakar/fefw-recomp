@@ -359,6 +359,48 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 |---|---|---|
 | gpu-1 | baseline GPU ms/frame + pass profile at 4K; A/B of the three toggles together | queued 13 Nov (5d3e3e9) |
 
+## GPU2 track (branch `perf/gpu2`)
+
+Goal: GPU time at or under ~14 ms p50 and under 16 ms p99 at 2600 draws per frame (the densest Dagsion street windows), at native
+3840x2160, render ratio 1.0, no upscaler. Test requests go to `C:/Users/aj12a/tmp/fefw-perf/queue/gpu2-<n>/`.
+
+### The 17-18 ms was not GPU work (13 Nov)
+
+With `[nvn] split_submit_ms = 2` the tester's dense windows read "GPU p50 17.0-18.0 ms", next to render-thread work p50 16.6-17.4 ms.
+- gpustats adds up each submission's first-to-last timestamp (top-of-pipe at the start, bottom-of-pipe at the end).
+- A split submission hands its first parts to the GPU while the render thread still records the rest. So the span includes the GPU
+  waiting for the next part, and it follows the render thread.
+- The same windows without split show the real GPU time:
+
+| run | split | draws/frame | GPU p50 | p99 | render work p50 |
+|---|---|---:|---:|---:|---:|
+| m5-set | off | 2502-2591 | 12.25-12.44 | 14.4-14.6 | 16.0-17.3 |
+| g2B-gpu2-toggles | off | 2588-2614 | 12.3-12.5 | 15.0-15.35 | - |
+| m5-split / -b | 2 ms | 2352-2633 | 17.1-18.4 (span) | 21.6-24.5 (span) | 16.6-17.4 |
+| w11-pgo-b | 2 ms | 2443-2636 | 17.0-18.0 (span) | 22.7-23.6 (span) | 16.6-17.4 |
+
+So the GPU at 2600 draws is about 12.4 ms p50 and under 16 p99: the target is met. The dense street is **render-thread bound**. Split
+does not change render work (it is a win for other reasons, measured by the tester in window 6).
+
+GPU cost by draw count (gp-m3-set pass profile, 1129 vs 2525 draws, timestamps drain the GPU):
+- About +2 ms from 1100 to 2500 draws, about 1.4 us per draw.
+- Where it goes: depth pre-pass `c0:0 d126` +0.3, forward `c4:97 d126` +0.36, the 7 full-screen `c1:97` passes +0.4, G-buffer
+  `c5:43 d126` +0.13, clustered lights `cs ee541a5d` +0.16, shadows +0.1.
+- The other ~10.4 ms is fixed 4K work: post passes, copies, UBO writes, light culling.
+- Per-draw state changes are not where the GPU time goes at this draw count.
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| `33f6c13` | gpustats: a timestamp pair at every split boundary and a second line, `GPU busy ms/frame ...`. Busy is the union of the parts' intervals across all submissions; gaps where the GPU waits for the render thread are left out, and overlaps count once. `idle inside submissions` = span - busy | with `[prof] gpu_stats` (or the frame trace) only |
+
+### Test log
+
+| request | what | result |
+|---|---|---|
+| gpu2-1 | P (best stack + split + stats) and Q (no split): busy vs span at 2600 draws, and the GPU cost of the split parts | queued 13 Nov |
+
 ## CPU track (branch `perf/cpu`)
 
 Goal: on the Ryzen 7 3700X both the game thread and the render thread fit in 16.6 ms with headroom at `[fefw] fps60 = 1`, with steady
