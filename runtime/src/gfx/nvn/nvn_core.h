@@ -132,6 +132,7 @@ void lifetime_texture_freed(const Texture* t);
 void pool_register(MemoryPool* p);
 void pool_unregister(MemoryPool* p);
 PoolHit pool_lookup(uint64_t gpu_address);          // pool is null when the address is in no pool
+uint64_t pool_generation();                         // moves with every pool registration and removal
 inline uint8_t* host_ptr(uint64_t gpu_address) { return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(gpu_address)); }
 
 // The data of an NVNbuffer (0x30 bytes in the game's memory).

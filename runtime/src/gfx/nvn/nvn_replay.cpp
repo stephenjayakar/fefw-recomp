@@ -399,6 +399,9 @@ void rs_report() {
     static uint64_t last_scans = 0, last_looks = 0;      // pool_textures_to_prepare: full scans of every registered texture, and all calls
     uint64_t scans = 0, looks = 0;
     pool_scan_counts(&scans, &looks);
+    static uint64_t last_sv_h = 0, last_sv_m = 0;
+    uint64_t sv_h = 0, sv_m = 0, sv_bad = 0;
+    servable_memo_stats(&sv_h, &sv_m, &sv_bad);
     if (!last_tsc) { last_p = p; last_tsc = __rdtsc(); last_t = clk::now(); g_rs = RStats(); last_scans = scans; last_looks = looks; return; }
     if (p < last_p + static_cast<uint64_t>(every)) return;
     const uint64_t tsc = __rdtsc();
@@ -416,7 +419,8 @@ void rs_report() {
             "(%.0f desc, %.0f prep left out, %.0f pipe, %.0f layouts, %.0f keys), %.0f dispatches | per draw us: head %.2f prep %.2f fb %.2f pass %.2f pipe %.2f dyn %.2f "
             "sets %.2f (alloc+update %.2f) vb %.2f call %.2f out %.2f | sets/frame %.0f (%.1f%% cached, %.0f writes, %.0f left bound) | resolves/frame tex %.0f img %.0f (memo %.0f) | "
             "binds/frame %.0f (%.1f%% same) | set misses/frame: new layout or submission %.0f, only uniform offsets %.0f, only uniform buffers %.0f, "
-            "textures %.0f, other %.0f | pool looks/frame %.1f, full scans/frame %.2f | rt_check %llu checked, %llu mismatches",
+            "textures %.0f, other %.0f | pool looks/frame %.1f, full scans/frame %.2f | servable memo/frame hits %.0f misses %.0f (%llu mismatches) | "
+            "rt_check %llu checked, %llu mismatches",
             frames, fms(kRsAll), setup, fms(kRsCall), fms(kRsOut), fms(kRsDispatch),
             fms(kRsAll) - setup - fms(kRsCall) - fms(kRsOut) - fms(kRsDispatch), s.draws * pf, s.draws_desc * pf, s.preps_skipped * pf, s.draws_pipe * pf, s.layouts * pf,
             s.keys * pf, s.dispatches * pf, dus(kRsHead), dus(kRsPrep), dus(kRsFb), dus(kRsPass), dus(kRsPipe), dus(kRsDyn), dus(kRsSets), dus(kRsAlloc), dus(kRsVb),
@@ -424,9 +428,12 @@ void rs_report() {
             s.set_writes * pf, s.sets_skipped * pf, s.res_tex * pf, s.res_img * pf, s.res_memo * pf, s.binds * pf,
             s.binds ? 100.0 * static_cast<double>(s.binds_same) / static_cast<double>(s.binds) : 0.0, s.miss_first * pf, s.miss_uboofs * pf,
             s.miss_ubo * pf, s.miss_tex * pf, s.miss_other * pf, static_cast<double>(looks - last_looks) * pf, static_cast<double>(scans - last_scans) * pf,
+            static_cast<double>(sv_h - last_sv_h) * pf, static_cast<double>(sv_m - last_sv_m) * pf, static_cast<unsigned long long>(sv_bad),
             static_cast<unsigned long long>(g_chk_n), static_cast<unsigned long long>(g_chk_bad));
     last_scans = scans;
     last_looks = looks;
+    last_sv_h = sv_h;
+    last_sv_m = sv_m;
     last_p = p;
     last_tsc = tsc;
     last_t = now;
@@ -1605,7 +1612,7 @@ void out_draw_read(uint64_t addr, uint64_t size, bool copy_ok, int why) {
     if (!addr) return;
     if (!size) size = 65536;
     if (!out_overlaps(addr, size)) return;
-    if (copy_ok && out_servable(addr, size)) return;
+    if (copy_ok && out_servable_memo(addr, size)) return;   // [nvn] servable_memo (default off: out_servable)
     compute_out_guard(addr, size, why);
 }
 

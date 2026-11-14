@@ -84,6 +84,8 @@ void pool_unregister(MemoryPool* p) {
 // Each thread keeps the pools it found (64 slots by the address's MiB), valid while no pool was registered or removed (g_pool_gen): the render thread looks up
 // the same few pools thousands of times a frame, and the map walk under the shared lock was ~7 % of its time (rt agent, notes/rt.md).
 // A pool's gpu_base and size are set before it is registered and never change. [nvn] pool_cache (default on).
+uint64_t pool_generation() { return g_pool_gen.load(std::memory_order_acquire); }
+
 PoolHit pool_lookup(uint64_t gpu_address) {
     // direct mapped by the address's MiB (the survey's page-keyed cache, notes/survey-perf.md #6): one compare on a hit
     struct Hit { uint64_t lo = 0, len = 0; MemoryPool* p = nullptr; };

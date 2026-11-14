@@ -121,6 +121,10 @@ bool all_armed(const Region* r, uint64_t first, uint64_t count);
 // Owner: true when every page of the run is valid, or still armed with its bit set in `alt` (one bit per page of the region, the caller's
 // own bitmap). A word of 64 pages at a time: the NVN back end asks this for every buffer a draw binds.
 bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const std::atomic<uint64_t>* alt);
+// Moves (after the bits change) every time a page of any region stops being valid or armed: a fault releases it, invalidate, forget, a
+// failed arm, region_destroy. An answer built from valid / armed bits that saw the same value before and after is still true as long as
+// the value has not moved (pages only turn valid or armed in between, which keeps such an answer true). nvn's servable memo uses it.
+uint64_t clear_epoch();
 uint64_t guard_faults();   // accesses that hit a guarded page (statistics)
 
 uint64_t faults();     // write faults handled so far (statistics)

@@ -191,6 +191,11 @@ uint64_t out_gen();
 bool out_clear_since(uint64_t addr, uint64_t size, uint64_t gen);
 // resolve_read would bind the copy for [addr, +size) (every page current there).
 bool out_servable(uint64_t addr, uint64_t size);
+// out_servable through [nvn] servable_memo (default off): a range found servable stays servable while no page of any write-watch region
+// lost its valid / armed bit (mem::ww::clear_epoch), no newer-in-the-copy mark was cleared and no mirror destroyed (the pool side's
+// epoch) and no pool was registered or removed. rt_check compares every memo answer with out_servable. Render thread.
+bool out_servable_memo(uint64_t addr, uint64_t size);
+void servable_memo_stats(uint64_t* hits, uint64_t* misses, uint64_t* mismatches);
 // Why results went back (the stats line): the end of a submission, or the GPU reader of the pool that needed them.
 enum OutWhy {
     kOutGpuReader = 0,      // unspecified reader

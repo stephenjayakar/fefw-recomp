@@ -82,6 +82,7 @@ MemoryPool::~MemoryPool() {
 
 namespace gpu {
 namespace {
+std::atomic<uint64_t> g_serv_epoch{0};   // out_servable_memo: moves after newer-in-the-copy marks are cleared or a mirror goes
 
 constexpr const char* kTag = "nvn.pool";
 constexpr uint64_t kMirrorChunkBytes = 64ull << 20;   // the mirror's chunk (kChunkBytes below): import strides are a multiple of it
@@ -1355,6 +1356,7 @@ void mirror_destroy(PoolGpu* p) {
     Mirror* m = p->mirror;
     if (!m) return;
     p->mirror = nullptr;
+    g_serv_epoch.fetch_add(1, std::memory_order_acq_rel);
     out_unregister(m);
     g_mirrors.erase(std::remove(g_mirrors.begin(), g_mirrors.end(), m), g_mirrors.end());
     if (m->ww) mem::ww::region_destroy(m->ww);
@@ -1494,6 +1496,7 @@ void settle(Mirror* m, uint64_t first, uint64_t last) {
         mem::ww::unguard(m->ww, p, q - p);
         p = q;
     }
+    g_serv_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void recompute_bounds() {
@@ -1691,6 +1694,39 @@ bool out_clear_since(uint64_t addr, uint64_t size, uint64_t gen) {
         if (g.lo < hi && lo < g.hi) return false;
     }
     return true;
+}
+
+// [nvn] servable_memo (default off). Only "servable" answers are kept: "not servable" makes the caller copy the results back, which moves
+// out_gen anyway. A kept answer is reused while its three epochs are unchanged: every way for a servable range to stop being servable
+// clears a valid or armed bit of the pool's write-watch region (clear_epoch), clears a newer-in-the-copy mark (settle: the pool side's
+// epoch), destroys the mirror (same) or removes the pool (pool_generation). Mirror chunks and pool imports are only ever added.
+struct ServMemo { uint64_t addr = 0, size = 0, ww = 0, sv = 0, pg = 0; bool ok = false; };
+ServMemo g_serv_memo[1024];
+uint64_t g_serv_hits = 0, g_serv_misses = 0, g_serv_bad = 0;
+bool out_servable_memo(uint64_t addr, uint64_t size) {
+    static const bool on = config_get_bool("nvn", "servable_memo", false);
+    if (!on) return out_servable(addr, size);
+    static const bool check = config_get_bool("nvn", "rt_check", false);
+    const uint64_t ww = mem::ww::clear_epoch(), sv = g_serv_epoch.load(std::memory_order_acquire), pg = pool_generation();
+    ServMemo& m = g_serv_memo[((addr >> 8) ^ (size * 0x9e3779b97f4a7c15ull >> 44)) & 1023];
+    if (m.ok && m.addr == addr && m.size == size && m.ww == ww && m.sv == sv && m.pg == pg) {
+        ++g_serv_hits;
+        if (check && !out_servable(addr, size)) {
+            ++g_serv_bad;
+            static int logged = 0;
+            if (logged++ < 20) NXLOG_W("nvn.rtcheck", "mismatch: servable memo (0x%llx +%llu)", static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+        }
+        return true;
+    }
+    ++g_serv_misses;
+    const bool ok = out_servable(addr, size);   // the epochs were read before: a clear during the check moves them past what is kept
+    m = {addr, size, ww, sv, pg, ok};
+    return ok;
+}
+void servable_memo_stats(uint64_t* hits, uint64_t* misses, uint64_t* mismatches) {
+    *hits = g_serv_hits;
+    *misses = g_serv_misses;
+    *mismatches = g_serv_bad;
 }
 
 bool out_servable(uint64_t addr, uint64_t size) {

@@ -228,6 +228,8 @@ int final_retry(uint64_t addr, ULONG_PTR kind, uint64_t generation) {
 
 // One page of a region becomes writable and counts as written. True when the page is ours to handle (the faulting write may retry).
 // The caller holds the region's lock shared.
+std::atomic<uint64_t> g_clear_epoch{0};   // clear_epoch(): moves after any valid / armed bit is cleared
+
 bool release_page(Region* r, uint64_t page) {
     const uint64_t b = bit(page);
     const uint64_t w = page >> 6;
@@ -238,6 +240,7 @@ bool release_page(Region* r, uint64_t page) {
     if (armed) rel.fetch_add(1, std::memory_order_seq_cst);
     const uint64_t old = r->prot[w].fetch_and(~b, std::memory_order_acq_rel);
     r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
+    g_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
     r->written[w].fetch_or(b, std::memory_order_acq_rel);
     const uint64_t addr = r->base + page * kPage;
     if (old & b) {
@@ -537,6 +540,7 @@ void region_destroy(Region* r) {
         while (q < r->npages && held(q)) ++q;
         set_bits(g_retired, (r->base - kHeapBase) / kPage + p, q - p, true);
         set_bits(r->prot.get(), p, q - p, false);
+        g_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
         set_bits(r->guard.get(), p, q - p, false);
         DWORD was = 0;
         VirtualProtect(reinterpret_cast<void*>(r->base + p * kPage), static_cast<SIZE_T>((q - p) * kPage), PAGE_READWRITE, &was);
@@ -628,6 +632,7 @@ bool arm(Region* r, uint64_t first, uint64_t count) {
     if (!VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(n), PAGE_READONLY, &was)) {
         set_bits(r->valid.get(), first, count, false);
         set_bits(r->prot.get(), first, count, false);
+        g_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
         return false;
     }
     g_generation.fetch_add(1, std::memory_order_seq_cst);
@@ -658,6 +663,7 @@ void invalidate(Region* r, uint64_t first, uint64_t count) {
     if (!r || first >= r->npages) return;
     count = std::min(count, r->npages - first);
     if (count) set_bits(r->valid.get(), first, count, false);
+    g_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void set_guard_handler(GuardHandler fn) { g_guard_fn.store(fn, std::memory_order_release); }
@@ -709,6 +715,7 @@ bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const s
 }
 
 uint64_t guard_faults() { return g_guard_faults.load(std::memory_order_relaxed); }
+uint64_t clear_epoch() { return g_clear_epoch.load(std::memory_order_acquire); }
 
 void take_written(Region* r, std::vector<uint64_t>& out) {
     if (!r) return;
@@ -931,6 +938,7 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
         for (uint64_t q = first; q < first + count; ++q)           // armed pages go back to read-write (the caller may then set its own)
             if (test(r->prot.get(), q)) release_page(r, q);
         set_bits(r->valid.get(), first, count, false);
+        g_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
         set_bits(r->written.get(), first, count, true);
     });
 }
