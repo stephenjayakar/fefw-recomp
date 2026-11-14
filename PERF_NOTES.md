@@ -364,7 +364,7 @@ Dagsion crowds and battle maps. Test requests go to `C:/Users/aj12a/tmp/fefw-per
 Goal: GPU time at or under ~14 ms p50 and under 16 ms p99 at 2600 draws per frame (the densest Dagsion street windows), at native
 3840x2160, render ratio 1.0, no upscaler. Test requests go to `C:/Users/aj12a/tmp/fefw-perf/queue/gpu2-<n>/`.
 
-### The 17-18 ms was not GPU work (13 Nov)
+### The 17-18 ms was not GPU work (13 Nov; confirmed by gpu2-1)
 
 With `[nvn] split_submit_ms = 2` the tester's dense windows read "GPU p50 17.0-18.0 ms", next to render-thread work p50 16.6-17.4 ms.
 - gpustats adds up each submission's first-to-last timestamp (top-of-pipe at the start, bottom-of-pipe at the end).
@@ -399,7 +399,7 @@ GPU cost by draw count (gp-m3-set pass profile, 1129 vs 2525 draws, timestamps d
 
 | request | what | result |
 |---|---|---|
-| gpu2-1 | P (best stack + split + stats) and Q (no split): busy vs span at 2600 draws, and the GPU cost of the split parts | queued 13 Nov |
+| gpu2-1 | P (best stack + split + stats) and Q (no split): busy vs span at 2600 draws, and the GPU cost of the split parts | P (w12-g21-P, window 12): at 2439-2636 draws, busy p50 12.38-12.52, p99 14.35-15.12, max 15.71, while the old span reads 17.6-17.75 (5.2-5.6 ms/frame of GPU idle between split parts). Hub at 1750-1890 draws: busy 11.8-12.2 p50 / 14.0-14.7 p99. The split parts cost ~0.1 ms against no-split m5-set (12.25-12.44): noise. Q was not needed. **Target met with ~4 ms to spare; the dense street is render-thread bound.** |
 
 ## CPU track (branch `perf/cpu`)
 
