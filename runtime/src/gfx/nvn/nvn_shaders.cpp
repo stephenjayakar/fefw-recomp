@@ -1386,10 +1386,10 @@ void ShaderCache::order_writer() {
     log_set_thread_name("nvn-order-write");
     std::unique_lock lk(lock_);
     for (;;) {
-        order_cv_.wait_for(lk, std::chrono::seconds(2), [this] { return order_stop_; });
+        order_cv_.wait_for(lk, std::chrono::seconds(2), [this] { return order_stop_.load(); });
         std::string lines;
         lines.swap(order_pending_);
-        const bool stop = order_stop_;
+        const bool stop = order_stop_.load();
         lk.unlock();
         flush_order(lines);
         lk.lock();
@@ -1498,10 +1498,7 @@ ShaderCache::~ShaderCache() {
     }
     pre_cv_.notify_all();
     pack_stop_.store(true);
-    {
-        std::lock_guard lk(lock_);
-        order_stop_ = true;
-    }
+    order_stop_.store(true);                         // without lock_: at process exit its owner may be gone (the writer wakes within 2 s anyway)
     order_cv_.notify_all();
     if (order_thread_.joinable()) order_thread_.join();
     for (std::thread& t : pre_threads_)

@@ -354,7 +354,7 @@ private:
     int spv_bytes_col_ = -1;                                           // column index of "spv_bytes" (-1: none; every line counts as packable)
     std::thread order_thread_;
     std::condition_variable order_cv_;
-    bool order_stop_ = false;                                          // (lock_)
+    std::atomic<bool> order_stop_{false};                              // no lock: the destructor may run after the writer was killed
     // what the game's own loads (find -> load) cost, by source (preloaded words / the pack / separate .spv files)
     std::atomic<uint64_t> ld_count_{0}, ld_pre_{0}, ld_pack_{0}, ld_pack_mem_{0}, ld_files_{0}, ld_us_{0}, ld_worst_us_{0}, ld_files_us_{0};
     std::atomic<uint64_t> ld_logged_ms_{0}, ld_logged_count_{0};
