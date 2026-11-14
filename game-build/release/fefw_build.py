@@ -404,6 +404,17 @@ def free_memory():
         return None
 
 
+def pgo_gen_skip(src):
+    """--pgo-gen: units built without instrumentation. clang's instrumented compile of the unit holding the lifted original of the
+    game's zstd decoder (the NX_ORIG fallback of nx_hle_zstd_multiframe, one huge function) ran for over 45 CPU-minutes without
+    finishing (perf/codegen, 13 Nov); that code runs only when the native decoder declines, so it needs no profile."""
+    try:
+        with open(src, encoding='utf-8', errors='replace') as f:
+            return 'nx_hle_zstd_multiframe' in f.read()
+    except OSError:
+        return False
+
+
 def compile_all(runner, gen, obj, jobs, env, variant):
     units = []
     for name, _, _, _, shards in MODULES:
@@ -428,6 +439,8 @@ def compile_all(runner, gen, obj, jobs, env, variant):
         name, src, o = t
         tmp = o + '.tmp'
         cmd = [ZIG, 'c++'] + cxxflags(variant) + ['-I', os.path.join(RECOMP, 'include'), '-I', os.path.dirname(src), '-c', src, '-o', tmp]
+        if PGO['gen'] and pgo_gen_skip(src):     # see pgo_gen_skip
+            cmd = [x for x in cmd if x not in ('-fprofile-generate',)]
         rc, tail = runner.run(cmd, env=env)
         if rc != 0:
             return 'Compiling %s/%s failed (exit %d):\n%s' % (name, os.path.basename(src), rc, tail)
