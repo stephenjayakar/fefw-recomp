@@ -195,7 +195,10 @@ bool g_mask_ready = false, g_mask_ok = false;
 // new pass and anything that binds other pipelines sets them all (a new command buffer has no dynamic state, a new pass has other
 // formats and extents).
 enum : uint32_t {
-    kPipe = 1, kDesc = 2, kVb = 4, kDynVp = 8, kDynRaster = 16, kDynDepth = 32, kDynStencil = 64, kDynBias = 128, kDynBlend = 256, kAllDirty = 0x1ff
+    // kDescBuf: a buffer binding (or push constants) changed; kDescTex: a texture, image or pool binding changed. kDesc = either (every
+    // other cause marks both). Only bind_sets tells them apart (texture sets left bound, [nvn] tex_set_skip).
+    kPipe = 1, kDescBuf = 2, kVb = 4, kDynVp = 8, kDynRaster = 16, kDynDepth = 32, kDynStencil = 64, kDynBias = 128, kDynBlend = 256, kDescTex = 512,
+    kDesc = kDescBuf | kDescTex, kAllDirty = 0x3ff
 };
 uint32_t g_dirty = kAllDirty;
 // A command may write [addr, addr + size) of pool memory: device-local copies of those pages are stale, and bindings that point at them are
@@ -352,7 +355,7 @@ enum RsZone : int { kRsHead, kRsPrep, kRsFb, kRsPass, kRsPipe, kRsDyn, kRsSets, 
 struct RStats {
     uint64_t cyc[kRsN] = {};
     uint64_t draws = 0, draws_desc = 0, draws_pipe = 0, sets = 0, set_hits = 0, set_writes = 0, res_tex = 0, res_img = 0, res_memo = 0;
-    uint64_t binds = 0, binds_same = 0, layouts = 0, keys = 0, dispatches = 0;
+    uint64_t binds = 0, binds_same = 0, layouts = 0, keys = 0, dispatches = 0, sets_skipped = 0;
     uint64_t miss_first = 0, miss_uboofs = 0, miss_ubo = 0, miss_tex = 0, miss_other = 0;   // set cache misses by what differs from the last set of that layout
 };
 RStats g_rs;
@@ -411,14 +414,14 @@ void rs_report() {
     const double pf = 1.0 / frames;
     NXLOG_I("nvn.rstats", "%.0f frames: replay %.2f ms/frame = draw setup %.2f + call %.2f + out %.2f + dispatch %.2f + rest %.2f | %.0f draws/frame "
             "(%.0f desc, %.0f pipe, %.0f layouts, %.0f keys), %.0f dispatches | per draw us: head %.2f prep %.2f fb %.2f pass %.2f pipe %.2f dyn %.2f "
-            "sets %.2f (alloc+update %.2f) vb %.2f call %.2f out %.2f | sets/frame %.0f (%.1f%% cached, %.0f writes) | resolves/frame tex %.0f img %.0f (memo %.0f) | "
+            "sets %.2f (alloc+update %.2f) vb %.2f call %.2f out %.2f | sets/frame %.0f (%.1f%% cached, %.0f writes, %.0f left bound) | resolves/frame tex %.0f img %.0f (memo %.0f) | "
             "binds/frame %.0f (%.1f%% same) | set misses/frame: new layout or submission %.0f, only uniform offsets %.0f, only uniform buffers %.0f, "
             "textures %.0f, other %.0f | pool looks/frame %.1f, full scans/frame %.2f | rt_check %llu checked, %llu mismatches",
             frames, fms(kRsAll), setup, fms(kRsCall), fms(kRsOut), fms(kRsDispatch),
             fms(kRsAll) - setup - fms(kRsCall) - fms(kRsOut) - fms(kRsDispatch), s.draws * pf, s.draws_desc * pf, s.draws_pipe * pf, s.layouts * pf,
             s.keys * pf, s.dispatches * pf, dus(kRsHead), dus(kRsPrep), dus(kRsFb), dus(kRsPass), dus(kRsPipe), dus(kRsDyn), dus(kRsSets), dus(kRsAlloc), dus(kRsVb),
             dus(kRsCall), dus(kRsOut), s.sets * pf, s.sets ? 100.0 * static_cast<double>(s.set_hits) / static_cast<double>(s.sets) : 0.0,
-            s.set_writes * pf, s.res_tex * pf, s.res_img * pf, s.res_memo * pf, s.binds * pf,
+            s.set_writes * pf, s.sets_skipped * pf, s.res_tex * pf, s.res_img * pf, s.res_memo * pf, s.binds * pf,
             s.binds ? 100.0 * static_cast<double>(s.binds_same) / static_cast<double>(s.binds) : 0.0, s.miss_first * pf, s.miss_uboofs * pf,
             s.miss_ubo * pf, s.miss_tex * pf, s.miss_other * pf, static_cast<double>(looks - last_looks) * pf, static_cast<double>(scans - last_scans) * pf,
             static_cast<unsigned long long>(g_chk_n), static_cast<unsigned long long>(g_chk_bad));
@@ -2457,14 +2460,83 @@ void support_for_draw(const ProgLayout& pl, bool compute) {
     g_draw_support = u;
 }
 
+// [nvn] tex_set_skip (default on): a draw whose texture inputs did not change since the last draw bound its sets (same layout, same command
+// buffer, no texture / image / pool bind, nothing that marks everything dirty: a pass end, an upload or layout change, a dispatch, a clear
+// drawn with its own pipeline, a new command buffer; the pools' registration versions the same) leaves the sets bound that hold only plain
+// bound textures (SamplerBinding combined image samplers: no buffer, no handle read from a uniform block, no side effect in build_set). Set 0
+// (buffers) is built and pushed as before. Most street draws change only uniform buffers between draws of the same material.
+// [nvn] rt_check builds the skipped sets anyway and checks that the content cache gives the very set that is bound.
+struct LastGfxSets {
+    bool valid = false;
+    const ProgLayout* pl = nullptr;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    TexturePool* tp = nullptr;
+    SamplerPool* sp = nullptr;
+    uint64_t tv = 0, sv = 0;
+    VkDescriptorSet ds[kPoolSet + 1] = {};
+};
+LastGfxSets g_last_gfx;
+struct SkipMaskSlot { const ProgLayout* pl = nullptr; uint32_t mask = 0; };
+SkipMaskSlot g_skip_mask[256];
+bool tex_set_skip_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "tex_set_skip", true);
+    return on;
+}
+uint64_t pool_version(TexturePool* p) {
+    if (!p) return 0;
+    std::shared_lock<std::shared_mutex> lk(p->lock);
+    return p->version;
+}
+uint64_t pool_version(SamplerPool* p) {
+    if (!p) return 0;
+    std::shared_lock<std::shared_mutex> lk(p->lock);
+    return p->version;
+}
+// bit s: set s of the layout holds only SamplerBinding combined image samplers (kPoolSet: the shared pool arrays, which pool_state_moved
+// watches: it marks kDesc when they change)
+uint32_t skippable_sets(const ProgLayout& pl) {
+    SkipMaskSlot& sl = g_skip_mask[(reinterpret_cast<uintptr_t>(&pl) >> 4) & 255];
+    if (sl.pl == &pl) return sl.mask;
+    uint32_t ok = 0, bad = 0;
+    for (const BindingDesc& d : pl.bindings) {
+        if (d.set > kPoolSet) continue;
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        const bool plain = d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b.nvn.source == NvnSource::SamplerBinding;
+        (plain ? ok : bad) |= 1u << d.set;
+    }
+    uint32_t mask = ok & ~bad & ~1u;                 // never set 0 (the buffers)
+    if (pl.has_set[kPoolSet]) mask |= 1u << kPoolSet;
+    sl = {&pl, mask};
+    return mask;
+}
+
 void bind_sets(const ProgLayout& pl, VkPipelineBindPoint bp) {
     VkDescriptorSet ds[kPoolSet + 1] = {};
+    // the texture sets this draw may leave bound (graphics only)
+    uint32_t skip = 0;
+    TexturePool* const tp = S.tpool.get();
+    SamplerPool* const sp = S.spool.get();
+    uint64_t tv = 0, sv = 0;
+    const bool gfx = bp == VK_PIPELINE_BIND_POINT_GRAPHICS && tex_set_skip_on();
+    if (gfx) {
+        tv = pool_version(tp);
+        sv = pool_version(sp);
+        if (g_last_gfx.valid && !(g_dirty & kDescTex) && g_last_gfx.pl == &pl && g_last_gfx.cb == F->cb && g_last_gfx.tp == tp && g_last_gfx.sp == sp &&
+            g_last_gfx.tv == tv && g_last_gfx.sv == sv && g_fb_use.empty() && g_vol3d_use.empty() && !g_su_tex && !g_fb_seen)
+            skip = skippable_sets(pl);
+    }
     if (g_push_stack.size() <= g_bind_depth) g_push_stack.push_back(std::make_unique<PushSet0>());
     PushSet0& push0 = *g_push_stack[g_bind_depth];
     struct Depth { Depth() { ++g_bind_depth; } ~Depth() { --g_bind_depth; } } depth;
     push0.ready = false;
     for (uint32_t set = 0; set < 4; ++set) {
         if (!pl.has_set[set]) continue;
+        if (skip & (1u << set)) {
+            ++g_rs.sets_skipped;
+            if (rt_check()) chk(build_set(pl, set) == g_last_gfx.ds[set], "tex set skip");
+            ds[set] = VK_NULL_HANDLE;                // still bound from the last draw
+            continue;
+        }
         g_push0.ready = false;
         ds[set] = build_set(pl, set);
         if (set == 0 && g_push0.ready) {      // swapped, not copied: the writes keep pointing into their own buffer infos
@@ -2474,7 +2546,29 @@ void bind_sets(const ProgLayout& pl, VkPipelineBindPoint bp) {
             g_push0.ready = false;
         }
     }
-    if (pl.has_set[kPoolSet]) ds[kPoolSet] = pool_set(S.tpool.get(), S.spool.get(), *F);   // the texture and sampler pools as arrays (nvn_pipeline.cpp)
+    if (pl.has_set[kPoolSet] && (skip & (1u << kPoolSet))) {
+        ++g_rs.sets_skipped;
+        if (rt_check()) chk(pool_set(S.tpool.get(), S.spool.get(), *F) == g_last_gfx.ds[kPoolSet], "pool set skip");
+    } else if (pl.has_set[kPoolSet]) {
+        ds[kPoolSet] = pool_set(S.tpool.get(), S.spool.get(), *F);   // the texture and sampler pools as arrays (nvn_pipeline.cpp)
+    }
+    if (skip && F->cb != g_last_gfx.cb) {   // defensive: the command buffer changed while the sets were built: bind every set in the new one
+        for (uint32_t set = 0; set < 4; ++set)
+            if ((skip & (1u << set)) && pl.has_set[set]) ds[set] = build_set(pl, set);
+        if (pl.has_set[kPoolSet] && (skip & (1u << kPoolSet))) ds[kPoolSet] = pool_set(S.tpool.get(), S.spool.get(), *F);
+        skip = 0;
+    }
+    if (gfx) {
+        for (uint32_t i = 0; i <= kPoolSet; ++i)
+            if (!(skip & (1u << i))) g_last_gfx.ds[i] = ds[i];
+        g_last_gfx.valid = true;
+        g_last_gfx.pl = &pl;
+        g_last_gfx.cb = F->cb;
+        g_last_gfx.tp = tp;
+        g_last_gfx.sp = sp;
+        g_last_gfx.tv = tv;
+        g_last_gfx.sv = sv;
+    }
     if (push0.ready && !push0.writes.empty()) {   // a push of no writes is not allowed
         vkCmdPushDescriptorSetKHR(F->cb, bp, pl.layout, 0, static_cast<uint32_t>(push0.writes.size()), push0.writes.data());
         push0.ready = false;
@@ -4543,8 +4637,8 @@ void mark_dirty(const RecordReader& r) {
     }
     switch (r.op()) {
         case Op::BindProgram: g_dirty |= kPipe | kDesc | kVb; break;
-        case Op::BindBuffers: g_dirty |= r.payload<P_BindBuffers>().kind == kBufVertex ? kVb : kDesc; break;
-        case Op::BindTextures: case Op::BindImages: case Op::SetTexturePool: case Op::SetSamplerPool: g_dirty |= kDesc; break;
+        case Op::BindBuffers: g_dirty |= r.payload<P_BindBuffers>().kind == kBufVertex ? kVb : kDescBuf; break;
+        case Op::BindTextures: case Op::BindImages: case Op::SetTexturePool: case Op::SetSamplerPool: g_dirty |= kDescTex; break;
         case Op::BindVertexAttribs: case Op::BindVertexStreams: g_dirty |= kPipe | kVb; break;
         case Op::BindBlend: case Op::BindColor: case Op::BindChannelMask: case Op::BindMultisample: case Op::SetDepthClamp: g_dirty |= kPipe; break;
         case Op::BindPolygon: g_dirty |= kPipe | kDynRaster | kDynBias; break;
@@ -4823,7 +4917,7 @@ void run_list(const CmdList& list, int depth) {
                     std::memcpy(S.push_gfx[p.slot & 7] + off, src, n);
                     g_push_buf[p.slot & 7] = UploadAlloc();
                 }
-                g_dirty |= kDesc;
+                g_dirty |= kDescBuf;   // a buffer binding of set 0 (build_set: NvnSource::PushConstants)
                 break;
             }
             case Op::Dispatch: { RsScope rs(kRsDispatch); ++g_rs.dispatches; const auto& p = r.payload<P_Dispatch>(); do_dispatch(p.x, p.y, p.z, 0); break; }
@@ -5265,6 +5359,8 @@ void replay_shutdown() {
     pipeline_shutdown();
     g_pl = nullptr;                // the layouts are gone with the pipelines
     for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
+    for (SkipMaskSlot& sl : g_skip_mask) sl = SkipMaskSlot();
+    g_last_gfx = LastGfxSets();
     S = GState();
     g_out_all = true;
     raw_binds_reset();
