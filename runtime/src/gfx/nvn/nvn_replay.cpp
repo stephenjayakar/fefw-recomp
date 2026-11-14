@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <intrin.h>
+#include <bit>
 
 #include "nxrt/config.h"
 #include "nxrt/frame_limiter.h"
@@ -42,6 +43,7 @@
 #include "extras/fsr1_spatial.h"
 #include "extras/spatial_upscaler.h"
 #include "extras/temporal.h"
+#include "nvn_cmdq.h"
 #include "nvn_pipeline.h"
 #include "nvn_shaders.h"
 
@@ -57,6 +59,8 @@ struct GState {
     const ShaderInfo* stage[6] = {};
     struct Bind { uint64_t addr = 0, size = 0; };
     Bind vtx[16], ubo[6][16], ssbo[6][16], xfb[4];
+    // bit k: slot k is bound (addr != 0); kept by BindBuffers, the only op that writes the slots (out_draw_bindings walks only these)
+    uint32_t vtx_mask = 0, ubo_mask[6] = {}, ssbo_mask[6] = {}, xfb_mask = 0;
     uint64_t tex[6][64] = {};
     uint64_t img[6][16] = {};
     Ref<TexturePool> tpool;
@@ -1652,6 +1656,18 @@ void out_draw_read_slot(OutSlot& m, const GState::Bind& b, bool copy_ok, int why
     out_draw_read(b.addr, b.size, copy_ok, why);
 }
 
+bool out_masks_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "out_masks", true);
+    return on;
+}
+// [nvn] rt_check: the bound-slot masks agree with the slots
+void out_masks_check() {
+    auto mask_of = [](const GState::Bind* b, int n) { uint32_t m = 0; for (int i = 0; i < n; ++i) if (b[i].addr) m |= 1u << i; return m; };
+    bool ok = mask_of(S.vtx, 16) == S.vtx_mask && mask_of(S.xfb, 4) == S.xfb_mask;
+    for (int st = 0; st < 6; ++st) ok = ok && mask_of(S.ubo[st], 16) == S.ubo_mask[st] && mask_of(S.ssbo[st], 16) == S.ssbo_mask[st];
+    chk(ok, "out masks");
+}
+
 // One slot of out_draw_bindings by index (the same order as its full pass).
 void out_check_slot(int idx, uint64_t gen, VkDeviceSize ua) {
     const GState::Bind* b;
@@ -1693,14 +1709,48 @@ void out_draw_bindings() {
             return;
         }
         g_out_unmemo = false;
-        OutSlot* m = g_out_slot;
-        for (const GState::Bind& b : S.vtx) { out_draw_read_slot(*m, b, true, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
-        for (int st = 0; st < kCompute; ++st) {
-            if (!S.stage[st]) { m += 32; continue; }
-            for (const GState::Bind& b : S.ubo[st]) { out_draw_read_slot(*m, b, ua && (b.addr % ua) == 0, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
-            for (const GState::Bind& b : S.ssbo[st]) { out_draw_read_slot(*m, b, true, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+        if (out_masks_on()) {
+            // [nvn] out_masks (default on): only the bound slots (S.*_mask), in the same order; an unbound slot is a no-op in the walk below.
+            // The walk over every slot was ~11 % of the render thread at 2600 draws (most of ~84 slots a draw are unbound).
+            if (rt_check()) out_masks_check();
+            OutSlot* m0 = g_out_slot;
+            for (uint32_t mk = S.vtx_mask; mk; mk &= mk - 1) {
+                const unsigned k = static_cast<unsigned>(std::countr_zero(mk));
+                OutSlot& m = m0[k];
+                out_draw_read_slot(m, S.vtx[k], true, kOutDrawBuffer, gen);
+                g_out_unmemo |= m.gen == ~0ull;
+            }
+            for (int st = 0; st < kCompute; ++st) {
+                if (!S.stage[st]) continue;
+                OutSlot* ms = m0 + 16 + st * 32;
+                for (uint32_t mk = S.ubo_mask[st]; mk; mk &= mk - 1) {
+                    const unsigned k = static_cast<unsigned>(std::countr_zero(mk));
+                    const GState::Bind& b = S.ubo[st][k];
+                    out_draw_read_slot(ms[k], b, ua && (b.addr % ua) == 0, kOutDrawBuffer, gen);
+                    g_out_unmemo |= ms[k].gen == ~0ull;
+                }
+                for (uint32_t mk = S.ssbo_mask[st]; mk; mk &= mk - 1) {
+                    const unsigned k = static_cast<unsigned>(std::countr_zero(mk));
+                    out_draw_read_slot(ms[16 + k], S.ssbo[st][k], true, kOutStorageXfb, gen);
+                    g_out_unmemo |= ms[16 + k].gen == ~0ull;
+                }
+            }
+            OutSlot* mx = m0 + 16 + kCompute * 32;
+            for (uint32_t mk = S.xfb_mask; mk; mk &= mk - 1) {
+                const unsigned k = static_cast<unsigned>(std::countr_zero(mk));
+                out_draw_read_slot(mx[k], S.xfb[k], false, kOutStorageXfb, gen);
+                g_out_unmemo |= mx[k].gen == ~0ull;
+            }
+        } else {
+            OutSlot* m = g_out_slot;
+            for (const GState::Bind& b : S.vtx) { out_draw_read_slot(*m, b, true, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+            for (int st = 0; st < kCompute; ++st) {
+                if (!S.stage[st]) { m += 32; continue; }
+                for (const GState::Bind& b : S.ubo[st]) { out_draw_read_slot(*m, b, ua && (b.addr % ua) == 0, kOutDrawBuffer, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+                for (const GState::Bind& b : S.ssbo[st]) { out_draw_read_slot(*m, b, true, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
+            }
+            for (const GState::Bind& b : S.xfb) { out_draw_read_slot(*m, b, false, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
         }
-        for (const GState::Bind& b : S.xfb) { out_draw_read_slot(*m, b, false, kOutStorageXfb, gen); g_out_unmemo |= b.addr && m->gen == ~0ull; ++m; }
         g_out_all = false;
         g_out_last_gen = out_gen();     // after the pass: a flush in it may have moved the generation
         if (g_out_last_gen != gen) g_out_all = true;
@@ -2669,8 +2719,12 @@ void temporal_for_draw(const ProgLayout& pl) {
     dr.depth_aspect = true;
     VkImageView dv = tex_sampled_view(depth, dr);
     if (!src || !dv) return;
-    VkImageView out = extras::temporal_evaluate(&device(), F->cb, src, dv, tex_sampled_layout(depth), render, VkExtent2D{te.width, te.height},
-                                                S.depth_mode == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
+    VkImageView out;
+    {
+        cmdq::Direct direct;   // DLSS / FSR 2 / Streamline record through their own entry points
+        out = extras::temporal_evaluate(&device(), F->cb, src, dv, tex_sampled_layout(depth), render, VkExtent2D{te.width, te.height},
+                                        S.depth_mode == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
+    }
     g_dirty = kAllDirty;                                                  // the SDKs bind their own compute state
     if (out) {
         g_su_tex = best_r.tex;
@@ -2706,8 +2760,12 @@ void scene_upscale_for_draw(const ProgLayout& pl) {
         tex_transition(r.tex, *F, tex_sampled_layout(r.tex));
         VkImageView src = tex_sampled_view(r.tex, make_request(b, r));
         if (!src) return;
-        VkImageView up = su->upscale(F->cb, src, VkExtent2D{se.width, se.height}, VkExtent2D{se.width, se.height}, VkExtent2D{te.width, te.height}, true,
-                                     extras::scene_upscale_prescale(), extras::upscale_sharpness());
+        VkImageView up;
+        {
+            cmdq::Direct direct;   // the upscalers may record through their SDK's entry points
+            up = su->upscale(F->cb, src, VkExtent2D{se.width, se.height}, VkExtent2D{se.width, se.height}, VkExtent2D{te.width, te.height}, true,
+                             extras::scene_upscale_prescale(), extras::upscale_sharpness());
+        }
         if (up) {
             g_su_tex = r.tex;
             g_su_view = up;
@@ -2803,6 +2861,28 @@ bool depth_ro_for_draw() {
     return !writes_depth && !writes_stencil;
 }
 
+// [nvn] layout_cache (default on): the layouts of recently drawn programs by their stages, direct mapped, without prog_layout's lock and map
+// (~2 % of the render thread: a street frame switches programs ~1100 times). Layouts live until pipeline_shutdown (replay_shutdown clears it).
+struct LayoutCacheSlot { const ShaderInfo* st[6] = {}; const ProgLayout* pl = nullptr; };
+LayoutCacheSlot g_layout_cache[256];
+const ProgLayout* layout_cached(const ShaderInfo* const stages[6]) {
+    static const bool on = nxrt::config_get_bool("nvn", "layout_cache", true);
+    if (!on) return prog_layout(stages);
+    uint64_t h = 0;
+    for (int i = 0; i < 6; ++i) h = (h ^ reinterpret_cast<uint64_t>(stages[i])) * 0x9e3779b97f4a7c15ull;
+    LayoutCacheSlot& sl = g_layout_cache[(h >> 56) & 255];
+    if (sl.pl && std::memcmp(sl.st, stages, sizeof sl.st) == 0) {
+        if (rt_check()) chk(prog_layout(stages) == sl.pl, "layout cache");
+        return sl.pl;
+    }
+    const ProgLayout* pl = prog_layout(stages);
+    if (pl) {
+        std::memcpy(sl.st, stages, sizeof sl.st);
+        sl.pl = pl;
+    }
+    return pl;
+}
+
 bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* topo_out) {
     rs_start();
     const ShaderInfo* vs = S.stage[kVertex];
@@ -2829,7 +2909,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
         // the layout of the same stages as at the last lookup is the same layout (layouts live until pipeline_shutdown): no lock, no map
         static const ShaderInfo* last_stages[6] = {};
         if (!g_pl || std::memcmp(stages, last_stages, sizeof stages) != 0) {
-            g_pl = prog_layout(stages);
+            g_pl = layout_cached(stages);
             std::memcpy(last_stages, stages, sizeof stages);
             ++g_rs.layouts;
         }
@@ -2871,6 +2951,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     rs_mark(kRsPrep);
     if (S.ncolor && fg_hudless_candidate(S.color_tex[0].get(), (S.color.blend_enable_mask & 1u) != 0)) {   // frame generation: the scene before the UI
         end_pass();
+        cmdq::Direct direct;   // frame generation SDKs record through their own entry points
         fg_hudless_capture(*F, S.color_tex[0].get());
     }
     if (g_fb_seen || (g_dirty & (kDesc | kPipe))) feedback_prepare(*pl);
@@ -3827,7 +3908,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
           !cs && !g_cs_missing.empty() ? " missing " : "", !cs ? g_cs_missing.c_str() : "");
     if (!cs) return;
     const ShaderInfo* stages[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, cs};
-    const ProgLayout* pl = prog_layout(stages);
+    const ProgLayout* pl = layout_cached(stages);
     if (!pl) return;
     MemoScope memo(*pl);
     prepare_textures(*pl);
@@ -4511,14 +4592,24 @@ void run_list(const CmdList& list, int depth) {
                 const NVNbufferRange* rg = reinterpret_cast<const NVNbufferRange*>(r.blob<P_BindBuffers>());
                 for (uint32_t i = 0; i < p.count; ++i) {
                     const uint32_t k = p.first + i;
-                    if (p.kind == kBufVertex && k < 16) { S.vtx[k] = {rg[i].address, rg[i].size}; out_slot_changed(static_cast<int>(k)); }
-                    else if (p.kind == kBufUniform && p.stage < 6 && k < 16) {
+                    const uint32_t bit = 1u << (k & 31), on = rg[i].address ? bit : 0u;
+                    if (p.kind == kBufVertex && k < 16) {
+                        S.vtx[k] = {rg[i].address, rg[i].size};
+                        S.vtx_mask = (S.vtx_mask & ~bit) | on;
+                        out_slot_changed(static_cast<int>(k));
+                    } else if (p.kind == kBufUniform && p.stage < 6 && k < 16) {
                         S.ubo[p.stage][k] = {rg[i].address, rg[i].size};
+                        S.ubo_mask[p.stage] = (S.ubo_mask[p.stage] & ~bit) | on;
                         if (p.stage < kCompute) out_slot_changed(16 + static_cast<int>(p.stage) * 32 + static_cast<int>(k));
                     } else if (p.kind == kBufStorage && p.stage < 6 && k < 16) {
                         S.ssbo[p.stage][k] = {rg[i].address, rg[i].size};
+                        S.ssbo_mask[p.stage] = (S.ssbo_mask[p.stage] & ~bit) | on;
                         if (p.stage < kCompute) out_slot_changed(16 + static_cast<int>(p.stage) * 32 + 16 + static_cast<int>(k));
-                    } else if (p.kind == kBufXfb && k < 4) { S.xfb[k] = {rg[i].address, rg[i].size}; out_slot_changed(16 + kCompute * 32 + static_cast<int>(k)); }
+                    } else if (p.kind == kBufXfb && k < 4) {
+                        S.xfb[k] = {rg[i].address, rg[i].size};
+                        S.xfb_mask = (S.xfb_mask & ~bit) | on;
+                        out_slot_changed(16 + kCompute * 32 + static_cast<int>(k));
+                    }
                 }
                 break;
             }
@@ -4866,7 +4957,10 @@ void run_list(const CmdList& list, int depth) {
             case Op::EvaluateDlss:                                                    // the host upscaler (api_dlss_replay.cpp) binds its own compute state
                 end_pass();
                 TRACE("dlss evaluation (the scene is upscaled here; frame generation's inputs)");
-                dlss_replay(*F, r.payload<P_EvaluateDlss>().eval);
+                {
+                    cmdq::Direct direct;   // NGX / Streamline record through their own entry points
+                    dlss_replay(*F, r.payload<P_EvaluateDlss>().eval);
+                }
                 g_dirty = kAllDirty;
                 gstamp("dlss");
                 break;
@@ -5150,6 +5244,7 @@ void replay_shutdown() {
     dlss_replay_shutdown();
     pipeline_shutdown();
     g_pl = nullptr;                // the layouts are gone with the pipelines
+    for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
     S = GState();
     g_out_all = true;
     raw_binds_reset();
