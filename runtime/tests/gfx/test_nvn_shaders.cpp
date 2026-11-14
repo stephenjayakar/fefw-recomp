@@ -343,3 +343,59 @@ NXTEST(preload_pack_round_trip) {
     nxrt::config_set("nvn", "shader_order", "shader_order.txt");
     fs::remove_all(dir.parent_path(), ec);
 }
+
+// [nvn] shader_pack_all (default on): the pack written after the boot preload holds every shader of results.tsv, not only the order file's
+// (10 of 40 here); with the .spv files gone the next cache serves all 40 from it (resident: from memory). The order file gets the shaders
+// the game loads within a few seconds (its own writer thread), not only at a shutdown.
+NXTEST(preload_pack_all_shaders) {
+    if (!shader_cache().is_open()) {
+        nxtest::skip("shader cache not open (no results.tsv in the configured or default folder)");
+        return;
+    }
+    std::string tsv;
+    if (!read_file(fs::path(shader_cache().dir()) / "results.tsv", tsv)) {
+        nxtest::skip("results.tsv unreadable");
+        return;
+    }
+    const fs::path dir = fs::temp_directory_path() / "nxrt_test_pack_all" / "spirv";
+    std::error_code ec;
+    fs::remove_all(dir.parent_path(), ec);
+    fs::create_directories(dir);
+    std::vector<std::string> lines = split(tsv, '\n'), hashes;
+    std::string out_tsv = lines[0] + "\n", order;
+    for (size_t i = 1; i < lines.size() && hashes.size() < 40; i++) {
+        const std::string hash = lines[i].substr(0, lines[i].find('\t'));
+        if (hash.size() != 16 || !fs::copy_file(fs::path(shader_cache().dir()) / (hash + ".spv"), dir / (hash + ".spv"), ec)) continue;
+        hashes.push_back(hash);
+        out_tsv += lines[i] + "\n";
+        if (hashes.size() <= 10) order += hash + "\n";
+    }
+    if (hashes.size() < 40) {
+        nxtest::skip("fewer than 40 .spv files in the shader cache");
+        return;
+    }
+    std::ofstream(dir / "results.tsv", std::ios::binary) << out_tsv;
+    std::ofstream(dir.parent_path() / "order.txt", std::ios::binary) << order;
+    const std::string order_path = (dir.parent_path() / "order.txt").string(), dir_s = dir.generic_string();
+    nxrt::config_set("nvn", "shader_order", order_path.c_str());
+    const fs::path fresh = dir.parent_path() / "spirv.preload.pack.new", pack = dir.parent_path() / "spirv.preload.pack";
+    {
+        ShaderCache c;
+        CHECK(c.open(dir_s));
+        for (int i = 0; i < 600 && !fs::exists(fresh); i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(fs::exists(fresh));
+    for (const std::string& h : hashes) fs::remove(dir / (h + ".spv"));
+    {
+        ShaderCache c;
+        CHECK(c.open(dir_s));
+        CHECK(fs::exists(pack) && !fs::exists(fresh));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));       // the resident read of the pack
+        size_t served = 0;
+        for (const std::string& h : hashes)
+            if (const ShaderInfo* s = c.load_stub(h); s && !s->spirv.empty()) served++;
+        CHECK_EQ(served, hashes.size());
+    }
+    nxrt::config_set("nvn", "shader_order", "shader_order.txt");
+    fs::remove_all(dir.parent_path(), ec);
+}

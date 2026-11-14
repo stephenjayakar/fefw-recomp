@@ -1203,6 +1203,7 @@ void ShaderCache::pack_build(size_t missing) {
     std::unordered_set<std::string> seen;
     std::string raw, comp;
     size_t reused = 0, compressed = 0, skipped = 0;
+    std::string unreadable;                          // -> <pack>.skip: not counted as missing again (no rebuild at every start)
     ZSTD_CCtx* cc = ZSTD_createCCtx();
     for (const std::string& hash : pack_list_) {
         if (!ok || !cc) break;
@@ -1235,6 +1236,8 @@ void ShaderCache::pack_build(size_t missing) {
         } else {
             if (!read_file(dir_ + "/" + hash + ".spv", raw) || raw.empty() || raw.size() % 4 || raw.size() > (64u << 20)) {
                 skipped++;
+                unreadable += hash;
+                unreadable += '\n';
                 continue;
             }
             comp.resize(ZSTD_compressBound(raw.size()));
@@ -1268,6 +1271,10 @@ void ShaderCache::pack_build(size_t missing) {
         DeleteFileW(tmp.c_str());
         if (!pack_stop_.load()) NXLOG_W("nvn", "shader pack: writing preload.pack.new failed (error %lu)", static_cast<unsigned long>(GetLastError()));
         return;
+    }
+    {
+        std::ofstream sk(pack_path(dir_, ".skip"), std::ios::binary | std::ios::trunc);
+        if (sk) sk << unreadable;
     }
     NXLOG_I("nvn", "shader pack: wrote preload.pack.new in %.1f s: %zu shaders (%zu from preload.pack, %zu compressed, %zu skipped), "
                    "%llu MiB of SPIR-V in %llu MiB; it is used from the next start", (now_ms() - t0) / 1000.0, idx.size(), reused, compressed, skipped,
@@ -1348,9 +1355,22 @@ void ShaderCache::start_preload() {
     static const bool pack_all = nxrt::config_get_bool("nvn", "shader_pack_all", true);
     pack_list_ = pre_list_;
     if (pack_all) {
+        std::unordered_set<std::string> unreadable;  // .spv files the last full build could not read (pack_build)
+        {
+            std::string sk;
+            if (read_file(pack_path(dir_, ".skip"), sk)) {
+                size_t p = 0;
+                while (p < sk.size()) {
+                    size_t nl = sk.find('\n', p);
+                    if (nl == std::string::npos) nl = sk.size();
+                    if (nl > p) unreadable.insert(sk.substr(p, nl - p));
+                    p = nl + 1;
+                }
+            }
+        }
         std::vector<std::string> rest;
         for (const auto& [h, ln] : lines_) {
-            if (order_known_.count(h)) continue;
+            if (order_known_.count(h) || unreadable.count(h)) continue;
             if (spv_bytes_col_ >= 0) {
                 const std::string b = column_text(std::string_view(results_.data() + ln.first, ln.second), spv_bytes_col_);
                 if (b.empty() || b == "0") continue;          // not translated: no .spv
