@@ -381,6 +381,7 @@ bool split_submission(Frame& f) {
     if (!g || !f.split_ok || !f.slot || g->frame_batch || g->batch_max > 1 || pool_copy_pending() || !on_render_thread()) return false;
     Slot& s = *static_cast<Slot*>(f.slot);
     if (f.cb != s.cb) return false;
+    nxrt::HitchTimer split_timer(nxrt::kHpRenderSplit);   // the budget's "split submissions" per frame
     VkCommandBuffer next = VK_NULL_HANDLE;     // the buffer for the rest first: without one nothing is split
     if (!s.split_free.empty()) {
         next = s.split_free.back();

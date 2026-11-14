@@ -32,6 +32,7 @@ struct Wrapped {
 };
 
 bool g_log = false;                       // [kernel] thread_log; the wrappers also run (silently) for [kernel] occupancy
+bool g_names = false;                     // [kernel] wait_stats / spin_threads / lock_spin_threads: names go to the kernel (kernel_thread_named)
 std::mutex g_tt_mu;
 std::unordered_map<uint64_t, uint32_t> g_tt_handle;   // ThreadType* -> kernel handle, for SetThreadName
 
@@ -126,7 +127,14 @@ void set_name(Wrapped& w, ::Ctx* c) {
         if (it != g_tt_handle.end()) h = it->second;
     }
     if (h)
-        if (auto t = handle_as<KThread>(h)) occ_name(*t, name.c_str());
+        if (auto t = handle_as<KThread>(h)) {
+            occ_name(*t, name.c_str());
+            if (g_names) {
+                kernel_thread_named(*t, name.c_str());
+                NXLOG_I("threads", "%s is \"%s\": nn prio %d, ideal core %d, core mask 0x%llx%s%s", t->name.c_str(), name.c_str(), t->prio - 28, t->ideal_core,
+                        (unsigned long long)t->core_mask, t->spin_ok ? ", spins before sleeping" : "", t->lock_spin_ok ? ", polls held mutexes" : "");
+            }
+        }
     if (g_log) NXLOG_I("threads", "%s by %s: ThreadType 0x%llx = \"%s\"; caller %s", w.sym + 9, self_name(), (unsigned long long)tt, name.c_str(), where.c_str());
 }
 void name1(::Ctx* c) { set_name(g_name, c); }
@@ -181,6 +189,7 @@ void thread_diag_note_created(uint32_t handle) {
 
 void install_thread_diag() {
     g_log = config_get_bool("kernel", "thread_log", false);
+    g_names = kernel_names_wanted();
     install_occupancy();
     const std::string at = config_get_str("sched", "core_number_at", "");
     if (!at.empty()) {
@@ -188,7 +197,7 @@ void install_thread_diag() {
         g_core_at_ret = _strtoui64(at.c_str(), nullptr, 16);
         g_core_at_val = colon == std::string::npos ? 0 : std::atoi(at.c_str() + colon + 1);
     }
-    if (!g_log && !occupancy_wanted() && !g_core_at_ret) return;
+    if (!g_log && !occupancy_wanted() && !g_core_at_ret && !g_names) return;
     g_create6.fn = create6;
     g_create7.fn = create7;
     g_name.fn = name1;

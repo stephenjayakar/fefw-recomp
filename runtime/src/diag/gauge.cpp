@@ -106,7 +106,7 @@ std::vector<HitchEvent> g_pending;
 // say whether the render thread and the game thread fit in the frame, with percentiles (the hitch line only sees frames over 50 ms).
 // Render thread work = replay - GPU slot waits - lock waits + present - limiter - acquire; its CPU time comes from QueryThreadCycleTime (TSC
 // cycles on the core). Game work = the gap between two presents - the present's back pressure (waiting for the render thread).
-struct RFrame { float dt = 0, work = 0, gpu = 0, idle = 0, lim = 0, kcyc = 0; };
+struct RFrame { float dt = 0, work = 0, gpu = 0, idle = 0, lim = 0, kcyc = 0, sub = 0, split = 0; };
 struct GFrame { float gap = 0, bp = 0, sync = 0, wait = 0, kcyc = 0; };
 constexpr size_t kBRing = 8192;
 std::atomic<bool> g_budget_on{false};
@@ -142,6 +142,8 @@ void hitch_on_frame(uint64_t t, uint64_t prev_t, uint64_t n) {
             f.gpu = (float)(d(kHpRenderGpuWait) + d(kHpRenderAcquire));
             f.idle = (float)d(kHpRenderIdle);
             f.lim = (float)d(kHpRenderLimiter);
+            f.sub = (float)(d(kHpRenderSubmit) + d(kHpRenderPresentEnd));
+            f.split = (float)d(kHpRenderSplit);
             f.kcyc = (float)((double)(cyc - prev_cyc) / 1000.0);
             const uint64_t k = g_rf_n.load(std::memory_order_relaxed);
             g_rf[k % kBRing] = f;
@@ -283,6 +285,12 @@ float pct(std::vector<float>& v, double p) {     // v sorted
     if (v.empty()) return 0;
     return v[std::min(v.size() - 1, (size_t)((double)v.size() * p))];
 }
+std::string pcts2(std::vector<float> v) {     // two decimals: sub-millisecond parts
+    std::sort(v.begin(), v.end());
+    char b[96];
+    snprintf(b, sizeof b, "p50 %.2f p95 %.2f p99 %.2f max %.2f", pct(v, 0.5), pct(v, 0.95), pct(v, 0.99), v.empty() ? 0.0f : v.back());
+    return b;
+}
 std::string pcts(std::vector<float> v) {
     std::sort(v.begin(), v.end());
     char b[96];
@@ -312,10 +320,11 @@ void budget_report() {
     const uint64_t r0 = std::max(g_bud_rf_last, rn > kBRing - 64 ? rn - (kBRing - 64) : 0), g0 = std::max(g_bud_gf_last, gn > kBRing - 64 ? gn - (kBRing - 64) : 0);
     g_bud_rf_last = rn, g_bud_gf_last = gn;
     if (!(tpm > 0) || rn <= r0) return;
-    std::vector<float> dt, work, cpu, gpu, idle, lim;
+    std::vector<float> dt, work, cpu, gpu, idle, lim, sub, split;
     for (uint64_t i = r0; i < rn; i++) {
         const RFrame& f = g_rf[i % kBRing];
         dt.push_back(f.dt), work.push_back(f.work), gpu.push_back(f.gpu), idle.push_back(f.idle), lim.push_back(f.lim);
+        sub.push_back(f.sub), split.push_back(f.split);
         cpu.push_back((float)((double)f.kcyc * 1000.0 / tpm));
     }
     std::vector<float> gap, gwork, gcpu, gwait, gsync;
@@ -359,6 +368,14 @@ void budget_report() {
                 gap.size(), pcts(gap).c_str(), pcts(gwork).c_str(), pcts(gcpu).c_str(), median_of(gwait),
                 [&] { std::vector<float> v = gwait; std::sort(v.begin(), v.end()); return pct(v, 0.99); }(),
                 [&] { std::vector<float> v = gsync; std::sort(v.begin(), v.end()); return pct(v, 0.99); }(), slow, by_game, by_render, by_gpu);
+    if (!gap.empty()) {   // where the game thread's waits go and what the render thread's submissions cost (waits track): a line of its own, so the parsers of
+        // the two lines above see them unchanged
+        std::vector<float> gbp;
+        for (uint64_t i = g0; i < gn; i++) gbp.push_back(g_gf[i % kBRing].bp);
+        NXLOG_I("budget", "waits per present: game thread system-call waits %s; GPU sync waits (all threads) %s; present back pressure %s | render thread per frame: "
+                "queue submits + present submit %s; split submissions %s",
+                pcts2(gwait).c_str(), pcts2(gsync).c_str(), pcts2(gbp).c_str(), pcts2(sub).c_str(), pcts2(split).c_str());
+    }
 }
 
 // CPU time of every thread of the process over the window, grouped by name: who uses the cores (oversubscription, driver threads).

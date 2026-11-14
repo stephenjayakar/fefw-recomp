@@ -36,4 +36,8 @@ void install_occupancy();
 void occ_tag_main(KThread& t);                    // main_thread_adopt
 void occ_main_woken();                            // g_k held: the calling thread wakes main (who main waits for)
 void occ_lock_contended();                        // g_k was busy: takes it, counting the wait
+// The game named thread t (nn::os::SetThreadName; main: "main" when adopted): keeps the name for the wait statistics and applies
+// [kernel] spin_threads / lock_spin_threads (kernel_sync.cpp). Takes g_k.
+void kernel_thread_named(KThread& t, const char* game_name);
+bool kernel_names_wanted();                       // wait_stats or a thread list is set: thread_diag.cpp wraps SetThreadName
 }
