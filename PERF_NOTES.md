@@ -550,3 +550,63 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 | request | what | result |
 |---|---|---|
 | render-1 | out_masks + layout_cache (defaults), replay_threads = 2 A/B, battle, profile | queued |
+
+## Pipeline-stall track (branch `perf/pipe`)
+
+Goal: no first-use stall over ~50 ms (new areas, spells, effects, cutscenes) even with cold pipeline caches. Test requests go to
+`tmp/fefw-perf/queue/pipe-<n>/`; cold-cache runs through `tmp/fefw-perf/pipe/cold_batch.py`.
+
+### Diagnosis: the r1-tbat battle stall (3 frames of 319 / 326 / 453 ms in `dungeon_after`, t = 100-102 s)
+
+It was not a pipeline compile on any frame's critical path:
+- render thread idle 300-433 ms of each frame (replay 5.6-8.1 ms, pipeline creation 0.1-0.3 ms): it had nothing to replay.
+- the game thread was off the CPU: gap 327-459 ms, but on the CPU only 18-37 ms and in guest system calls only 3-4 ms. GPU sync waits 0,
+  present back pressure 0. So it was blocked in host code that is not a guest system call.
+- in those 2 s the game set 45 programs (35 new) and the battle's 32 new pipelines appeared. The GPL side did its job: 116 new shader parts
+  compiled on the background threads (4090 ms of worker time, ~35 ms each, so a cold driver cache), 43 draws deferred for 11 parts, 0 parts
+  built or waited for at the draw, 0 whole pipelines at the draw. Those deferred draws are skipped (pop-in), not stalls.
+- the 32 new keys use 52 distinct shaders; **38 of them were not in `spirv.preload.pack` and not in the order file** (`pipe/keys_vs_pack.py`).
+  `nvnProgramSetShaders` -> `ShaderCache::find` -> `load` -> `read_spv` reads such a shader as a separate `.spv` file **on the game thread**,
+  from `E:/.../shader_cache/spirv` (the slow, 99 % full HDD; the test install points there too). Not in the Windows file cache, each is a
+  directory/MFT/data seek or three: 38 x ~30 ms = ~1.1 s, the length of the three frames. Repeat runs did not stall because the files were then
+  in the file cache (and the keys in the key file), which is also why the user sees it again after a reboot or once the cache is evicted.
+- why the pack lacked them: the pack only holds the order file's shaders (12,088 records, ~3,600 packed), and the order file's new lines were
+  held until 77 had come or until a shutdown, which a closed window never runs. The test install's `shader_order.txt` had not grown since
+  13 Nov 09:45 (1560 lines) through dozens of runs.
+
+Other first-use paths found by reading the code (not seen in the warm logs, but hit with cold caches):
+- compute pipelines: no key file, no parts, built synchronously by the render thread at the first dispatch (`compute_pipeline`).
+- a draw whose key-file pipeline the prewarm is still building, and whose parts are not ready, **waits** for the whole build on the render
+  thread (`prewarm_take`, "prewarm.wait"): after a driver update every recorded key compiles cold at boot.
+- the draw's fast link and its vertex-input / fragment-output parts are made with the pipeline cache, whose lock the saver thread holds while
+  it serialises the whole cache (`vkGetPipelineCacheData`, every 2 s while new pipelines appear, 300+ MB here).
+- "Prepare shaders" (`gpl_prepare`) cannot run for Fortune's Weave: it needs `shader_cache/programs.bin` (vertex/fragment pairs), which the
+  FE setup does not write. Shader parts depend on the pair (shared layout, producer outputs), so a full-corpus parts prepass needs that list
+  first (follow-up: write programs.bin from the BNSH variations at setup).
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| 8c10ac3 | the pack holds every shader of `results.tsv` with SPIR-V (order file's first); the first start that finds it incomplete writes the full `.new` pack in the background (30 s after boot, background I/O priority); used from the next start | `[nvn] shader_pack_all = true` |
+| 8c10ac3 | the pack's frames stay in memory after the boot read (~170 MB for the full pack): a shader load never touches the disk | `[nvn] shader_pack_resident = true` |
+| 8c10ac3 | order file appended every 2 s by its own thread (`nvn-order-write`), never on the game thread | always |
+| 8c10ac3 | instrumentation: `shader loads by the game: ...` line every 10 s (by source), a warning per load over 20 ms, hitch counters `shader_loads`, `shader_file_reads`, `shader_load_ms` | always |
+| 8c10ac3 | compute pipelines built on the pipeline-library threads when the game sets a compute program; the dispatch takes it, waits for one under way, or builds one still queued; `compute pipelines ahead: ...` line | `[nvn] compute_async = prebuild` (`off`, `skip`) |
+| 8c10ac3 | a draw whose prewarm build is under way (not linkable) is skipped while frames flow instead of waiting | `[nvn] prewarm_wait = false` |
+| 8c10ac3 | 2 extra pipeline-library threads that only take urgent jobs (parts a deferred draw needs, compute, bound programs) | `[nvn] gpl_burst_threads = 2` |
+| 8c10ac3 | fast links and vertex-input / fragment-output parts without the pipeline cache (no lock shared with the saver) | `[nvn] gpl_link_cache = false` |
+
+### Cold-cache test (no live files touched)
+
+`pipe/cold_batch.py <plan>` wraps `harness/batch.py`. A plan entry with `"cold": {...}` gets its own empty pipeline cache, key file and order
+file (`C:/Games/fefw-test/cold/<label>/`, via `NXRT_NVN_PIPELINE_CACHE` / `_KEYS` / `NXRT_NVN_SHADER_ORDER`), a fresh `NXRT_NVN_SPIRV_SALT`
+(the NVIDIA disk cache misses too), and, with `"spirv": "fresh"`, a copy of the live shader cache written with unbuffered I/O to
+`E:/BigData/games/fefw-pipe-cold` (its files are not in the Windows file cache, as after a reboot). Equivalent by hand: rename
+`pipeline_cache.bin` / `pipeline_keys.bin` / `shader_order.txt` in the TEST install and restore them afterwards.
+
+### Test log
+
+| request | what | result |
+|---|---|---|
+| pipe-1 | cold A/B (base 9635cb3 vs 8c10ac3, DLL md5 3ca8e769): battle + hub, cold spirv copy, salt, + warm check | queued |
