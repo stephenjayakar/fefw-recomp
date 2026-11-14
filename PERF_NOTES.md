@@ -541,3 +541,31 @@ Per presented frame, from the budget lines (`waits` = main's own system-call wai
   mutex 0.48 s), host wake-up mean 6.9 us (79 % in 5-10 us); Basic workers 14,400 blocks each (9,400 on the job condition variable),
   5.9 us; GFX workers 6,430 each, 7-8 us. Who ended main's blocks there: GFX_Worker0 ~6,100 x 64 us (~0.7 ms/frame), the Basic workers'
   job completions ~1.7-2 ms/frame and mutex hand-overs ~0.65 ms/frame, MOCull_Leader ~0.55 ms/frame (one ~600 us wait), SND_Update ~0.08.
+- **waits-2 (windows 15-16)**, game work p50 street_cold / street_warm (ms), frames >20 ms street_cold / street_warm:
+
+  | run | street_cold | street_warm | >20 ms |
+  |---|---|---|---|
+  | base runs (wt1 x2, wt2 x2, w16) | 15.85-16.17 | 16.50-16.57 | 421-477 / 397-519 |
+  | sj (main + Basic workers, 30 us), 3 runs | 15.12-15.87 | 16.04-16.15 | 360-432 / 345-406 |
+  | sjg (+ GFX_Worker0, MOCull_Leader) | 15.37 | 15.67 | 369 / 359 |
+  | sj60 (60 us) | 15.41 | 15.74 | 426 / 296 |
+  | sj + starvation_lean | 15.59 | 15.83 | 305 / 303 |
+
+  hub_cold swings with the crowds (one base run reached 12.7 ms / 1% low 51.0), so the street numbers are the reliable ones: the
+  spinning takes 0.4-0.8 ms off main's frame work there, the street 1% lows stay at 41-43 (render-bound windows), and frames over
+  20 ms drop 10-35 %. `starvation_lean` cuts the guard from 88 to 24 ms of CPU per second with no fps change; it boosted nothing in any
+  run. 60 us is no better than 30 us. sjg (adding GFX_Worker0 and MOCull_Leader) is the best street run but within noise of sj.
+
+### Where it stands (14 Nov, 01:30)
+
+- Recommended for the live install once perf/waits is merged (ini, `[kernel]`): `spin_us = 30`, `spin_threads =
+  main,Basic_Worker,GFX_Worker0,MOCull_Leader` (or `main,Basic_Worker`), `lock_spin_us = 30`, `lock_spin_threads = main`; `[sched]`
+  `starvation_lean = true`. **Never set `spin_us` on a DLL without `spin_threads`** (b59bc62 and older): it spins every thread, the
+  cpu-1 H loss.
+- What is left of main's waits after that is the game's own job chains (the Basic workers' jobs, MOCull's ~0.6 ms culling job,
+  GFX_Worker0's command building) and, in dense windows, the render thread arriving late at the GPU (fence-age-2 sync waits). Neither is
+  a runtime sync cost any more: host wake-ups are ~6-8 us each and the spinning removes most of main's.
+- Not pursued, with reasons: deeper game/render pipelining (throughput-bound in the windows that set the 1% lows); handing a mutex to
+  a waiter only once it runs ("wake to compete", would save part of the ~0.6 ms/frame of hand-overs but changes the Horizon mutex
+  semantics the SDK relies on, for a gain the lock poll already takes most of); CCX remapping (neutral); the arrival-frame allocator
+  (no runtime memory-service path in it); large pages (above: needs a heap rework and a user privilege; measure DTLB misses first).
