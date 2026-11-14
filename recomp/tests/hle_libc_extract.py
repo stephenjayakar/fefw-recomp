@@ -13,7 +13,7 @@ import re
 import sys
 
 WANT = ['75007bbc80', '750078df20', '750078df00', '750078e1e0', '75007a6c20', '75007bc140', '75007bc240']
-head = re.compile(r'^void f_([0-9a-f]+)\(Ctx \*__restrict c\) \{$')
+head = re.compile(r'^void f_([0-9a-f]+)\(Ctx \*__restrict (?:NX_NOESC )?c\) \{$')
 bodies = {}
 for f in sorted(glob.glob(os.path.join(sys.argv[1], 'c_*.cpp'))):
     lines = open(f, encoding='utf-8').read().split('\n')

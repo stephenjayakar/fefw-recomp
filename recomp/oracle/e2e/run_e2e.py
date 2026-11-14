@@ -47,9 +47,18 @@ def read_x64(prefix, img):
     return regs, mem
 
 
+# Registers the AAPCS64 leaves undefined after a return may differ when the lifter is told to rely on that (NXRECOMP_OPT, nxrecomp/opt.py):
+# 'tregs' keeps x8..x17 in function locals (not written back at returns), 'flags' NZCV. Memory and every other register must match.
+_OPT = set((os.environ.get('NXRECOMP_OPT') or '').split(','))
+ABI_DEAD_X = set(range(8, 18)) if 'tregs' in _OPT else set()
+ABI_DEAD_NZCV = 'flags' in _OPT
+
+
 def compare(uc, regs, mem):
     diffs = []
     for i in range(31):
+        if i in ABI_DEAD_X:
+            continue
         if uc['x'][i] != int(regs['x%d' % i], 16):
             diffs.append('x%d uc=%x x64=%s' % (i, uc['x'][i], regs['x%d' % i]))
     if uc['sp'] != int(regs['sp'], 16):
@@ -57,7 +66,7 @@ def compare(uc, regs, mem):
     for i in range(32):
         if int(uc['v'][i], 16) != int(regs['v%d' % i], 16):
             diffs.append('v%d uc=%s x64=%s' % (i, uc['v'][i], regs['v%d' % i]))
-    if uc['nzcv'] != int(regs['nzcv'], 16):
+    if not ABI_DEAD_NZCV and uc['nzcv'] != int(regs['nzcv'], 16):
         diffs.append('nzcv uc=%x x64=%s' % (uc['nzcv'], regs['nzcv']))
     for name, h in uc['mem'].items():
         if h != mem.get(name):

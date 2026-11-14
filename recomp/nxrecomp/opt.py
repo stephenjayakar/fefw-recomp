@@ -71,8 +71,14 @@ VSET = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); vset\(&c->v\[\1\], 2, 0, t\);')
 VSET_REP = r'c->v[\1] = nx::lane0_w((uint32_t)t);'
 VSTORE_D = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); vset\(&c->v\[\1\], 3, 0, t\);')
 VSTORE_D_REP = r'c->v[\1] = nx::lane0_d((uint64_t)t);'
+# ... and every whole-register write as one 16-byte store (neon.h nx_vst): MOVI's two halves, and `c->v[n] = <V128>` (an aggregate copy
+# that the host compiler may split into two 8-byte stores, which a later 16-byte read can then not forward from).
+VMOVI = re.compile(r'\{ c->v\[(\d+)\]\.d\[0\] = ([^;]+); c->v\[\1\]\.d\[1\] = ([^;]+); \}')
+VMOVI_REP = r'{ nx_vst(&c->v[\1], nx::v_dd(\2, \3)); }'
+VWHOLE = re.compile(r'\bc->v\[(\d+)\] = ([^;]+);')
+VWHOLE_REP = r'nx_vst(&c->v[\1], \2);'
 LABEL = re.compile(r'^(L_\w+): ')
-HEAD = re.compile(r'^(?:__attribute__\(\(section\("[^"]*"\)\)\) )?((?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?)void ([fu])_([0-9a-f]+)\(Ctx \*__restrict c(, uint64_t rp)?\) \{$')
+HEAD = re.compile(r'^(?:__attribute__\(\(section\("[^"]*"\)\)\) )?((?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?)void ([fu])_([0-9a-f]+)\(Ctx \*__restrict (?:NX_NOESC )?c(, uint64_t rp)?\) \{$')
 
 
 class Skip(Exception):
@@ -120,6 +126,7 @@ class Func:
         if vstore:
             for nd in nodes:
                 nd[1] = VSTORE_D.sub(VSTORE_D_REP, VSTORE.sub(VSTORE_REP, VSET.sub(VSET_REP, nd[1])))
+                nd[1] = VWHOLE.sub(VWHOLE_REP, VMOVI.sub(VMOVI_REP, nd[1]))
         self.nodes = nodes
         self.index = {lab: k for k, (lab, _, _) in enumerate(nodes) if lab}
         self.toks = [[m for m in TOK.finditer(t) if (vregs or m.lastgroup not in ('va', 'vw', 'vr', 'vsync')) and (xregs or m.lastgroup not in ('xa', 'xw', 'xr'))] for _, t, _ in nodes]
@@ -414,6 +421,47 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True, vstore=
     out.append('}')
     info = {'flag_entry': flag_entry, 'flag_after_call': flag_after_call, 'safe_flags': safe_flags, 'x': len(xs), 'v': len(vs)}
     return '\n'.join(out), info
+
+
+TREG = re.compile(r'c->x\[(8|9|1[0-7])\]')
+TREG_CALL = re.compile(r'(\b(?:f_[0-9a-f]+|h_\w+)\(c\);|\bcall_indirect\(c, [^;]*\);|\bhost_import\(c, NX_IMPORT_ID\(\d+, \d+\)\);)')
+TREG_SYNC = re.compile(r'(\bguest_svc\(c, [^;]*?\);|\bnx_site_inline\(c, 0x[0-9a-f]+ULL\);)')
+TREG_MID = re.compile(r'\bif \(nx_site_midhook\(c, (0x[0-9a-f]+ULL)\)\) return;')
+
+
+def temps_local(text):
+    """'tregs' (perf/codegen2): x8..x17 in function locals that never meet the context at a call or a return.
+
+    AAPCS64: x9..x15 are temporaries, x16/x17 the intra-procedure-call scratch registers and x8 the indirect result register; none of
+    them carries a value into a callee except x8 (the address of a large result), none is preserved by a callee, and none is a
+    result. So a value the function leaves in them at a return, or in x9..x17 at a call, is dead in every ABI-conforming program, and
+    the stores the plain output makes there (the bulk of the remaining context stores in hot code) are dropped. The locals start from
+    the context (a function that reads one before writing it still sees the caller's value), x8 is stored before each call and read
+    back after it (it may be an argument), and at an SVC or a site callout every one of them is synced both ways. After a call the
+    locals keep their values (the callee may not rely on or return anything in them). Runs on optimize()'s output of a function it did
+    not skip (no unknown helper that takes the context)."""
+    lines = text.split('\n')
+    m = HEAD.match(lines[0])
+    if not m or lines[-1] != '}':
+        return text, 0
+    body = '\n'.join(lines[1:-1])
+    used = sorted({int(n) for n in TREG.findall(body)})
+    if not used:
+        return text, 0
+    st = ' '.join('c->x[%d] = gx%d;' % (r, r) for r in used)
+    ld = ' '.join('gx%d = c->x[%d];' % (r, r) for r in used)
+    body = TREG.sub(lambda mt: 'gx' + mt.group(1), body)
+    if 8 in used:
+        body = TREG_CALL.sub(lambda mt: '{ c->x[8] = gx8; %s gx8 = c->x[8]; }' % mt.group(1), body)
+    body = TREG_SYNC.sub(lambda mt: '{ %s %s %s }' % (st, mt.group(1), ld), body)
+    body = TREG_MID.sub(lambda mt: '%s if (nx_site_midhook(c, %s)) return; %s' % (st, mt.group(1), ld), body)
+    blines = body.split('\n')
+    # the declaration goes after the leading `c->fn = ...;` / entry hook lines (they run before any register is read)
+    k = 0
+    while k < len(blines) and (blines[k].startswith('  c->fn = ') or blines[k].startswith('  if (nx_hook_entry(c, ')):
+        k += 1
+    decl = '  uint64_t ' + ', '.join('gx%d = c->x[%d]' % (r, r) for r in used) + ';'
+    return '\n'.join([lines[0]] + blines[:k] + [decl] + blines[k:] + ['}']), len(used)
 
 
 def optimize_shard(src, flags_abi=True, stats=None, vregs=True, keep_cs=True, xregs=True, vstore=False):

@@ -86,8 +86,12 @@ CPU_VARIANTS = {
 # The bundled zig c++ turns -O1, -O2 and -O3 alike into clang -O2 (plus loop and SLP vectorisation; `zig c++ -###` shows it). -g0: no
 # debug info (zig adds CodeView by default; nothing reads it, and the compile is faster without). -fomit-frame-pointer: one more host
 # register for the lifted code (zig keeps RBP frames by default); host unwinding uses the .pdata tables, not frame pointers.
+# NX_NOESCAPE_CTX + the capture-tracking limit (perf/codegen2): the context pointer is `noescape` at every call (recomp ctx.h NX_NOESC), and
+# LLVM follows its thousands of uses instead of giving up after 100, so guest loads and stores no longer force the context registers
+# in use to be reloaded (hot code: -20 % context loads, -17 % context stores, -4 % instructions; a cold unit: -11 % instructions).
 CXXFLAGS_COMMON = ['-std=c++20', '-O1', '-g0', '-fomit-frame-pointer', '-w', '-fno-exceptions', '-fno-rtti', '-fno-strict-aliasing', '-ffp-contract=off', '-fno-math-errno',
-                   '-fno-threadsafe-statics', '-DNX_INLINE_INDIRECT']
+                   '-fno-threadsafe-statics', '-DNX_INLINE_INDIRECT',
+                   '-DNX_NOESCAPE_CTX', '-mllvm', '-capture-tracking-max-uses-to-explore=100000']
 
 
 # Profile-guided builds (developer option, perf/codegen): --pgo-gen <profile runtime .a> builds an instrumented fefw.exe (IR PGO; its

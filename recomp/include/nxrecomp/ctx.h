@@ -28,6 +28,20 @@
 #include <string.h>
 #include <math.h>
 
+/* NX_NOESC marks the context parameter of every function the lifted code calls (the lifted functions themselves, call_indirect, host_import,
+ * the SVC and site entries): the callee uses the context only for the duration of the call and keeps no pointer to it, and guest memory never
+ * lies inside a Ctx. With it the host compiler (clang: `noescape` = LLVM `captures(none)`) knows that no guest load or store can touch the
+ * context, so a register value read from or written to `c->x[n]` before a guest memory access is still valid after it (otherwise every guest
+ * store forces the context registers in use to be reloaded). Only the lifted code defines NX_NOESCAPE_CTX (fefw_build.py, NxRecomp.cmake); the
+ * runtime's definitions of the same functions are built without it (the attribute is part of the function type in clang, and the lifted code
+ * and the runtime are separate units, so the two never meet). Needs `-mllvm -capture-tracking-max-uses-to-explore=<large>` to pay off in big
+ * functions: LLVM gives up proving a pointer uncaptured after 100 uses, and the context has thousands. */
+#if defined(NX_NOESCAPE_CTX) && defined(__clang__)
+#define NX_NOESC __attribute__((noescape))
+#else
+#define NX_NOESC
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -64,7 +78,7 @@ typedef struct Ctx {
 
 /* Indirect call or tail call to a guest address (BLR, BR out of a function, an unresolved jump table).
  * Looks the address up in the function tables of every loaded module. */
-void call_indirect(Ctx *c, uint64_t addr);
+void call_indirect(Ctx *NX_NOESC c, uint64_t addr);
 /* A call to a symbol another module provides (a PLT stub whose target is undefined in this module). `import_id` is globally
  * unique: NX_IMPORT_ID(module index, symbol index). The module index is NxModule.index of the calling module (the order of
  * the game config's module list, or --index of `nxrecomp lift`); the symbol index is the position in that module's
@@ -73,24 +87,24 @@ void call_indirect(Ctx *c, uint64_t addr);
 #define NX_IMPORT_ID(module_index, sym) (((uint32_t)(module_index) << 20) | (uint32_t)(sym))
 #define NX_IMPORT_MODULE(id) ((uint32_t)(id) >> 20)
 #define NX_IMPORT_SYM(id) ((uint32_t)(id) & 0xfffffu)
-void host_import(Ctx *c, uint32_t import_id);
+void host_import(Ctx *NX_NOESC c, uint32_t import_id);
 /* Raised by the generated code for: an undefined / reserved instruction word, BRK, falling off the end of a function. */
 void guest_trap(const char *what, uint64_t addr);
 /* An instruction the lifter could not translate (a gap in coverage, listed by `cover`). */
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what);
-void guest_svc(Ctx *c, uint32_t number);
+void guest_svc(Ctx *NX_NOESC c, uint32_t number);
 /* System registers the lifter does not model inline (anything but TPIDR_EL0, TPIDRRO_EL0, FPCR, FPSR, NZCV, DCZID, CTR,
  * CNTVCT/CNTFRQ). `sysreg` is bits 20:5 of the MRS/MSR word (o0:op1:CRn:CRm:op2). */
-uint64_t guest_mrs(Ctx *c, uint32_t sysreg);
-void guest_msr(Ctx *c, uint32_t sysreg, uint64_t value);
+uint64_t guest_mrs(Ctx *NX_NOESC c, uint32_t sysreg);
+void guest_msr(Ctx *NX_NOESC c, uint32_t sysreg, uint64_t value);
 /* Sites compiled in by the lifter from a site list (nxrecomp/program.py load_sites): a callout before an instruction, a
  * function hook at a function's start, a hook at a mid-function address. A hook returns nonzero when it has done the
  * function's work (the lifted function then returns at once). */
-void nx_site_inline(Ctx *c, uint64_t addr);
-int nx_site_midhook(Ctx *c, uint64_t addr);
-int nx_hook_entry(Ctx *c, uint64_t addr);
+void nx_site_inline(Ctx *NX_NOESC c, uint64_t addr);
+int nx_site_midhook(Ctx *NX_NOESC c, uint64_t addr);
+int nx_hook_entry(Ctx *NX_NOESC c, uint64_t addr);
 /* Diagnostics of a failed STXR (bits < 0: the monitor was not open on that address). May be a no-op. */
-void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);
+void stx_diag(Ctx *NX_NOESC c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);
 
 /* One lifted function of a module and its guest address. */
 typedef struct { uint64_t addr; void (*fn)(Ctx *); } FnEntry;
@@ -104,7 +118,7 @@ typedef struct { uint64_t pad; void (*fn)(Ctx *, uint64_t); } NxResume;
 /* C++ exception support. A lifted function that contains a catch clause whose handler can return is entered as
  * nx_catch_call(c, u_<entry>): the runtime runs body(c, 0) under a host frame it can unwind back to, and on an exception
  * that this function catches, calls body(c, landing pad) there instead. (ssbu-recomp's nro_catch_call.) */
-void nx_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t));
+void nx_catch_call(Ctx *NX_NOESC c, void (*body)(Ctx *, uint64_t));
 
 /* Unwind tables (from .eh_frame and the C++ LSDAs, see nxrecomp/eh.py and ehtables.py). All arrays are sorted by address.
  * Row: from `pc` (inclusive) to the next row of the same FDE, the CFA is x[cfa_reg] + cfa_off (cfa_reg 29 = FP, 31 = SP)

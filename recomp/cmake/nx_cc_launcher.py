@@ -20,7 +20,7 @@ import time
 
 TIME_LIMIT = float(os.environ.get('NX_TIME_LIMIT', '180'))
 OPTNONE_LINES = int(os.environ.get('NX_OPTNONE_LINES', '20000'))
-DEF = re.compile(r'^(?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?void ([fu]_[0-9a-f]+)\((Ctx \*__restrict c(?:, uint64_t rp)?)\) \{$')
+DEF = re.compile(r'^(?:NX_OPTNONE |__attribute__\(\(noinline\)\) )?void ([fu]_[0-9a-f]+)\((Ctx \*__restrict (?:NX_NOESC )?c(?:, uint64_t rp)?)\) \{$')
 
 
 def function_sizes(path):

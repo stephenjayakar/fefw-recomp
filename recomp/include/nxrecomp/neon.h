@@ -15,22 +15,32 @@
 #define NX_HOT static inline __attribute__((always_inline))
 #define NX_SLOW static __attribute__((noinline, cold))
 
+/* Lane access through whole-register (16-byte) loads and stores: a lane written in place would be a 1..8-byte store that a later
+ * 16-byte load of the same register can neither take from the store buffer (a store-forwarding stall on the host) nor see through
+ * in the compiler (the register goes through memory). As one 16-byte load + insert + 16-byte store, the compiler keeps the register
+ * in an XMM register across lane writes, and whole-register reads after them forward. */
+typedef uint8_t nx_vu8 __attribute__((vector_size(16)));
+typedef uint16_t nx_vu16 __attribute__((vector_size(16)));
+typedef uint32_t nx_vu32 __attribute__((vector_size(16)));
+typedef uint64_t nx_vu64 __attribute__((vector_size(16)));
 static inline uint64_t vget(const V128 *v, int sz, int i) {
     switch (sz) {
-    case 0: return v->b[i];
-    case 1: return v->h[i];
-    case 2: return v->w[i];
-    default: return v->d[i];
+    case 0: { nx_vu8 t; memcpy(&t, v, 16); return t[i]; }
+    case 1: { nx_vu16 t; memcpy(&t, v, 16); return t[i]; }
+    case 2: { nx_vu32 t; memcpy(&t, v, 16); return t[i]; }
+    default: { nx_vu64 t; memcpy(&t, v, 16); return t[i]; }
     }
 }
 static inline void vset(V128 *v, int sz, int i, uint64_t x) {
     switch (sz) {
-    case 0: v->b[i] = (uint8_t)x; break;
-    case 1: v->h[i] = (uint16_t)x; break;
-    case 2: v->w[i] = (uint32_t)x; break;
-    default: v->d[i] = x; break;
+    case 0: { nx_vu8 t; memcpy(&t, v, 16); t[i] = (uint8_t)x; memcpy(v, &t, 16); break; }
+    case 1: { nx_vu16 t; memcpy(&t, v, 16); t[i] = (uint16_t)x; memcpy(v, &t, 16); break; }
+    case 2: { nx_vu32 t; memcpy(&t, v, 16); t[i] = (uint32_t)x; memcpy(v, &t, 16); break; }
+    default: { nx_vu64 t; memcpy(&t, v, 16); t[i] = x; memcpy(v, &t, 16); break; }
     }
 }
+/* A whole register as one 16-byte store. */
+static inline void nx_vst(V128 *d, V128 r) { nx_vu64 t; memcpy(&t, &r, 16); memcpy(d, &t, 16); }
 static inline int64_t vsext(uint64_t x, int sz) {
     switch (sz) {
     case 0: return (int8_t)x;
@@ -98,7 +108,7 @@ NX_SLOW void v_f3v_ref(V128 *d, const V128 *pn, const V128 *pm, int op, int dbl,
             for (int i = 0; i < n / 2; i++) r.f[i] = fp_add32(a.f[2 * i], a.f[2 * i + 1]);
             for (int i = 0; i < n / 2; i++) r.f[n / 2 + i] = fp_add32(b.f[2 * i], b.f[2 * i + 1]);
         }
-        *d = r;
+        nx_vst(d, r);
         return;
     }
     for (int i = 0; i < n; i++) {
@@ -113,7 +123,7 @@ NX_SLOW void v_f3v_ref(V128 *d, const V128 *pn, const V128 *pm, int op, int dbl,
             if (is_mask) r.w[i] = m; else r.f[i] = v;
         }
     }
-    *d = r;
+    nx_vst(d, r);
 }
 /* Same, with the second operand taken from one element of vm. */
 NX_SLOW void v_f3e_ref(V128 *d, const V128 *pn, const V128 *pm, int idx, int op, int dbl, int n) {
@@ -246,7 +256,7 @@ NX_SLOW void v_f1v_ref(V128 *d, const V128 *pn, int op, int dbl, int n) {
             }
         }
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 NX_HOT void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
@@ -281,7 +291,7 @@ static inline void v_frint(V128 *d, const V128 *pn, int mode, int dbl, int n) {
         if (dbl) r.df[i] = fp_frint64(a.df[i], mode);
         else r.f[i] = fp_frint32(a.f[i], mode);
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* FMAXV / FMINV / FMAXNMV / FMINNMV across the four single lanes. Arm's Reduce is a tree, (lane0 op lane1) op
@@ -290,8 +300,8 @@ static inline void v_fred32(V128 *d, const V128 *pn, int is_min, int num) {
     uint32_t lo = fp_maxmin32_bits(pn->w[0], pn->w[1], is_min, num);
     uint32_t hi = fp_maxmin32_bits(pn->w[2], pn->w[3], is_min, num);
     uint32_t r = fp_maxmin32_bits(lo, hi, is_min, num);
-    d->d[0] = 0; d->d[1] = 0;
-    d->w[0] = r;
+    V128 t; t.d[0] = r; t.d[1] = 0;
+    nx_vst(d, t);
 }
 
 enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA };
@@ -335,7 +345,7 @@ static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz
         }
         vset(&r, sz, i, z);
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* ADDV: the sum of the n elements (size sz) of n, modulo the size, alone in d (the rest zeroed). */
@@ -345,7 +355,7 @@ static inline void v_addv(V128 *d, const V128 *pn, int sz, int n) {
     V128 r;
     r.d[0] = 0; r.d[1] = 0;
     vset(&r, sz, 0, s);
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* SMULL/UMULL, SMLAL/UMLAL, SMLSL/UMLSL (vector and by element). Source elements of size sz from the lower
@@ -363,7 +373,7 @@ static inline void v_mull(V128 *d, const V128 *pn, const V128 *pm, int sz, int u
         vset(&r, rs, i, z);
     }
     if (!acc) { V128 t; t.d[0] = 0; t.d[1] = 0; for (int i = 0; i < n; i++) vset(&t, rs, i, vget(&r, rs, i)); r = t; }
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* MUL / MLA / MLS (vector, by element): every element of n times element `elem` of m, modulo the size. */
@@ -375,7 +385,7 @@ static inline void v_mul_elem(V128 *d, const V128 *pn, const V128 *pm, int sz, i
         uint64_t p = vget(&a, sz, i) * y, old = vget(&r, sz, i);
         vset(&out, sz, i, acc == 1 ? old + p : acc == 2 ? old - p : p);
     }
-    *d = out;
+    nx_vst(d, out);
 }
 
 /* saturating narrowing shift right: SQSHRN / SQRSHRN (signed -> signed), UQSHRN / UQRSHRN (unsigned ->
@@ -395,7 +405,7 @@ static inline void v_qshrn(V128 *d, const V128 *pn, int shift, int dsz, int roun
     }
     if (!upper) { r.d[0] = 0; r.d[1] = 0; }
     for (int i = 0; i < n; i++) vset(&r, dsz, (upper ? n : 0) + i, out[i]);
-    *d = r;
+    nx_vst(d, r);
 }
 /* the scalar forms of the same (SQRSHRN h, s, #n ...): element 0 only, the rest of d zeroed. */
 static inline void v_qshrn_s(V128 *d, const V128 *pn, int shift, int dsz, int round, int src_signed, int dst_signed) {
@@ -406,7 +416,7 @@ static inline void v_qshrn_s(V128 *d, const V128 *pn, int shift, int dsz, int ro
     V128 r;
     r.d[0] = 0; r.d[1] = 0;
     vset(&r, dsz, 0, dst_signed ? v_sat_s(v, dsz) : v_sat_u(v, dsz));
-    *d = r;
+    nx_vst(d, r);
 }
 
 enum { I1_NOT, I1_NEG, I1_ABS, I1_CMEQ0, I1_REV64, I1_CNT };
@@ -428,7 +438,7 @@ static inline void v_i1v(V128 *d, const V128 *pn, int op, int sz, int n) {
         }
         vset(&r, sz, i, z);
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* Narrow each element of vn to half size: XTN writes the low half of the destination and zeroes the upper half; XTN2
@@ -437,7 +447,7 @@ static inline void v_xtn(V128 *d, const V128 *pn, int sz, int upper) {
     V128 a = *pn, r;
     if (upper) r = *d; else { r.d[0] = 0; r.d[1] = 0; }
     for (int i = 0; i < (8 >> sz); i++) vset(&r, sz, (upper ? (8 >> sz) : 0) + i, vget(&a, sz + 1, i));
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* BSL / BIT / BIF */
@@ -450,14 +460,14 @@ static inline void v_bitsel(V128 *d, const V128 *pn, const V128 *pm, int kind, i
                :             (x & m) | (n & ~m);             /* bif: insert if false     */
     }
     if (!q) r.d[1] = 0;
-    *d = r;
+    nx_vst(d, r);
 }
 
 static inline void v_dup_ref(V128 *d, uint64_t value, int sz, int n) {
     V128 r;
     r.d[0] = 0; r.d[1] = 0;
     for (int i = 0; i < n; i++) vset(&r, sz, i, value);
-    *d = r;
+    nx_vst(d, r);
 }
 NX_HOT void v_dup(V128 *d, uint64_t value, int sz, int n) {
 #ifdef NX_X86_SIMD
@@ -477,7 +487,7 @@ static inline void v_ext_ref(V128 *d, const V128 *pn, const V128 *pm, int imm, i
     int n = q ? 16 : 8;
     r.d[0] = 0; r.d[1] = 0;
     for (int i = 0; i < n; i++) r.b[i] = (imm + i < n) ? a.b[imm + i] : b.b[imm + i - n];
-    *d = r;
+    nx_vst(d, r);
 }
 #ifdef NX_X86_SIMD
 #define NX_EXT_CASE(k) case k: r = _mm_or_si128(_mm_srli_si128(a, k), _mm_slli_si128(b, 16 - k)); break;
@@ -557,7 +567,7 @@ static inline void v_perm(V128 *d, const V128 *pn, const V128 *pm, int opcode, i
             vset(&r, sz, 2 * i + 1, vget(&b, sz, part * half + i));
         }
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 /* SSHLL/USHLL (also SXTL/UXTL): widen the low (or high) half and shift left. */
@@ -569,7 +579,7 @@ static inline void v_shll(V128 *d, const V128 *pn, int shift, int sz, int is_uns
         uint64_t x = vget(&a, sz, i + (upper ? n : 0));
         vset(&r, sz + 1, i, (is_unsigned ? x : (uint64_t)vsext(x, sz)) << shift);
     }
-    *d = r;
+    nx_vst(d, r);
 }
 /* SHL / SSHR / USHR by immediate. kind: 0 shl, 1 sshr, 2 ushr. */
 static inline void v_shift(V128 *d, const V128 *pn, int shift, int sz, int kind, int n) {
@@ -583,7 +593,7 @@ static inline void v_shift(V128 *d, const V128 *pn, int shift, int sz, int kind,
         else z = shift >= bits ? 0 : x >> shift;
         vset(&r, sz, i, z);
     }
-    *d = r;
+    nx_vst(d, r);
 }
 
 #endif

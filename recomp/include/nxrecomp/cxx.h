@@ -118,7 +118,7 @@ raw:
 
 // ---- native routines outside the lifted code (fefw.exe: game-build/fefw/src/fefw_hle.cpp), for GameConfig.inline_replace bodies --------
 // `orig` is the lifted original (NX_ORIG in the body): the routine hands the call to it when it cannot give the same result.
-extern "C" void nx_hle_zstd_multiframe(Ctx *c, void (*orig)(Ctx *));
+extern "C" void nx_hle_zstd_multiframe(Ctx *NX_NOESC c, void (*orig)(Ctx *));
 
 namespace nx {
 
@@ -670,6 +670,8 @@ NX_INLINE V128 lane0_f(float t) { V128 v; v.d[0] = 0; v.d[1] = 0; v.f[0] = t; re
 NX_INLINE V128 lane0_df(double t) { V128 v; v.d[1] = 0; v.df[0] = t; return v; }
 NX_INLINE V128 lane0_w(uint32_t t) { V128 v; v.d[0] = t; v.d[1] = 0; return v; }
 NX_INLINE V128 lane0_d(uint64_t t) { V128 v; v.d[0] = t; v.d[1] = 0; return v; }
+// both halves of a register (MOVI / MVNI / FMOV vector immediates), written as one 16-byte store (opt vstore)
+NX_INLINE V128 v_dd(uint64_t lo, uint64_t hi) { V128 v; v.d[0] = lo; v.d[1] = hi; return v; }
 
 // ---- C library string routines, run natively (GameConfig.inline_replace) -------------------------------------------------
 // The guest's own memcpy / memmove / memset / memcmp / strlen / strcmp (nnSdk's, the Arm optimized-routines ones) lifted
@@ -726,7 +728,7 @@ NX_INLINE void nx_call_indirect(Ctx *c, uint64_t a) {
     const uint64_t i = __builtin_rotateright64(a - 0x7100000000ull, 2);
     if (i < __atomic_load_n(&nx_fn_flat_n, __ATOMIC_ACQUIRE)) {
         if (const uint32_t off = nx_fn_flat[i]) {
-            reinterpret_cast<void (*)(Ctx *)>(nx_fn_flat_host + off)(c);
+            reinterpret_cast<void (*)(Ctx *NX_NOESC)>(nx_fn_flat_host + off)(c);
             return;
         }
     }

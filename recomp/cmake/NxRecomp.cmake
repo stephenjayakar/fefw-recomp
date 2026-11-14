@@ -104,10 +104,15 @@ function(nxrecomp_add_module target)
     # -fno-math-errno: sqrtf and friends become instructions (the guest's errno is guest memory, the host's is never read). /GS-: no stack
     # cookie in every lifted function that has a local array.
     target_compile_options(${target} PRIVATE ${NX_OPT} /w /EHs-c- /GR- /GS- -fno-strict-aliasing /clang:-ffp-contract=off -fno-math-errno -mcx16)
+    # the context is noescape at every call (include/nxrecomp/ctx.h NX_NOESC); LLVM must follow its thousands of uses to use that
+    target_compile_options(${target} PRIVATE -DNX_NOESCAPE_CTX "SHELL:-mllvm -capture-tracking-max-uses-to-explore=100000")
     separate_arguments(extra_flags NATIVE_COMMAND "${NX_EXTRA_FLAGS}")
     target_compile_options(${target} PRIVATE ${extra_flags})
   else()
     target_compile_options(${target} PRIVATE -O1 -w -fno-exceptions -fno-rtti -fno-strict-aliasing -ffp-contract=off -mcx16)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      target_compile_options(${target} PRIVATE -DNX_NOESCAPE_CTX "SHELL:-mllvm -capture-tracking-max-uses-to-explore=100000")
+    endif()
   endif()
   if(NX_USE_LAUNCHER)
     set_target_properties(${target} PROPERTIES CXX_COMPILER_LAUNCHER "${NX_PYTHON};${NXRECOMP_ROOT}/cmake/nx_cc_launcher.py")
