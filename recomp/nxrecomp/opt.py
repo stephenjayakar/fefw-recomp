@@ -446,7 +446,9 @@ def temps_local(text):
         return text, 0
     body = '\n'.join(lines[1:-1])
     used = sorted({int(n) for n in TREG.findall(body)})
-    if not used:
+    # only functions that make calls: there the stores before every call go; in a leaf only the few at its returns would, and the
+    # locals then compete for host registers with everything else (the hottest leaf, main 0x1980580, came out 20 % larger)
+    if not used or not TREG_CALL.search(body):
         return text, 0
     st = ' '.join('c->x[%d] = gx%d;' % (r, r) for r in used)
     ld = ' '.join('gx%d = c->x[%d];' % (r, r) for r in used)
