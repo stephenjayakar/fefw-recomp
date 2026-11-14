@@ -622,3 +622,11 @@ streams (count and arguments of every vkCmd* call, hashed) between the two.
 Limits: the serial walk keeps ~60 % of today's render-thread time (texture preparation, held-result checks, mirror decisions, pass logic,
 bind state); stages 1-2 take the rest. Lowering the serial part further needs the held-result checks to get cheaper (`servable_memo`,
 render-6) and the per-draw cold reads of Texture / TexGpu to go (a flat per-draw texture cache keyed by pool id).
+
+Update after render-6/7 phase 1 (window 22, 0 rt_check mismatches over 1.4 billion checks on the hub route + battle; servable memo
+6760 hits / 1000 misses per frame in the dense street): the recorder `nvn-rec` is busy ~9.5 ms/frame in the dense street (render-5 runs,
+158-160 ms/s), the serial walk on the render thread ~13.3 ms. Stage 2 (more recorders) only pays once one recorder is the longer of the
+two; until then the lever is moving more *pure* work out of the walk onto the one recorder (stage 1b): the graphics pipeline lookup (the
+key is built in the walk, the lookup and the bind on the recorder; 2.3 %), the set-0 push writes (the buffers are resolved in the walk,
+the write list built on the recorder), the dynamic-state diff, and the vertex-buffer bind arrays. Stage 2 stays designed as above, for when
+the recorder passes ~13 ms.
