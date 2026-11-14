@@ -33,9 +33,10 @@ class Config(GameConfig):
     ]
     overrides = {}
     # nxrecomp/opt.py (perf/codegen; fewer and shorter x86 instructions, the same guest behaviour): NZCV in function locals, and
-    # scalar results written to a V register as one whole-register store; perf/codegen2: every V register write as one 16-byte store, and
-    # x8..x17 in function locals (AAPCS64 temporaries: not written back to the context at calls and returns, opt.temps_local)
-    opt = ('flags', 'vstore', 'tregs')
+    # scalar results written to a V register as one whole-register store (perf/codegen2: every V register write). 'tregs' (x8..x17 in
+    # function locals, opt.temps_local) is off for now: it changes the control flow of ~40 % of the functions it touches as clang sees
+    # them, so their PGO profile no longer applies; it needs a fresh profile (pgogen run) to be measured fairly.
+    opt = ('flags', 'vstore')
     # nnSdk 22.2.0's C string routines run natively (cxx.h hle_*; same results, checked against the lifted routines by
     # recomp/tests/hle_libc_test.cpp). Address: (body, the routine's first instruction words).
     inline_replace = {
