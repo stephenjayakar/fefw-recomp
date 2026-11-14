@@ -609,4 +609,16 @@ file (`C:/Games/fefw-test/cold/<label>/`, via `NXRT_NVN_PIPELINE_CACHE` / `_KEYS
 
 | request | what | result |
 |---|---|---|
-| pipe-1 | cold A/B (base 9635cb3 vs 5f195a3, DLL md5 0708780b): battle + hub, cold spirv copy, salt, + warm check | queued |
+| pipe-1 | cold A/B (base 9635cb3 vs 5f195a3, DLL md5 0708780b), window 21: battle + hub with empty pipeline cache/keys/order, new spirv_salt, uncached HDD copy of the shader cache; + warm check | **battle: worst gameplay frame 142 ms -> 44 ms** (A: 142 / 99 / 92 / 80 ms frames = compute pipelines compiled at the dispatch on the render thread 98 / 86 / 27 ms, and main blocked in ShaderCache::pack_read on the HDD; B: battle_open..dungeon_after <= 19 ms, the 40-44 ms frames are texture uploads at the dungeon load-in). Max render-thread "pipeline creation" in any hitch line 815 -> 52 ms (battle), 750 -> 23 ms (hub). Hub cold: no pipeline/shader frames over 50 ms in either (A loaded these shaders from the pack at loading time); remaining >50 ms = fast-travel arrivals (game code, ~300 ms) and texture frames after the load-in. B shader loads: 1155 / 1155 from the pack in memory, 0 .spv reads, worst 7.7 ms. Compute: 69 prebuilt, 0 built at the dispatch, 2 waits (380-450 ms) only at boot (title, t=6-9 s). Full pack written in 134 s (12,009 shaders, 681 MiB in 175 MiB). Warm check (p1-B-warm): within noise / slightly better than w17-base (street_cold 58.1 / 44.0, 239 frames >20 ms vs 57.6-57.8 / 42.1-42.9, 297-318). |
+
+#### What is left (cold caches)
+- The menu_to_world load-in frame is 1.3-1.5 s cold in both (warm ~260 ms): the render thread waits for shader parts at the draw (25 parts,
+  1.6 s in all) because frames are not "flowing" during loading, so gpl_async builds instead of skipping. Only on a first-ever visit with a cold
+  driver cache; a loading-screen-adjacent frame.
+- Compute builds still in progress at the first dispatch are waited for (2 waits of 380-450 ms, at the title screen in these runs).
+  `compute_async = skip` would skip them; not default (a skipped dispatch may leave results later frames use).
+- In the first cold minute the background compiles (gpl 4 + burst 2 threads, ~70 s of CPU) slightly lower hub 1% lows (B-hub hub_cold 44.4
+  vs A 50.4 in one run; B-build 50.7): noise-level, no frame over 33 ms.
+- "Prepare shaders" cannot run for Fortune's Weave without `shader_cache/programs.bin` (setup does not write one); with the key file and the
+  full pack, first-use is covered at runtime anyway.
+
