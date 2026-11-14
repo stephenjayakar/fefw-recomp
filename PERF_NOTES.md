@@ -609,4 +609,4 @@ file (`C:/Games/fefw-test/cold/<label>/`, via `NXRT_NVN_PIPELINE_CACHE` / `_KEYS
 
 | request | what | result |
 |---|---|---|
-| pipe-1 | cold A/B (base 9635cb3 vs 8c10ac3, DLL md5 3ca8e769): battle + hub, cold spirv copy, salt, + warm check | queued |
+| pipe-1 | cold A/B (base 9635cb3 vs dbc0b10, DLL md5 15258ac2): battle + hub, cold spirv copy, salt, + warm check | queued |
