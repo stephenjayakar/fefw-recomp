@@ -128,10 +128,13 @@ void prewarm_record(const GraphicsKey& key);                              // a d
 size_t prewarm_program(const ShaderInfo* const stages[6]);                // a program got its shaders: its recorded pipelines go first in line (how many)
 // True with *out: the pipeline was built ahead. False: build it here, except that when a background build of it is under way and can_link()
 // says the draw can link it from parts now, *later gets the whole pipeline that will replace the linked one (link with no upgrade of its own).
-bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later);
+// busy (when given): the background build is under way and the draw cannot link it; instead of waiting for the build, false with *busy = true
+// (the caller skips the draw and asks again at the next one).
+bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later,
+                  bool* busy = nullptr);
 void prewarm_shutdown();                                                  // stops the workers (before the device is torn down)
 struct PrewarmStats {
-    uint64_t recorded = 0, loaded = 0, queued = 0, built = 0, taken = 0, waited = 0, claimed = 0;
+    uint64_t recorded = 0, loaded = 0, queued = 0, built = 0, taken = 0, waited = 0, claimed = 0, skipped_busy = 0;
     uint64_t failed = 0, promoted = 0, linked_meanwhile = 0;   // builds that failed; jobs moved ahead by a program set; draws linked while the whole build ran
     double wait_ms = 0;
 };
@@ -139,6 +142,12 @@ PrewarmStats prewarm_stats();
 // `ints`: samplers that read integer textures (spirv_int_samplers); null when that variant cannot be made (the caller then uses the
 // translated module with float views).
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints = {});
+// [nvn] compute_async (default prebuild): a compute program's pipeline is built on a background thread as soon as the game sets its shader, so
+// the first dispatch (render thread) takes it ready instead of compiling it (tens to hundreds of ms on a cold driver cache). The dispatch waits
+// for a build under way and builds one still queued itself; `skip` skips the dispatch instead while a build runs and frames are flowing (visual
+// risk: a dispatch whose results later frames keep; for measurements). Any thread.
+void compute_prebuild(const ShaderInfo* cs);
+void compute_progress_log();                     // one log line when something changed since the last call
 VkShaderModule shader_module(const ShaderInfo* s);
 // A content id of a shader module (hash of the words it was made from): two modules made from the same words have the same id, so the shader
 // parts built for the stand-in shaders of the key file are found again by the game's own. Any thread.
@@ -202,6 +211,9 @@ void gpl_program_bound(const ShaderInfo* const stages[6]);           // a comman
 void gpl_prebuild(std::function<bool(GraphicsKey&, const ProgLayout*&)> resolve, bool front);
 // True when the draw can link this key now: eligible, and its two shader parts are built.
 bool gpl_ready(const GraphicsKey& key, const ProgLayout& layout);
+bool gpl_frames_flowing();                                           // a present within the last 100 ms (draws may be skipped rather than wait)
+// A job for the pipeline-library threads (compute pipelines, compute_prebuild): ahead of the hot programs' parts. False when they are off.
+bool gpl_queue_task(std::function<void()> fn);
 void gpl_progress_log();                                             // one log line when something changed since the last call
 void gpl_stop();                                                     // stops the workers (before modules and layouts go)
 void gpl_shutdown();                                                 // destroys the parts (after the pipelines)

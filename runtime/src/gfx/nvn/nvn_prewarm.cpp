@@ -262,17 +262,19 @@ void saver_main() {
         g_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_stop; });
         if (g_stop) break;
         const uint64_t sig = g_stats.recorded + g_stats.queued * 3 + g_stats.built * 5 + g_stats.taken * 7 + g_stats.waited * 11 + g_stats.claimed * 13 +
-                             g_stats.linked_meanwhile * 17 + g_stats.promoted * 19;
+                             g_stats.linked_meanwhile * 17 + g_stats.promoted * 19 + g_stats.skipped_busy * 23;
         if (sig != logged) {                       // the process may end without a shutdown: say what the prewarm did while it runs
             logged = sig;
             NXLOG_I(kTag, "prewarm so far: %llu recorded, %llu loaded, %llu queued (%llu moved ahead), %llu built ahead (%llu failed), %llu taken by draws (%llu waited %.1f ms), "
-                          "%llu linked from parts while building, %llu built by the draw itself",
+                          "%llu linked from parts while building, %llu built by the draw itself, %llu draws skipped while their build ran",
                     static_cast<unsigned long long>(g_stats.recorded), static_cast<unsigned long long>(g_stats.loaded), static_cast<unsigned long long>(g_stats.queued),
                     static_cast<unsigned long long>(g_stats.promoted), static_cast<unsigned long long>(g_stats.built), static_cast<unsigned long long>(g_stats.failed),
                     static_cast<unsigned long long>(g_stats.taken), static_cast<unsigned long long>(g_stats.waited), g_stats.wait_ms,
-                    static_cast<unsigned long long>(g_stats.linked_meanwhile), static_cast<unsigned long long>(g_stats.claimed));
+                    static_cast<unsigned long long>(g_stats.linked_meanwhile), static_cast<unsigned long long>(g_stats.claimed),
+                    static_cast<unsigned long long>(g_stats.skipped_busy));
         }
         gpl_progress_log();
+        compute_progress_log();
         if (std::chrono::steady_clock::now() >= next_summary) {
             next_summary += std::chrono::seconds(30);
             log_summary_locked();
@@ -370,7 +372,8 @@ size_t prewarm_program(const ShaderInfo* const stages[6]) {
     return ahead.size();
 }
 
-bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later) {
+bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later, bool* busy) {
+    if (busy) *busy = false;
     Rec want;
     if (!rec_of(key, &want)) return false;
     const uint64_t digest = digest_of(want.h, want.rest);
@@ -413,6 +416,11 @@ bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<b
             j->state = 3;
             erase_job_locked(j);
             ++g_stats.claimed;
+            return false;
+        }
+        if (busy) {                                              // being built and not linkable: the draw is skipped, the next one asks again
+            *busy = true;
+            ++g_stats.skipped_busy;
             return false;
         }
         const auto t0 = std::chrono::steady_clock::now();        // being built: wait for it
@@ -467,6 +475,7 @@ PrewarmStats prewarm_stats() {
 // The game set a program's shaders: its recorded pipelines go first in line. Programs with both a vertex and a fragment shader also get
 // their shader parts queued by the pipeline-library side when the key file has nothing for them.
 void prewarm_program_shaders(const ShaderInfo* const stages[6]) {
+    if (stages && stages[5]) compute_prebuild(stages[5]);       // a compute program: its pipeline on a background thread ([nvn] compute_async)
     gpl_program(stages, prewarm_program(stages) != 0);
 }
 

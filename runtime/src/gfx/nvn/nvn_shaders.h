@@ -338,11 +338,26 @@ private:
         uint32_t csize, usize;
     };
     void pack_open();                                                  // open(), lock_ held
-    bool pack_read(const std::string& hash, std::string& out);         // any thread, no lock
-    bool read_spv(const std::string& hash, std::string& out);          // the pack, else <dir>/<hash>.spv
+    bool pack_read(const std::string& hash, std::string& out, bool* from_mem = nullptr);   // any thread, no lock
+    bool read_spv(const std::string& hash, std::string& out, int* source = nullptr);       // the pack, else <dir>/<hash>.spv; source 1 pack in memory, 2 pack file, 3 .spv file
     void pack_prefetch();                                              // own thread
     void preload_done();                                               // the last preload worker as it ends
     void pack_build(size_t missing);                                   // own thread
+    void order_writer();                                               // own thread: appends new order-file lines every few seconds
+    void note_load(int source, int64_t us);                            // load(): counters and the periodic line
+    // [nvn] shader_pack_all: the pack holds every shader of results.tsv that has SPIR-V, the order file's first (pack_list_), so a shader the
+    // game sets for the first time is never a separate file read on the game thread. [nvn] shader_pack_resident: the pack's data stays in memory
+    // (pack_mem_, filled front to back by pack_prefetch; pack_mem_end_ = bytes valid), so such a load costs no disk access at all.
+    std::vector<std::string> pack_list_;                               // what pack_build writes, in order (set in start_preload)
+    std::unique_ptr<char[]> pack_mem_;
+    std::atomic<uint64_t> pack_mem_end_{0};
+    int spv_bytes_col_ = -1;                                           // column index of "spv_bytes" (-1: none; every line counts as packable)
+    std::thread order_thread_;
+    std::condition_variable order_cv_;
+    bool order_stop_ = false;                                          // (lock_)
+    // what the game's own loads (find -> load) cost, by source (preloaded words / the pack / separate .spv files)
+    std::atomic<uint64_t> ld_count_{0}, ld_pre_{0}, ld_pack_{0}, ld_pack_mem_{0}, ld_files_{0}, ld_us_{0}, ld_worst_us_{0}, ld_files_us_{0};
+    std::atomic<uint64_t> ld_logged_ms_{0}, ld_logged_count_{0};
     void* pack_file_ = nullptr;                                        // HANDLE of preload.pack; set in open(), then read-only
     uint64_t pack_data_end_ = 0;
     std::unordered_map<std::string, PackEntry> pack_;                  // the usable entries; set in open(), then read-only

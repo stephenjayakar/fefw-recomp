@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include <tuple>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -794,13 +795,18 @@ VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
     prewarm_init();
     VkPipeline pipe = VK_NULL_HANDLE;
     std::shared_ptr<PipeUpgrade> later;          // the key file's whole pipeline, still being built: it replaces the linked one
-    // compiled ahead on a worker; one being compiled is linked from its parts meanwhile when they are built (else waited for)
-    if (prewarm_take(key, &pipe, [&] { return gpl_ready(key, layout); }, &later)) {
+    // compiled ahead on a worker; one being compiled is linked from its parts meanwhile when they are built, else waited for, or, with
+    // [nvn] prewarm_wait = false (default) while frames are flowing, the draw is skipped until it is done (a cold driver cache, e.g. after a
+    // driver update, makes each of those builds tens to hundreds of ms on the render thread)
+    static const bool prewarm_wait = nxrt::config_get_bool("nvn", "prewarm_wait", false);
+    bool busy = false;
+    if (prewarm_take(key, &pipe, [&] { return gpl_ready(key, layout); }, &later, (!prewarm_wait && gpl_frames_flowing()) ? &busy : nullptr)) {
         ++g_pipeline_count;
         g_gfx_keys.add(1);
         bucket.push_back({key, pipe, VK_NULL_HANDLE, nullptr});
         return pipe;
     }
+    if (busy) return VK_NULL_HANDLE;             // nothing recorded: the next draw with this key asks again
     std::shared_ptr<PipeUpgrade> up;
     bool pending = false;
     pipe = gpl_link(key, layout, later ? nullptr : &up, &pending); // linked from shader parts compiled ahead (null: not eligible or a part failed)
@@ -847,6 +853,111 @@ static VkShaderModule int_sampler_module(const ShaderInfo* cs, const std::vector
     return m;
 }
 
+// One compute pipeline (any thread: the render thread at a dispatch, or a pipeline-library thread for compute_prebuild).
+static VkPipeline create_compute(const ShaderInfo* cs, VkPipelineLayout layout, VkShaderModule m) {
+    ensure_cache();
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, ubo_robustness()};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
+    configure_guest_subgroup(ci.stage, subgroup_size);
+    ci.layout = layout;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    compiles_in_flight().fetch_add(1, std::memory_order_relaxed);
+    const uint64_t tp0 = nxrt::hitch_ticks();
+    const VkResult cr = vkCreateComputePipelines(vkdev(), g_cache, 1, &ci, nullptr, &pipe);
+    if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - tp0);
+    compiles_in_flight().fetch_sub(1, std::memory_order_relaxed);
+    if (cr != VK_SUCCESS) {
+        NXLOG_E(kTag, "compute pipeline failed for %s", cs->hash.c_str());
+        return VK_NULL_HANDLE;
+    }
+    counters().pipelines_created.fetch_add(1);
+    g_pipes_created.add(1);
+    g_cache_dirty.store(true, std::memory_order_relaxed);
+    g_new_since_save.fetch_add(1, std::memory_order_relaxed);
+    return pipe;
+}
+
+// ---- compute pipelines built ahead ([nvn] compute_async, nvn_pipeline.h compute_prebuild) ----------------------------------------
+// The key file and the shader parts cover graphics pipelines only: a compute shader the driver has not seen was compiled by the render thread at
+// its first dispatch. Now the game's nvnProgramSetShaders queues it for the pipeline-library threads; the dispatch takes the finished pipeline.
+namespace {
+struct CompJob {
+    int state = 0;                               // 0 queued, 1 building, 2 done, 3 taken over by the dispatch (g_comp_mu)
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+};
+std::mutex g_comp_mu;
+std::condition_variable g_comp_cv;
+std::unordered_map<const ShaderInfo*, std::shared_ptr<CompJob>> g_comp_jobs;
+struct CompStats {
+    uint64_t queued = 0, built = 0, taken = 0, waited = 0, claimed = 0, skipped = 0;
+    double wait_ms = 0, build_ms = 0;
+};
+CompStats g_comp_stats;
+int compute_async_mode() {                       // 0 off, 1 prebuild (wait for a build under way), 2 skip the dispatch while it builds
+    static const int m = [] {
+        const std::string v = nxrt::config_get_str("nvn", "compute_async", "prebuild");
+        return (v == "off" || v == "false" || v == "0") ? 0 : v == "skip" ? 2 : 1;
+    }();
+    return m;
+}
+}  // namespace
+
+void compute_prebuild(const ShaderInfo* cs) {
+    if (!cs || !compute_async_mode()) return;
+    auto job = std::make_shared<CompJob>();
+    {
+        std::lock_guard<std::mutex> lk(g_comp_mu);
+        if (!g_comp_jobs.emplace(cs, job).second) return;
+        ++g_comp_stats.queued;
+    }
+    const bool queued = gpl_queue_task([cs, job] {
+        {
+            std::lock_guard<std::mutex> lk(g_comp_mu);
+            if (job->state != 0) return;         // the dispatch came first and builds it itself
+            job->state = 1;
+        }
+        NXFT("pipe.compute.ahead");
+        const auto t0 = std::chrono::steady_clock::now();
+        const ShaderInfo* st[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, cs};
+        const ProgLayout* pl = prog_layout(st);
+        const VkShaderModule m = pl ? shader_module(cs) : VK_NULL_HANDLE;
+        const VkPipeline p = m ? create_compute(cs, pl->layout, m) : VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> lk(g_comp_mu);
+            job->pipe = p;
+            job->layout = pl ? pl->layout : VK_NULL_HANDLE;
+            job->state = 2;
+            ++g_comp_stats.built;
+            g_comp_stats.build_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        g_comp_cv.notify_all();
+    });
+    if (!queued) {                               // no pipeline-library threads: built at the dispatch as before
+        std::lock_guard<std::mutex> lk(g_comp_mu);
+        g_comp_jobs.erase(cs);
+        --g_comp_stats.queued;
+    }
+}
+
+// One line when something changed since the last call (the prewarm's saver thread calls it every 2 s).
+void compute_progress_log() {
+    std::lock_guard<std::mutex> lk(g_comp_mu);
+    static uint64_t last = 0;
+    const CompStats& c = g_comp_stats;
+    const uint64_t sig = c.queued + c.built * 3 + c.taken * 5 + c.waited * 7 + c.claimed * 11 + c.skipped * 13;
+    if (sig == last) return;
+    last = sig;
+    NXLOG_I(kTag, "compute pipelines ahead: %llu queued, %llu built (%.0f ms on workers), %llu taken by dispatches (%llu waited %.1f ms), %llu built by "
+                  "the dispatch itself, %llu dispatches skipped while building",
+            static_cast<unsigned long long>(c.queued), static_cast<unsigned long long>(c.built), c.build_ms, static_cast<unsigned long long>(c.taken),
+            static_cast<unsigned long long>(c.waited), c.wait_ms, static_cast<unsigned long long>(c.claimed), static_cast<unsigned long long>(c.skipped));
+}
+
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints) {
     ensure_cache();
     std::vector<uint32_t> ikey;
@@ -854,31 +965,48 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, cons
     const auto k = std::make_tuple(cs, layout.layout, ikey);
     auto it = g_compute.find(k);
     if (it != g_compute.end()) return it->second;
-    VkShaderModule m = ints.empty() ? shader_module(cs) : int_sampler_module(cs, ints, ikey);
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (m) {
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, ubo_robustness()};
-        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = m;
-        ci.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
-        configure_guest_subgroup(ci.stage, subgroup_size);
-        ci.layout = layout.layout;
-        const uint64_t tp0 = nxrt::hitch_ticks();
-        const VkResult cr = vkCreateComputePipelines(vkdev(), g_cache, 1, &ci, nullptr, &pipe);
-        if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - tp0);
-        if (cr != VK_SUCCESS) {
-            NXLOG_E(kTag, "compute pipeline failed for %s", cs->hash.c_str());
-            pipe = VK_NULL_HANDLE;
-        } else {
-            counters().pipelines_created.fetch_add(1);
-            ++g_pipeline_count;
-            g_pipes_created.add(1);
-            g_cache_dirty.store(true, std::memory_order_relaxed);
-    g_new_since_save.fetch_add(1, std::memory_order_relaxed);
+    if (ints.empty() && compute_async_mode()) {  // built ahead (compute_prebuild)?
+        std::unique_lock<std::mutex> lk(g_comp_mu);
+        auto jt = g_comp_jobs.find(cs);
+        if (jt != g_comp_jobs.end()) {
+            std::shared_ptr<CompJob> j = jt->second;
+            if (j->state == 0) {                 // still queued: build it here, now
+                j->state = 3;
+                g_comp_jobs.erase(jt);
+                ++g_comp_stats.claimed;
+            } else {
+                if (j->state == 1) {
+                    if (compute_async_mode() == 2 && gpl_frames_flowing()) {
+                        ++g_comp_stats.skipped;
+                        return VK_NULL_HANDLE;   // nothing recorded: the next dispatch asks again
+                    }
+                    const auto t0 = std::chrono::steady_clock::now();
+                    {
+                        NXFT("pipe.compute.wait");
+                        g_comp_cv.wait(lk, [&] { return j->state == 2; });
+                    }
+                    ++g_comp_stats.waited;
+                    g_comp_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                }
+                g_comp_jobs.erase(cs);
+                const VkPipeline built = j->pipe;
+                j->pipe = VK_NULL_HANDLE;
+                const bool same = j->state == 2 && j->layout == layout.layout;
+                if (same) ++g_comp_stats.taken;
+                lk.unlock();
+                if (same) {
+                    if (built) ++g_pipeline_count;
+                    g_compute[k] = built;
+                    g_compute_keys.add(1);
+                    return built;
+                }
+                if (built) vkDestroyPipeline(vkdev(), built, nullptr);   // another layout (not expected): built here below
+            }
         }
     }
+    VkShaderModule m = ints.empty() ? shader_module(cs) : int_sampler_module(cs, ints, ikey);
+    VkPipeline pipe = m ? create_compute(cs, layout.layout, m) : VK_NULL_HANDLE;
+    if (pipe) ++g_pipeline_count;
     g_compute[k] = pipe;                         // new key: the lookup above missed
     g_compute_keys.add(1);
     return pipe;
@@ -1654,6 +1782,13 @@ void pipeline_shutdown() {
     VkDevice d = vkdev();
     prewarm_shutdown();
     gpl_stop();
+    {
+        std::lock_guard<std::mutex> lk(g_comp_mu);
+        for (auto& [cs, j] : g_comp_jobs)
+            if (j->pipe) vkDestroyPipeline(d, j->pipe, nullptr);     // built ahead, never dispatched
+        g_comp_jobs.clear();
+        g_comp_stats = CompStats{};
+    }
     if (!g_cache_big || g_new_since_save.load() >= 300) save_cache();
     for (auto& [h, bucket] : g_gfx)
         for (auto& e : bucket) {
