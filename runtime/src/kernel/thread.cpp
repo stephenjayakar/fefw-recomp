@@ -194,6 +194,7 @@ uint32_t main_thread_adopt(uint64_t stack_size, const char* name) {
     diag_register_thread(t->name.c_str(), &t->ctx, t->id);
     sched_apply(*t);
     occ_tag_main(*t);
+    kernel_thread_named(*t, "main");
     NXLOG_I("thread", "host thread %lu is now the guest main thread (stack 0x%llx..0x%llx)", GetCurrentThreadId(), (unsigned long long)stack, (unsigned long long)p.stack_top);
     return h;
 }

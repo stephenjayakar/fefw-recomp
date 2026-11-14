@@ -423,3 +423,92 @@ inclusive tables.
   size as 0.1.7's. The game code is already -O2. Remaining compiler levers for the game thread: a profile-guided build (instrumented
   exe, a profiling run of the real scenes, rebuild with the profile; typical 10-20 % on branchy code; several hours of build and
   test time), or a native-ISA variant (`-mcpu=znver2`: LZCNT for the guest's CLZ, BMI2 shifts; a few % at most).
+
+## Waits track (branch `perf/waits`)
+
+Goal: the game thread (main) spends about 12 ms of a ~17.7 ms street frame on the CPU; the rest is waiting. This track measures what it
+waits on and cuts the waits that are the runtime's (guest sync, wake-ups, placement, submission cost), not the render thread's replay
+speed (RENDER track) or GPU cost (GPU2 track). Test requests go to `tmp/fefw-perf/queue/waits-<n>/`; scratch and tools in
+`tmp/fefw-perf/waits/`.
+
+### What main waits on (best stack: b59bc62 + gpu set + split 2 + PGO exe; tester runs w11-pgo-b, c3-cpu3-O, w8-cg2-prof)
+
+Per presented frame, from the budget lines (`waits` = main's own system-call waits; GPU sync = nvnSyncWait of any thread):
+
+| street window | frame p50 | main CPU p50 | main svc waits p50 | GPU sync waits | render work p50 |
+|---|---:|---:|---:|---:|---:|
+| light (800-1300 draws) | 16.7 | 10.9-11.8 | 2.5-2.8 | 0-0.5 ms (p99 0.5-3) | 8.6-12 |
+| dense (2400-2640 draws, 130-160 s, 290-320 s) | 18.3-19.1 | 12.0-13.5 | 3.6-4.8 | ~1.7 ms (464 waits / 914 ms in 10 s) | 16.6-17.4 |
+
+- **GPU sync waits** are all on fences two presents old ("sync waits by fence age: 2"), and all "on the GPU only" (the render thread had
+  already submitted the fenced work). In the dense windows they exist because the render thread (16.6-17.4 ms) is the limiter: the GPU
+  finishes frame N-2 late because its replay finished late. Deeper game/render pipelining cannot help there (throughput-bound, not
+  latency-bound: `present_ahead` 1 already lets the game record N+1 while the render thread replays N, and the game's own fence is two
+  frames back). In light windows they are near 0. Not a game-side lever: they go away when the RENDER track shortens replay.
+- **Main's system-call waits** (occupancy run c3-cpu3-O, hub, ~600 frames per 10 s; "who woke main"):
+
+  | woken by | waits / frame | blocked / frame | per wait |
+  |---|---:|---:|---:|
+  | Basic_Worker1-4, address (job completion) | ~8 | ~1.5 ms | ~185 us |
+  | Basic_Worker1-4, mutex hand-over | ~25 | ~0.5 ms | ~20 us |
+  | GFX_Worker0, address | ~11 | ~0.25 ms | ~23 us |
+  | GFX_Worker1-4, address | ~15 | ~0.12 ms | ~8 us |
+  | SND_Update, mutex | ~1 | 0.1-0.18 ms | ~150 us |
+  | PX_Executor, address | ~1 | ~0.08 ms | ~85 us |
+
+  While main waits on an address, on average only 1.0-1.5 of the 4 Basic workers run, and none for 25-45 % of that time (the sampler
+  counts a thread as blocked until it runs again, so that share includes the host's wake-up of the worker and of main): main waits on
+  short chains of jobs, not on a saturated pool. The Basic workers are idle 85 % of the time (98.7 % of their waits are the job
+  condition variable).
+- **Sampled stacks** (w8-cg2-prof, main, whole run): of main's waiting samples 38 % are WaitForAddress (17 % from one call site of the
+  frame loop, f_7100a99ae0 < f_710180b3a0; 15 % from a job-wait helper f_7100a86a90 called from many places), 37 % present back
+  pressure (pacing in light frames), 12 % ArbitrateLock (most through the lock wrapper f_7101979ee0), 6 % nvnSyncWait, and 2.8 %
+  *inside* SignalToAddress / ArbitrateUnlock (the waker side: the kernel lock or the wake system call).
+- **Wake-up latency on this PC** (tmp/fefw-perf/waits/bench/wakebench.cpp, idle machine, two pinned threads, sleeper really asleep):
+  SRW + condition variable woken under the lock (what kernel_sync.cpp does) p50 6.0 us / p99 11 us; woken after the unlock 4.0 / 8.5;
+  WaitOnAddress 4.0 / 8.7; a spin 0.1. Same CCX, other CCX and SMT sibling all within 1-2 us of each other. So one host wake-up is
+  ~5 us: at ~60 blocking waits of main per frame plus the job wake-ups in its chains, the host's wake-up latency is a few tenths of a
+  ms per frame, not milliseconds. The rest of main's ~2.6-4.5 ms is the jobs' and lock holders' own run time.
+- **Placement**: console cores 0..5 -> processors 12, 10, 8, 6, 4, 2 (physical cores 6, 5, 4 on CCX1; 3, 2, 1 on CCX0), soft affinity
+  on 0xfffc. Main is core 0; the Basic job pool runs on cores 1..4 ([sched] core_number_at note), so two of the four workers sit on
+  the other CCX.
+- **Starvation guard**: its thread polls NtQuerySystemInformation(SystemProcessInformation) every 50 ms at THREAD_PRIORITY_HIGHEST and
+  costs 1.4-1.6 ms of CPU per frame (8-9 % of a core, more than any GFX worker), all of it a snapshot of every process on the PC.
+- **Arrival frames** (~320 ms): only 8-12 ms of system calls and 100-400 page faults per arrival frame (w11-pgo-b hitch lines); the
+  allocator share (~14 %) is the lifted SDK allocator itself (s5-default samples under f_7100652310: 97 % lifted SDK code, ~10 % the
+  cross-module call path host_import / import_resolve, 1.4 % write-watch faults; no virtual-memory or kernel memory service on the
+  path). Nothing for the runtime's memory services there.
+
+### Large pages for guest memory: feasibility (item 4)
+
+- **What a TLB miss costs here** (tmp/fefw-perf/waits/bench/tlbbench.cpp: a random pointer chase over the same number of cache lines,
+  packed 64 B apart vs one line per 4 KiB page; Zen 2's L2 DTLB holds 2048 4 KiB entries = 8 MB of reach):
+
+  | lines | packed | one per page | per-load cost of the page walk |
+  |---:|---:|---:|---:|
+  | 4096 (256 KB, L2) | 2.8 ns | 14.4 ns | +11.6 ns |
+  | 16384 (1 MB, L3) | 8.9 ns | 23.0 ns | +14 ns |
+  | 65536 (4 MB, L3) | 10.5 ns | 32.3 ns | +22 ns |
+  | 262144 (16 MB, past one CCX's L3) | 72 ns | 137 ns | +65 ns |
+
+  With 2 MiB pages a few hundred MB of game objects need a few hundred TLB entries instead of tens of thousands, so most of that walk
+  cost goes. The game thread's samples sit ~48 % on guest loads (codegen track); how many of them miss the DTLB is not known without
+  hardware counters (AMD uProf's "L2 DTLB miss" events would say it in one run; not installed here). Plausible range: a few percent to
+  ~15 % of main's CPU.
+- **Why it is not a toggle yet:**
+  - The heap is ONE pagefile-backed section (SEC_RESERVE, primary view at kHeapBase plus alias views for pool imports; memory.cpp).
+    Large pages need `SEC_LARGE_PAGES | SEC_COMMIT` (committed and non-pageable up front: the game's ~11 GB heap would be locked RAM on a
+    24 GB PC), 2 MiB-aligned views, and a section is either large-paged or not.
+  - Write-watch (write_watch.cpp) arms single 4 KiB pages read-only with VirtualProtect to see CPU writes to GPU pools that lie inside
+    that heap; a large page cannot be protected per 4 KiB page. So only heap ranges that never hold a watched pool could use large pages,
+    and the game decides where its pools go after the heap is committed at boot. A workable design: the heap as many 2 MiB-granular
+    sections, large ones only for ranges a recorded pool map of earlier runs says stay unwatched, with a fallback to 4 KiB sections when
+    the large allocation fails (it can take seconds or fail outright on a fragmented system). That is a substantial rework of memory.cpp
+    and the alias/import paths, for a gain not yet measured.
+  - Allocating ~10 GB of large pages at boot needs Windows to find contiguous 2 MiB physical runs; after hours of uptime it may fail or
+    take many seconds.
+- **The privilege step the user would need** (only if this is ever built and wanted): run `secpol.msc` -> Local Policies -> User Rights
+  Assignment -> "Lock pages in memory" -> add your own account -> sign out and back in. `whoami /priv` then lists
+  SeLockMemoryPrivilege. Nothing was changed on this PC; the benchmark reports the privilege as not held.
+- Recommendation: first measure DTLB misses on main in the street with AMD uProf (free) on the current build. Only if they are a large
+  share of its loads is the heap rework worth it.

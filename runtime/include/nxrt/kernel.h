@@ -112,6 +112,10 @@ struct KThread : KObject {
     uint32_t wait_tag = 0;
     void* cv_storage[1] = {nullptr};    // CONDITION_VARIABLE is pointer sized: this thread's own wake-up (kernel_sync.cpp)
     std::weak_ptr<KThread> self;
+    // [kernel] spin_threads / lock_spin_threads (kernel_sync.cpp): this thread spins on its wake flag before it sleeps / polls a held mutex
+    // word before it queues. Set when the game names the thread (main: when it is adopted). Read by the thread itself.
+    bool spin_ok = false, lock_spin_ok = false;
+    char game_name[32] = {};            // the name nn::os::SetThreadName gave it (thread_diag.cpp), written under the kernel lock; empty until then
     ~KThread() override;                // closes host_handle
     ObjType type() const override { return ObjType::Thread; }
     bool signaled() const override { return exited; }
