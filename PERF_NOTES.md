@@ -549,6 +549,7 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 | 8a97d39 | kDesc split into kDescBuf / kDescTex; texture sets (only SamplerBinding samplers, or the pool arrays) left bound when a draw changed only buffers (same layout and command buffer, same pool versions, no substitution); rt_check verifies against the content cache | `[nvn] tex_set_skip = true` |
 | 89366ac | texture preparation block left out on buffer-only draws (same layout and command buffer; not with uniform-block handles, feedback or trace) | `[nvn] prep_skip = true` |
 | 89366ac | descriptor sets allocated 8 per vkAllocateDescriptorSets call per layout | `[nvn] set_batch = 8` |
+| 1c2a894 | tex_sampled_view: the image's last two (request, view) answers, cleared with the views; rt_check compares | `[nvn] view_memo = true` |
 
 ### Test log
 
@@ -556,8 +557,15 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 |---|---|---|
 | render-1 | out_masks + layout_cache (defaults), replay_threads = 2 A/B, battle, profile | window 15: masks + layout cache -0.6 to -0.8 ms render work (neutral in fps). replay_threads = 2: dense street render work p50 16.8 -> 13.6-14.2, p99 21.6-25.5 -> 18.5-21.1; median dense frame 18.7 -> 17.9; street_cold >20 ms frames -25 %, 1% low +1; worker nvn-rec 9.7 ms/frame CPU on a free core, waits for it 0.08-0.17 ms/frame, 0 ring-full waits; stills identical. Battle had 32 new pipelines in one run (repeat in window 16) |
 | render-2 | batched publishes to the worker (`replay_batch`), `feedback_fast` | window 17: small win, merged (perf-stutter 9635cb3) and live with replay_threads = 2: dense street render work p50 13.5-14.5 -> 13.2-13.7, p99 ~19-21 -> 17.3-19.7, worker -13 %, visuals identical |
-| render-3 | `tex_set_skip` (on 9635cb3) | window 19 (result pending) |
-| render-4 | `prep_skip`, `set_batch` (on render-3) | queued |
+| render-3 | `tex_set_skip` (on 9635cb3) | window 19: NEUTRAL, correct (0 rt_check mismatches, visuals identical). Only 148-175 sets/frame left bound (3.5 %): textures change between almost every draw in this game; not merged |
+| render-4 | `prep_skip`, `set_batch` (on render-3) | window 20 (prep_skip fires as rarely as tex_set_skip) |
+| render-5 | render-3/4 + `view_memo` | queued |
+
+Clean profile r3-prof (render-3, no rt_check), render thread: run_list = begin_draw 59 % (build_set 25 %, prepare_textures 6 %, vertex
+buffer resolve_read 5 %, resolve_texture 3 %, graphics_pipeline 2 %), out_draw_bindings 15 % (out_servable 5 %: bound uniform buffers keep
+overlapping held compute results, so the slots stay unmemoised and are checked again every draw), do_dispatch 10 %. Inside build_set (render
+busy %): UBO resolve_read 4.0, tex_sampled_view 3.2, alloc_set 2.2, sampler_for 1.9, make_request 1.4, set cache 1.1, is_color_feedback 0.8.
+The rest of the per-draw cost is a long tail of cold Texture / TexGpu reads.
 
 What render-1 showed about the limiter (r1-t, street at 140 s, 2585 draws): render thread work p50 14.2, idle p50 3.5 (waiting for the
 game); game thread work p50 18.0 with no present back pressure = CPU 12.8 + waits 4.7, GPU sync waits only p99 3.2. Main's blocked time
