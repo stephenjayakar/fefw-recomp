@@ -560,8 +560,13 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 | render-3 | `tex_set_skip` (on 9635cb3) | window 19: NEUTRAL, correct (0 rt_check mismatches, visuals identical). Only 148-175 sets/frame left bound (3.5 %): textures change between almost every draw in this game; not merged |
 | render-4 | `prep_skip`, `set_batch` (on render-3) | window 20 (prep_skip fires as rarely as tex_set_skip) |
 | render-5 | render-3/4 + `view_memo` | queued |
-| render-6 | `servable_memo` (off by default; write-watch clear epoch + pool epoch + pool generation; rt_check compares) | queued: rt_check runs first, then A/B |
-| render-7 | render-mt stage 1: `desc_on_recorder` (texture sets on the recorder; off by default; rt_check compares content keys) | queued: rt_check runs first, then A/B (perf/render-mt 893c4a7) |
+| render-5 result | | window 22: render work p50 -0.3..-0.5 ms, fps / 1% lows unchanged, 0 rt_check mismatches; not merged on its own |
+| render-6 | `servable_memo` (off by default; write-watch clear epoch + pool epoch + pool generation; rt_check compares) | window 22 phase 1: 0 mismatches over 1.4 G checks (hub route) + battle; 6760 hits / 1000 misses per frame. Window 24 phase 2 (cg2-1 exe): render work p50 -0.3..-0.4 ms, fps / 1% lows neutral, stills identical |
+| render-7 | render-mt stage 1: `desc_on_recorder` (perf/render-mt 893c4a7) | phase 1 (rt_check) clean; phase 2 CRASHED at boot without rt_check: the recorder's vkUpdateDescriptorSets got a null view or sampler (PDB-confirmed). With rt_check the render thread had made every view first |
+| render-8 | stage 1 fixed: views made on the render thread, null handles logged and replaced (f4134f8) | queued: no-rt_check boot first, rt_check run, then the A/B of both switches |
+
+With the cg2 exes the dense street median frame is ~16.8 ms (the cap): render work at p50 (13-13.5 ms) has ~3 ms of headroom, and render
+cuts now only help the p99 spikes (render work p99 17.5-22 ms vs the 15 ms target).
 
 Clean profile r3-prof (render-3, no rt_check), render thread: run_list = begin_draw 59 % (build_set 25 %, prepare_textures 6 %, vertex
 buffer resolve_read 5 %, resolve_texture 3 %, graphics_pipeline 2 %), out_draw_bindings 15 % (out_servable 5 %: bound uniform buffers keep
