@@ -46,6 +46,11 @@ constexpr const char* kTag = "nvn.gpu";
 constexpr uint32_t kSlots = 36;                  // about three frames of submissions (the game submits ~11 times a frame): with fewer, recording waits on
                                                  // the GPU for a submission of a recent frame and the CPU cannot get frames ahead
 constexpr uint32_t kGpMax = 1024;      // GPU pass profiler: timestamps per submission
+// Frame trace / [prof] gpu_stats timestamps per slot: 0 = start of the first part, 1 = end of the last part, then for each split boundary k
+// (split_submission) 2+2k = end of part k and 3+2k = start of part k+1. A submission split more often than kSplitStamps times keeps its later
+// parts merged (their gaps count as busy).
+constexpr uint32_t kSplitStamps = 15;
+constexpr uint32_t kQpSlot = 2 + 2 * kSplitStamps;
 constexpr VkDeviceSize kUploadBytes = 8ull << 20;   // per slot; larger uploads get their own staging buffer
 
 // Live-count gauges of this file (leak monitor, nxrt/gauge.h).
@@ -63,7 +68,8 @@ struct Slot {
     VkDeviceSize upload_off = 0;
     std::vector<gfx::Buffer> extra;       // staging / overflow buffers of the submission
     uint64_t serial = 0;                  // last submission that used the slot
-    bool timed = false;                   // frame trace: the submission wrote GPU timestamps (query pair index = slot index * 2)
+    bool timed = false;                   // frame trace: the submission wrote GPU timestamps (query index = slot index * kQpSlot)
+    uint32_t parts = 0;                   // timed: split boundaries stamped (kSplitStamps at most)
     uint64_t cpu_t0 = 0;
     uint64_t sets_live = 0;               // descriptor sets allocated from this slot's pools since the last reset (vk.descriptor_sets)
     uint32_t gp_n = 0;                    // GPU pass profiler: timestamps written by the submission
@@ -80,7 +86,11 @@ struct GpuStats {
     int64_t every = 0;
     uint64_t cur_frame = UINT64_MAX;
     double cur_ns = 0;
+    double cur_busy_ns = 0;
     std::vector<float> frame_ms;
+    std::vector<float> busy_ms;           // the GPU's busy time per frame: the union of the submission parts' intervals (idle gaps between
+                                          // split parts, and between submissions, left out; overlaps counted once)
+    uint64_t last_end = 0;                // GPU ticks: end of the last part read back (submissions are read back in submission order)
     uint64_t presents0 = 0;
     uint64_t c0[14] = {};
     std::map<std::string, std::pair<double, uint64_t>> gp;   // label -> GPU ns, intervals
@@ -392,6 +402,9 @@ bool split_submission(Frame& f) {
         vk_gauge_command_buffers().add(1);
     }
     if (!g->batch.empty()) flush_batch();       // keep the submission order
+    const bool stamp = g->qpool && s.timed && s.parts < kSplitStamps;
+    const uint32_t qb = static_cast<uint32_t>(&s - g->slots) * kQpSlot + 2 + 2 * s.parts;
+    if (stamp) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qb);
     if (vkEndCommandBuffer(s.cb) != VK_SUCCESS) {
         s.split_free.push_back(next);
         return false;
@@ -415,6 +428,10 @@ bool split_submission(Frame& f) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(next, &bi);
+    if (stamp) {
+        vkCmdWriteTimestamp(next, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g->qpool, qb + 1);
+        s.parts++;
+    }
     s.cb = next;
     f.cb = next;
     g->ctr.submits.fetch_add(1);
@@ -477,18 +494,23 @@ uint64_t stats_counter(int i) {
 }
 
 // [prof] gpu_stats: one submission's GPU time, added to the frame it was recorded in; a full window of frames is logged.
-void stats_add(uint64_t frame, double ns) {
+void stats_add(uint64_t frame, double ns, double busy_ns) {
     GpuStats& st = g->stats;
     if (frame != st.cur_frame) {
-        if (st.cur_frame != UINT64_MAX && st.cur_ns > 0) st.frame_ms.push_back(static_cast<float>(st.cur_ns * 1e-6));
+        if (st.cur_frame != UINT64_MAX && st.cur_ns > 0) {
+            st.frame_ms.push_back(static_cast<float>(st.cur_ns * 1e-6));
+            st.busy_ms.push_back(static_cast<float>(st.cur_busy_ns * 1e-6));
+        }
         if (st.cur_frame == UINT64_MAX) {
             for (int i = 0; i < 14; ++i) st.c0[i] = stats_counter(i);
             st.gp.clear();
         }
         st.cur_frame = frame;
         st.cur_ns = 0;
+        st.cur_busy_ns = 0;
     }
     st.cur_ns += ns;
+    st.cur_busy_ns += busy_ns;
     if (st.frame_ms.size() < static_cast<size_t>(st.every)) return;
     std::vector<float> v = st.frame_ms;
     std::sort(v.begin(), v.end());
@@ -496,6 +518,12 @@ void stats_add(uint64_t frame, double ns) {
     for (float x : v) sum += x;
     const size_t n = v.size();
     auto pct = [&](double q) { return static_cast<double>(v[std::min(n - 1, static_cast<size_t>(q * static_cast<double>(n - 1) + 0.5))]); };
+    std::vector<float> vb = st.busy_ms;
+    std::sort(vb.begin(), vb.end());
+    double bsum = 0;
+    for (float x : vb) bsum += x;
+    const size_t nb = std::max<size_t>(1, vb.size());
+    auto bpct = [&](double q) { return vb.empty() ? 0.0 : static_cast<double>(vb[std::min(nb - 1, static_cast<size_t>(q * static_cast<double>(nb - 1) + 0.5))]); };
     uint64_t c1[14];
     for (int i = 0; i < 14; ++i) c1[i] = stats_counter(i);
     const double frames = std::max<double>(1.0, static_cast<double>(c1[10] - st.c0[10]));
@@ -504,6 +532,11 @@ void stats_add(uint64_t frame, double ns) {
             "dispatches %.1f, clears %.1f, copies %.1f, submits %.1f, full barriers %.1f (game barriers %.1f, of them left out %.1f), image barriers %.1f, texture uploads %.1f, dispatch barriers left out %.1f",
             n, sum / static_cast<double>(n), pct(0.5), pct(0.9), pct(0.99), static_cast<double>(v[n - 1]), pf(0), pf(1), pf(2), pf(3), pf(4), pf(5),
             pf(6), pf(7), pf(11), pf(13), pf(8), pf(9), pf(12));
+    // busy: the GPU's own time (gaps where it waited for the render thread to hand over the next part or submission are left out). With
+    // [nvn] split_submit_ms the first line's numbers include those gaps: a part goes to the GPU while the rest is still being recorded.
+    NXLOG_I("nvn.gpustats", "GPU busy ms/frame avg %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f | idle inside submissions avg %.2f ms/frame",
+            bsum / static_cast<double>(nb), bpct(0.5), bpct(0.9), bpct(0.99), vb.empty() ? 0.0 : static_cast<double>(vb.back()),
+            (sum - bsum) / static_cast<double>(n));
     if (!st.gp.empty()) {
         // the pass profiler's intervals by label, the most expensive first ("pass WxH cN:fmt dfmt": one render pass; "cs <hash>": one dispatch)
         std::vector<std::pair<double, std::string>> by;
@@ -516,6 +549,7 @@ void stats_add(uint64_t frame, double ns) {
                     by[i].second.c_str());
     }
     st.frame_ms.clear();
+    st.busy_ms.clear();
     st.gp.clear();
     std::copy(c1, c1 + 14, st.c0);
 }
@@ -530,15 +564,36 @@ Slot& acquire_slot() {
     }
     if (s.timed) {
         s.timed = false;
-        uint64_t ts[2] = {0, 0};
-        const uint32_t idx = static_cast<uint32_t>(&s - g->slots) * 2;
-        if (vkGetQueryPoolResults(g->dev->device(), g->qpool, idx, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
+        uint64_t ts[kQpSlot] = {};
+        const uint32_t nq = 2 + 2 * s.parts;
+        const uint32_t idx = static_cast<uint32_t>(&s - g->slots) * kQpSlot;
+        if (vkGetQueryPoolResults(g->dev->device(), g->qpool, idx, nq, sizeof(uint64_t) * nq, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
             static const uint16_t z = ft::zone_id("gpu.exec");
-            const double ns = static_cast<double>(ts[1] - ts[0]) * g->dev->properties().limits.timestampPeriod;
+            const double period = g->dev->properties().limits.timestampPeriod;
+            const double ns = static_cast<double>(ts[1] - ts[0]) * period;
             ft::event(z, s.cpu_t0, s.cpu_t0 + static_cast<uint64_t>(ns), static_cast<uint32_t>(s.serial));
-            if (g->stats.every > 0) stats_add(s.frame, ns);
+            if (g->stats.every > 0) {
+                // parts [ts0, end0], [start1, end1], ..., [start_n, ts1]: their union with everything read back before (a part's start
+                // stamp can come before the previous part's work has finished; that overlap counts once)
+                uint64_t busy = 0;
+                uint64_t& last = g->stats.last_end;
+                auto add = [&](uint64_t a, uint64_t b) {
+                    if (b <= a) return;
+                    if (a < last) a = last;
+                    if (b > a) busy += b - a;
+                    if (b > last) last = b;
+                };
+                uint64_t start = ts[0];
+                for (uint32_t k = 0; k < s.parts; k++) {
+                    add(start, ts[2 + 2 * k]);
+                    start = ts[3 + 2 * k];
+                }
+                add(start, ts[1]);
+                stats_add(s.frame, ns, static_cast<double>(busy) * period);
+            }
         }
     }
+    s.parts = 0;
     if (s.gp_n >= 2 && g->gpool) {      // GPU pass profiler: one event per interval between two timestamps, named gp:<label>, arg = draws
         uint64_t ts[kGpMax];
         const uint32_t n = std::min(s.gp_n, kGpMax);
@@ -910,7 +965,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cb, &bi);
-    const uint32_t qi = static_cast<uint32_t>(&s - g->slots) * 2;
+    const uint32_t qi = static_cast<uint32_t>(&s - g->slots) * kQpSlot;
     if (g->gpool) {
         vkCmdResetQueryPool(s.cb, g->gpool, static_cast<uint32_t>(&s - g->slots) * kGpMax, kGpMax);
         s.gp_n = 0;
@@ -918,7 +973,8 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         gpass_stamp(f, "(start)", 0);
     }
     if (g->qpool) {
-        vkCmdResetQueryPool(s.cb, g->qpool, qi, 2);
+        vkCmdResetQueryPool(s.cb, g->qpool, qi, kQpSlot);
+        s.parts = 0;
         vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g->qpool, qi);
         s.timed = true;
         s.cpu_t0 = ft::now_ns();
@@ -1418,7 +1474,7 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     if (ft::on() || gp->stats.every > 0) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = kSlots * 2;
+        qi.queryCount = kSlots * kQpSlot;
         if (vkCreateQueryPool(dev.device(), &qi, nullptr, &gp->qpool) != VK_SUCCESS) gp->qpool = VK_NULL_HANDLE;
         else vk_gauge_query_pools().add(1);
     }
