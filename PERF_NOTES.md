@@ -455,9 +455,17 @@ function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). S
 | 916068c | deferred Vulkan recording (`nvn_cmdq.cpp`): the vkCmd* / vkUpdateDescriptorSets calls the render thread makes while it records a submission go into a ring (arguments and the arrays they point to copied) and a worker thread `nvn-rec` makes them, in order, on the same command buffers. Begin/End/submit/reset/allocate/free wait for the worker first; DLSS / FSR / Streamline / frame-generation recorders run after a sync (`cmdq::Direct`). The volk entry points are wrapped once at bring-up; outside a recording scope every call goes straight through. | `[nvn] replay_threads = 1` (2 = on) |
 | 916068c | out_draw_bindings walks only bound slots (masks kept by BindBuffers), same order and result | `[nvn] out_masks = true` |
 | 916068c | 256-entry direct-mapped program layout cache for draws and dispatches | `[nvn] layout_cache = true` |
+| 9746d08 | records published to the worker in batches; the worker's progress read only when the ring looks full | `[nvn] replay_batch = 16` |
+| 9746d08 | is_color_feedback: one image lookup of the sampled texture instead of one per colour target | `[nvn] feedback_fast = true` |
 
 ### Test log
 
 | request | what | result |
 |---|---|---|
-| render-1 | out_masks + layout_cache (defaults), replay_threads = 2 A/B, battle, profile | queued |
+| render-1 | out_masks + layout_cache (defaults), replay_threads = 2 A/B, battle, profile | window 15: masks + layout cache -0.6 to -0.8 ms render work (neutral in fps). replay_threads = 2: dense street render work p50 16.8 -> 13.6-14.2, p99 21.6-25.5 -> 18.5-21.1; median dense frame 18.7 -> 17.9; street_cold >20 ms frames -25 %, 1% low +1; worker nvn-rec 9.7 ms/frame CPU on a free core, waits for it 0.08-0.17 ms/frame, 0 ring-full waits; stills identical. Battle had 32 new pipelines in one run (repeat in window 16) |
+| render-2 | batched publishes to the worker (`replay_batch`), `feedback_fast` | queued (9746d08) |
+
+What render-1 showed about the limiter (r1-t, street at 140 s, 2585 draws): render thread work p50 14.2, idle p50 3.5 (waiting for the
+game); game thread work p50 18.0 with no present back pressure = CPU 12.8 + waits 4.7, GPU sync waits only p99 3.2. Main's blocked time
+is ended by guest threads (Basic_Worker1-4, GFX_Worker0, MOCull_Leader in wt1-diag), never by the render thread: the game does not wait
+on the render hand-off. At p50 the dense street is now game-thread bound; render work sets the tail (41 of 53 slow frames).
