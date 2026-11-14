@@ -751,4 +751,8 @@ void sync() {
     if (g_q && t_q) do_sync();
 }
 
+bool queueing() { return g_q && t_q; }
+uint8_t* record(void (*exec)(const uint8_t* payload), size_t payload) { return q_begin(exec, payload); }
+void commit() { q_commit(); }
+
 }  // namespace nxrt::nvn::be::cmdq

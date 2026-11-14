@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 // Deferred Vulkan command recording ([nvn] replay_threads, nvn_cmdq.cpp).
 //
 // The render thread replays the game's NVN command lists: it decides what every draw needs (state, descriptors, layouts, uploads) and
@@ -43,5 +45,12 @@ private:
 
 // Waits until the worker has made every call queued so far (no-op outside a Scope).
 void sync();
+
+// True on the render thread inside a Scope (outside a Direct): calls are being queued.
+bool queueing();
+// A record of the caller's own: `payload` bytes the caller fills, then commit(). The worker runs exec(payload) in queue order. Only while
+// queueing(). The payload must be trivially copyable data (it is never destroyed).
+uint8_t* record(void (*exec)(const uint8_t* payload), size_t payload);
+void commit();
 
 }  // namespace nxrt::nvn::be::cmdq

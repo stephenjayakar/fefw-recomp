@@ -2061,6 +2061,227 @@ PushSet0 g_push0;
 std::vector<std::unique_ptr<PushSet0>> g_push_stack;   // bind_sets takes set 0's writes out of g_push0 at once, into the one of its depth
 size_t g_bind_depth = 0;
 
+uint64_t g_last_set_key = 0;   // the content key of the last set build_set made or found (rt_check of desc_on_recorder)
+
+// ---- [nvn] desc_on_recorder (default off; needs replay_threads = 2): texture sets built and bound on the recorder thread ----------------
+// perf/render-mt stage 1 (PERF_NOTES, "Design: parallel recording"). For a graphics set that holds only combined image samplers bound by
+// the program (SamplerBinding / HandleInUniform), the render thread makes every decision build_set makes, in walk order (which texture, the
+// feedback / waiting / upscaler substitutions, the image and its tracked layout at this point) and queues one record; the recorder makes the
+// views and samplers (their caches are locked, nvn_gpu_texture.cpp), hashes the content as build_set does, finds or makes the set in its own
+// per-submission cache and descriptor pools (per slot), updates and binds it, in queue order before the draw. rt_check also builds the set the
+// old way on the render thread and the recorder compares the content keys ("mismatch: recorder set").
+struct DeferHdr {
+    VkCommandBuffer cb;
+    VkPipelineLayout pl_layout;
+    VkDescriptorSetLayout set_layout;
+    void* slot;
+    uint32_t set, n;
+    uint64_t old_key;
+    bool check;
+};
+struct DeferEnt {
+    uint32_t binding = 0;
+    const DescriptorBinding* b = nullptr;
+    Texture* t = nullptr;
+    TexGpu* g = nullptr;                       // null: the dummy view and sampler
+    TexResolved r;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageView su_view = VK_NULL_HANDLE;      // the upscaled scene replaces the view (S14)
+    VkImageView dview = VK_NULL_HANDLE;
+    VkSampler dsmp = VK_NULL_HANDLE;
+};
+// The recorder's descriptor pools and set cache of one slot: reset at the slot's next submission (rec_begin_submit, recorder idle: the
+// render thread waited for it at the end of the last submission, and the slot's GPU work is done).
+struct RecSlot {
+    std::vector<VkDescriptorPool> pools;
+    size_t cur = 0;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<VkDescriptorSet>> spare;
+    SetCache cache;
+};
+std::unordered_map<void*, std::unique_ptr<RecSlot>> g_rec_slots;   // inserted by the render thread only while the recorder is idle
+std::atomic<uint64_t> g_rec_sets{0}, g_rec_hits{0}, g_rec_bad{0};
+bool g_no_defer = false;
+bool desc_on_recorder_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "desc_on_recorder", false);
+    return on;
+}
+VkDescriptorSet rec_alloc(RecSlot& rs, VkDescriptorSetLayout layout) {
+    std::vector<VkDescriptorSet>& spare = rs.spare[layout];
+    if (spare.empty()) {
+        constexpr uint32_t kBatch = 8;
+        VkDescriptorSetLayout layouts[kBatch];
+        for (VkDescriptorSetLayout& l : layouts) l = layout;
+        VkDescriptorSet sets[kBatch] = {};
+        for (int attempt = 0; attempt < 3 && spare.empty(); ++attempt) {
+            if (rs.cur >= rs.pools.size()) {
+                const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u << 15}};
+                VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                ci.maxSets = 1u << 13;
+                ci.poolSizeCount = 1;
+                ci.pPoolSizes = sizes;
+                VkDescriptorPool p = VK_NULL_HANDLE;
+                if (vkCreateDescriptorPool(vkdev(), &ci, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+                rs.pools.push_back(p);
+            }
+            VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = rs.pools[rs.cur];
+            ai.descriptorSetCount = kBatch;
+            ai.pSetLayouts = layouts;
+            if (vkAllocateDescriptorSets(vkdev(), &ai, sets) == VK_SUCCESS) {
+                for (uint32_t i = kBatch; i-- > 0;) spare.push_back(sets[i]);
+            } else {
+                ++rs.cur;   // full: the next pool (made on demand)
+            }
+        }
+        if (spare.empty()) return VK_NULL_HANDLE;
+    }
+    const VkDescriptorSet ds = spare.back();
+    spare.pop_back();
+    return ds;
+}
+// Recorder thread: build (or find) the set and bind it.
+void x_defer_set(const uint8_t* p) {
+    const DeferHdr* h = reinterpret_cast<const DeferHdr*>(p);
+    const DeferEnt* ents = reinterpret_cast<const DeferEnt*>(h + 1);
+    auto it = g_rec_slots.find(h->slot);
+    if (it == g_rec_slots.end()) return;      // cannot happen: rec_begin_submit made it
+    RecSlot& rs = *it->second;
+    VkWriteDescriptorSet writes[64];
+    VkDescriptorImageInfo infos[64];
+    uint64_t key = 1469598103934665603ull + h->set;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    mix(reinterpret_cast<uint64_t>(h->pl_layout));
+    for (uint32_t i = 0; i < h->n; ++i) {
+        const DeferEnt& e = ents[i];
+        VkDescriptorImageInfo ii = {e.dsmp, e.dview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        if (e.g) {
+            const ViewRequest q = make_request(*e.b, e.r);
+            if (const VkImageView v = tex_view_on(e.g, e.t, q)) {
+                ii.imageView = v;
+                ii.imageLayout = e.layout;
+                if (e.r.has_sampler) ii.sampler = sampler_for(e.r.smp);
+                if (e.su_view) {
+                    ii.imageView = e.su_view;
+                    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                }
+            }
+        }
+        infos[i] = ii;
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = e.binding;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &infos[i];
+        writes[i] = w;
+        mix(reinterpret_cast<uint64_t>(ii.imageView));
+        mix(reinterpret_cast<uint64_t>(ii.sampler));
+        mix(static_cast<uint64_t>(ii.imageLayout));
+    }
+    g_rec_sets.fetch_add(1, std::memory_order_relaxed);
+    if (h->check && key != h->old_key) {
+        if (g_rec_bad.fetch_add(1, std::memory_order_relaxed) < 20)
+            NXLOG_W("nvn.rtcheck", "mismatch: recorder set (set %u, %u bindings)", h->set, h->n);
+    }
+    VkDescriptorSet ds = rs.cache.find(key);
+    if (ds) {
+        g_rec_hits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ds = rec_alloc(rs, h->set_layout);
+        if (!ds) return;
+        for (uint32_t i = 0; i < h->n; ++i) writes[i].dstSet = ds;
+        vkUpdateDescriptorSets(vkdev(), h->n, writes, 0, nullptr);   // not queued: this is the recorder (calls pass straight through)
+        rs.cache.put(key, ds);
+    }
+    vkCmdBindDescriptorSets(h->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, h->pl_layout, h->set, 1, &ds, 0, nullptr);
+}
+// Render thread, at the start of a submission (recorder idle): the slot's recorder pools and cache start over.
+void rec_begin_submit(void* slot) {
+    if (!desc_on_recorder_on() || !slot) return;
+    std::unique_ptr<RecSlot>& p = g_rec_slots[slot];
+    if (!p) p = std::make_unique<RecSlot>();
+    for (VkDescriptorPool pool : p->pools) vkResetDescriptorPool(vkdev(), pool, 0);
+    p->cur = 0;
+    for (auto& kv : p->spare) kv.second.clear();
+    p->cache.clear();
+}
+void rec_shutdown() {
+    for (auto& kv : g_rec_slots)
+        for (VkDescriptorPool pool : kv.second->pools) vkDestroyDescriptorPool(vkdev(), pool, nullptr);
+    g_rec_slots.clear();
+}
+
+VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set);
+// True when set `set` of pl was queued for the recorder (it builds and binds the set itself).
+bool build_set_deferred(const ProgLayout& pl, uint32_t set) {
+    if (g_no_defer || set == 0 || !desc_on_recorder_on() || !cmdq::queueing()) return false;
+    uint32_t n = 0;
+    for (const BindingDesc& d : pl.bindings) {
+        if (d.set != set) continue;
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.nvn_stage == kCompute ||
+            (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform))
+            return false;
+        ++n;
+    }
+    if (n == 0 || n > 64) return false;
+    uint64_t old_key = 0;
+    const bool check = rt_check();
+    if (check) {   // the old way too, for the recorder to compare with
+        g_no_defer = true;
+        build_set(pl, set);
+        g_no_defer = false;
+        old_key = g_last_set_key;
+    }
+    uint8_t* rec = cmdq::record(&x_defer_set, sizeof(DeferHdr) + n * sizeof(DeferEnt));
+    DeferHdr* h = new (rec) DeferHdr{F->cb, pl.layout, pl.sets[set], F->slot, set, n, old_key, check};
+    DeferEnt* ents = reinterpret_cast<DeferEnt*>(h + 1);
+    static const std::string null_fmt = nxrt::config_get_str("nvn", "debug_null_format", "");
+    uint32_t i = 0;
+    for (const BindingDesc& d : pl.bindings) {
+        if (d.set != set) continue;
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        DeferEnt* e = new (&ents[i++]) DeferEnt();
+        e->binding = d.binding;
+        e->b = &b;
+        const int component = b.image.component == ScalarType::Sint ? 2 : b.image.component == ScalarType::Uint ? 3 : 1;
+        e->dview = dummy_view(view_type_for(b), b.image.depth, component);
+        e->dsmp = dummy_sampler();
+        // the decisions of build_set's combined image sampler case, in the same order
+        TexResolved r = resolve_texture(d);
+        if (r.tex && !g_fb_use.empty()) {
+            const auto fb = g_fb_use.find(r.tex);
+            if (fb != g_fb_use.end()) r.tex = fb->second;
+        }
+        if (r.tex && !g_vol3d_use.empty() && wants_vol3d(b, r)) {
+            const auto vc = g_vol3d_use.find(r.tex);
+            if (vc != g_vol3d_use.end()) {
+                r.tex = vc->second;
+                r.view.has_layers = false;
+            }
+        }
+        if (r.tex && !null_fmt.empty() && r.tex->fmt) {
+            const std::string sized = std::string(r.tex->fmt->name) + ":" + std::to_string(r.tex->b.width) + "x" + std::to_string(r.tex->b.height);
+            if (null_fmt == r.tex->fmt->name || null_fmt == sized) r.tex = nullptr;
+        }
+        const bool feedback = r.tex && is_color_feedback(r.tex);
+        const bool waiting = r.tex && tex_layout(r.tex) == VK_IMAGE_LAYOUT_UNDEFINED && tex_first_upload_deferrable(r.tex);
+        if (r.tex && !waiting && !feedback) {
+            if (TexGpu* g = tex_gpu(r.tex)) {
+                e->t = r.tex;
+                e->g = g;
+                e->r = r;
+                e->layout = tex_layout(r.tex) == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : tex_sampled_layout(r.tex);
+                if (r.tex == g_su_tex && g_su_view) e->su_view = g_su_view;
+            }
+        } else if (feedback) {
+            NVN_LOG_ONCE("color-feedback", "a texture is sampled while it is a colour attachment of the pass: the dummy texture is bound");
+        }
+    }
+    cmdq::commit();
+    ++g_rs.sets;
+    return true;
+}
+
 VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
     if (t_set_scratch.size() <= t_set_depth) t_set_scratch.push_back(std::make_unique<SetScratch>());
     SetScratch& sc = *t_set_scratch[t_set_depth];
@@ -2344,6 +2565,7 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
         writes.push_back(w);
     }
     ++g_rs.sets;
+    g_last_set_key = key;
     if (set == 0 && pl.push_set0) {   // pushed by bind_sets: no set to find or make (every write of set 0 is a buffer, prog_layout)
         g_push0.binfo.assign(binfo.begin(), binfo.end());
         g_push0.writes.assign(writes.begin(), writes.end());
@@ -2542,7 +2764,7 @@ void bind_sets(const ProgLayout& pl, VkPipelineBindPoint bp) {
     TexturePool* const tp = S.tpool.get();
     SamplerPool* const sp = S.spool.get();
     uint64_t tv = 0, sv = 0;
-    const bool gfx = bp == VK_PIPELINE_BIND_POINT_GRAPHICS && tex_set_skip_on();
+    const bool gfx = bp == VK_PIPELINE_BIND_POINT_GRAPHICS && tex_set_skip_on() && !desc_on_recorder_on();
     if (gfx) {
         tv = pool_version(tp);
         sv = pool_version(sp);
@@ -2560,6 +2782,10 @@ void bind_sets(const ProgLayout& pl, VkPipelineBindPoint bp) {
             ++g_rs.sets_skipped;
             if (rt_check()) chk(build_set(pl, set) == g_last_gfx.ds[set], "tex set skip");
             ds[set] = VK_NULL_HANDLE;                // still bound from the last draw
+            continue;
+        }
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS && build_set_deferred(pl, set)) {   // the recorder builds and binds it (desc_on_recorder)
+            ds[set] = VK_NULL_HANDLE;
             continue;
         }
         g_push0.ready = false;
@@ -5190,6 +5416,7 @@ void replay_begin_submit(Frame& f) {
     note_frame_for_pacing();
     rs_report();
     F = &f;
+    rec_begin_submit(f.slot);   // desc_on_recorder: the slot's recorder pools start over (the recorder is idle here)
     tex_poll_cpu_writes();
     if (extras::LowLatency* ll = extras::lowlat()) ll->submit_begin();     // RENDERSUBMIT_START of the frame (S14)
     if (g_trace_frame == -2) {
@@ -5391,6 +5618,7 @@ void replay_shutdown() {
     for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
     for (SkipMaskSlot& sl : g_skip_mask) sl = SkipMaskSlot();
     g_last_gfx = LastGfxSets();
+    rec_shutdown();
     g_prep_pl = nullptr;
     g_prep_cb = VK_NULL_HANDLE;
     S = GState();

@@ -46,6 +46,7 @@
 #include "nvn_texture_layout.h"
 #include "tegra_tiling.h"
 #include "astc2bc7.h"
+#include "nvn_cmdq.h"
 
 namespace nxrt::nvn::be {
 
@@ -826,6 +827,11 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     return g;
 }
 
+// The view caches of every image (views, the request memo, the sampled-format memo) and the sampler cache: the render thread and, with
+// [nvn] desc_on_recorder, the recorder thread (nvn_cmdq) make views and samplers. Uncontended almost always.
+std::recursive_mutex g_view_mu;
+std::mutex g_sampler_mu;
+
 // The texture's image, created on first use. Null when the texture has no usable image (the failure is counted and logged once).
 TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
     if (!t || !active()) return nullptr;
@@ -1174,6 +1180,7 @@ bool rt_check_on() {
 // The view with these fields, created once and cached on the image.
 VkImageView view_for(TexGpu& g, VkImageViewType type, uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count,
                      VkFormat fmt, VkImageAspectFlags aspect, const VkComponentMapping& swz) {
+    std::lock_guard<std::recursive_mutex> vl(g_view_mu);
     const std::array<uint32_t, 12> key = {static_cast<uint32_t>(type), base_level, level_count, base_layer, layer_count,
                                           static_cast<uint32_t>(fmt), static_cast<uint32_t>(aspect), static_cast<uint32_t>(swz.r),
                                           static_cast<uint32_t>(swz.g), static_cast<uint32_t>(swz.b), static_cast<uint32_t>(swz.a), 0u};
@@ -1639,6 +1646,7 @@ float tex_scale_wanted(Texture* t) {
 bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     TexGpu* g = tex_or_null(t);
     if (!g || g->scale == to) return false;
+    cmdq::sync();   // queued descriptor builds name this image's views (desc_on_recorder): they are made before the image is replaced
     if (to != 1.0f && (g->scale_blocked || g->transcoded || is_block_format(g->format))) return false;
     Shape s = shape_of(*t);
     if (to != 1.0f) {
@@ -1684,10 +1692,13 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     if (g->presented) device().wait_idle();
     g->presented = false;
     std::vector<VkImageView> views;
-    for (auto& kv : g->views) views.push_back(kv.second);
-    g->views.clear();
-    g->last_view = VK_NULL_HANDLE;
-    for (auto& m : g->req_memo) m.v = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::recursive_mutex> vl(g_view_mu);
+        for (auto& kv : g->views) views.push_back(kv.second);
+        g->views.clear();
+        g->last_view = VK_NULL_HANDLE;
+        for (auto& m : g->req_memo) m.v = VK_NULL_HANDLE;
+    }
     defer_destroy([old, views]() mutable {
         for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
         device().destroy_image(old);
@@ -2220,10 +2231,18 @@ bool same_request(const ViewRequest& a, const ViewRequest& b) {
 VkImageView tex_sampled_view_uncached(TexGpu* g, Texture* t, const ViewRequest& req);
 // [nvn] view_memo (default on): the image's last two (request, view) answers are returned without the checks and the view cache lookup
 // (~3 % of the render thread at 2600 draws). rt_check compares with the full path.
+VkImageView tex_view_on(TexGpu* g, Texture* t, const ViewRequest& req);
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
+    return tex_view_on(g, t, req);
+}
+
+// tex_sampled_view on an image already made (any thread; the recorder thread with [nvn] desc_on_recorder: g was made, and is kept alive,
+// by the render thread).
+VkImageView tex_view_on(TexGpu* g, Texture* t, const ViewRequest& req) {
     g->sampled_at.store(static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed)) + 1, std::memory_order_relaxed);
+    std::lock_guard<std::recursive_mutex> vl(g_view_mu);
     static const bool memo = nxrt::config_get_bool("nvn", "view_memo", true);
     if (!memo) return tex_sampled_view_uncached(g, t, req);
     for (const TexGpu::ReqMemo& m : g->req_memo)
@@ -2469,6 +2488,7 @@ static SamplerLast g_sampler_last[4];
 static unsigned g_sampler_last_next = 0;
 
 VkSampler sampler_for(const SamplerInfo& game_sampler) {
+    std::lock_guard<std::mutex> sl(g_sampler_mu);
     SamplerLast* last = g_sampler_last;
     unsigned& last_next = g_sampler_last_next;
     const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
@@ -2508,8 +2528,11 @@ void tex_destroy(TexGpu* g) {
     }
     g_gauge_textures_live.sub(1);
     if (g->presented) device().wait_idle();
-    for (auto& kv : g->views) { vkDestroyImageView(vkdev(), kv.second, nullptr); vk_gauge_image_views().sub(1); }
-    g->views.clear();
+    {
+        std::lock_guard<std::recursive_mutex> vl(g_view_mu);
+        for (auto& kv : g->views) { vkDestroyImageView(vkdev(), kv.second, nullptr); vk_gauge_image_views().sub(1); }
+        g->views.clear();
+    }
     if (g->img) g_live_images.fetch_sub(1);
     device().destroy_image(g->img);
     if (g->sparse) {

@@ -294,6 +294,8 @@ bool tex_standin_swap_pending(Texture* t);
 bool tex_first_upload_uncompressed_deferrable(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
+// tex_sampled_view on an image already made (any thread: the recorder with [nvn] desc_on_recorder). Holds the view cache lock.
+VkImageView tex_view_on(TexGpu* g, Texture* t, const ViewRequest& req);
 // A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the
 // shader the texel bits (float formats; 32-bit integer ones through their float alias), else 2 / 3: signed / unsigned integers that only
 // an integer view can read, so the shader needs its sampler retyped (spirv_int_samplers) and the binding an integer view.
