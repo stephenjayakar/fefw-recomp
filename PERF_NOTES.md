@@ -643,7 +643,7 @@ waits unchanged (3.6-4.0), frame median ~16.8 ms in both.
 - **Codegen-2 total** (live PGO exe 184d72de -> codegen2-3, same DLL): main CPU per frame -11 to -13 % in every town scene (street_cold
   13.26 -> 11.88 ms, street_warm 13.82 -> 12.11, hub_cold 12.0 -> 10.6); Basic workers ~-12 %; dense-street game CPU p50
   13.3-14.7 -> ~12.0, game waits 4.4-4.6 -> 3.6-4.0, so **game work p50 in the dense street ~18 -> ~15.9 ms**; dense frame median
-  17.1-18.1 -> 16.7-17.0 ms; street 1% lows 40-44 -> 44-47; arrivals -25..-35 ms. codegen2-1 is live (tester, 07:14).
+  17.1-18.1 -> 16.7-17.0 ms; street 1% lows 40-44 -> 44-47; arrivals -25..-35 ms. codegen2-3 is live (tester, 09:30; codegen2-1 was live 07:14-09:30).
 - **Target not met**: game work p50 <= 14.5 needs another ~1.4 ms. Of main's ~12 ms CPU in those windows ~78 % is lifted code (cg21-prof:
   78.4 % of main's busy samples, the rest runtime: NVN recording, import calls, SVCs, spin-waiting) and the profile stays flat (top 40
   functions 25 %). The waits are the job chains' own run time (Basic workers' f_7101980580 / f_71005ef6e0 / f_7100a831a0, the
