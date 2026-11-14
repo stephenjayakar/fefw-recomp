@@ -423,3 +423,41 @@ inclusive tables.
   size as 0.1.7's. The game code is already -O2. Remaining compiler levers for the game thread: a profile-guided build (instrumented
   exe, a profiling run of the real scenes, rebuild with the profile; typical 10-20 % on branchy code; several hours of build and
   test time), or a native-ISA variant (`-mcpu=znver2`: LZCNT for the guest's CLZ, BMI2 shifts; a few % at most).
+
+## Render track (branch `perf/render`)
+
+Goal: the render thread (NVN command replay to Vulkan) at 2600 draws/frame in the dense street: work p50 <= ~11 ms, p99 <= ~15 ms (was
+p50 16.6-17.4, p99 22-24 ms, ~6.5 us a draw; COORD 21:30). Test requests go to `tmp/fefw-perf/queue/render-<n>/`.
+
+### Where a draw's time goes (w8-cg2-prof, bdd8f2f, resolved to source lines)
+
+Tools (`tmp/fefw-perf/render/`): `tree.py` (busy-sample call tree of one thread), `drv.py`/`drv2.py` (driver share, by calling
+function), `lines.py` / `incl.py` (self / inclusive samples per source line: the profiled DLL's offsets moved onto a byte-identical
+function of a build linked with a PDB, `linkpdb.cmd`, then `llvm-symbolizer`). Shares of the render thread's busy samples:
+
+| what | share | notes |
+|---|---:|---|
+| NVIDIA driver (nvoglv64) | 28 % | vkCmd* ~22 % (bind pipeline 5.1, push descriptors + bind sets 3.4, dynamic state 1.8, begin/end rendering 2.3, barriers 2.3, dispatch 1.3, draws), vkUpdateDescriptorSets 2.4, vkAllocateDescriptorSets 1.5, submits 1.9 |
+| build_set (descriptor sets, inclusive) | 23.7 % | UBO resolve_read 3.3, tex_sampled_view 2.4, vkUpdateDescriptorSets 2.4, shadow_of 1.7, alloc_set 1.6, sampler_for 1.6, make_request 1.0, set cache 0.8, the rest spread thin |
+| out_draw_bindings | 11-12 % | the full walk over ~84 buffer slots (16 vertex + 2 stages x 32 + 4 xfb), taken after every program bind; the dirty-only path is 0.1 % |
+| prepare_textures | 4.5 % | |
+| samples_depth_target | 3.5 % | first resolve of each texture binding of the draw + tex_or_null cache misses |
+| vertex buffers (resolve_read) | 3.4 % | |
+| ensure_pass | 2.8 % | |
+| prog_layout | 2.0 % | its mutex and map, ~1100 program switches a frame |
+| graphics_pipeline + build_key | 2.0 % | |
+| do_dispatch (inclusive) | 10.7 % | 179 dispatches a frame |
+
+### Changes
+
+| commit | what | toggle (default) |
+|---|---|---|
+| 916068c | deferred Vulkan recording (`nvn_cmdq.cpp`): the vkCmd* / vkUpdateDescriptorSets calls the render thread makes while it records a submission go into a ring (arguments and the arrays they point to copied) and a worker thread `nvn-rec` makes them, in order, on the same command buffers. Begin/End/submit/reset/allocate/free wait for the worker first; DLSS / FSR / Streamline / frame-generation recorders run after a sync (`cmdq::Direct`). The volk entry points are wrapped once at bring-up; outside a recording scope every call goes straight through. | `[nvn] replay_threads = 1` (2 = on) |
+| 916068c | out_draw_bindings walks only bound slots (masks kept by BindBuffers), same order and result | `[nvn] out_masks = true` |
+| 916068c | 256-entry direct-mapped program layout cache for draws and dispatches | `[nvn] layout_cache = true` |
+
+### Test log
+
+| request | what | result |
+|---|---|---|
+| render-1 | out_masks + layout_cache (defaults), replay_threads = 2 A/B, battle, profile | queued |
