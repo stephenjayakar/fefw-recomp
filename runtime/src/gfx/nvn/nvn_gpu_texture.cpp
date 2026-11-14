@@ -83,6 +83,11 @@ struct TexGpu {
     bool last_sampled_ok = false;
     std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
     VkImageView last_view = VK_NULL_HANDLE;
+    // tex_sampled_view's last two answers by request ([nvn] view_memo; render thread). Every input of the answer besides the request is
+    // fixed when the image is made; cleared with the views (tex_rescale).
+    struct ReqMemo { gpu::ViewRequest q; VkImageView v = VK_NULL_HANDLE; };
+    ReqMemo req_memo[2];
+    uint8_t req_next = 0;
     int refs = 1;                                      // texture objects over the same storage share one image (render thread)
     struct SparseState* sparse = nullptr;               // a sparse-residency image (a big texture of a virtual pool), else null
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
@@ -1682,6 +1687,7 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     for (auto& kv : g->views) views.push_back(kv.second);
     g->views.clear();
     g->last_view = VK_NULL_HANDLE;
+    for (auto& m : g->req_memo) m.v = VK_NULL_HANDLE;
     defer_destroy([old, views]() mutable {
         for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
         device().destroy_image(old);
@@ -2205,10 +2211,37 @@ bool tex_pool_preparation_pending(Texture* t) {
                                      g->layout == tex_sampled_layout(t));
 }
 
+bool same_request(const ViewRequest& a, const ViewRequest& b) {
+    return a.type == b.type && a.depth_compare == b.depth_compare && a.base_level == b.base_level && a.level_count == b.level_count &&
+           a.base_layer == b.base_layer && a.layer_count == b.layer_count && a.format == b.format && a.swizzle.r == b.swizzle.r &&
+           a.swizzle.g == b.swizzle.g && a.swizzle.b == b.swizzle.b && a.swizzle.a == b.swizzle.a && a.depth_aspect == b.depth_aspect &&
+           a.component == b.component;
+}
+VkImageView tex_sampled_view_uncached(TexGpu* g, Texture* t, const ViewRequest& req);
+// [nvn] view_memo (default on): the image's last two (request, view) answers are returned without the checks and the view cache lookup
+// (~3 % of the render thread at 2600 draws). rt_check compares with the full path.
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
     g->sampled_at.store(static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed)) + 1, std::memory_order_relaxed);
+    static const bool memo = nxrt::config_get_bool("nvn", "view_memo", true);
+    if (!memo) return tex_sampled_view_uncached(g, t, req);
+    for (const TexGpu::ReqMemo& m : g->req_memo)
+        if (m.v && same_request(m.q, req)) {
+            if (rt_check_on() && tex_sampled_view_uncached(g, t, req) != m.v) NXLOG_W("nvn.rtcheck", "mismatch: tex_sampled_view memo");
+            return m.v;
+        }
+    const VkImageView v = tex_sampled_view_uncached(g, t, req);
+    if (v) {
+        TexGpu::ReqMemo& m = g->req_memo[g->req_next];
+        g->req_next ^= 1;
+        m.q = req;
+        m.v = v;
+    }
+    return v;
+}
+
+VkImageView tex_sampled_view_uncached(TexGpu* g, Texture* t, const ViewRequest& req) {
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
     // NVN levels to image levels: an image stored without its top level ([gfx] texture_detail) answers a view that starts there from
