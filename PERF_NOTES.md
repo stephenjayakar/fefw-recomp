@@ -415,3 +415,17 @@ Checks: `recomp/tests/nxflags_test.cpp` (23.7 M cases, the NxFlags helpers again
 - `-mcpu=znver2`: -0.1 % instructions in the hot set; not worth a separate A/B yet.
 - PGO (clang instrumentation needs a profile runtime for the mingw target), cross-TU inlining (zig + LTO untested), large pages for
   guest memory (TLB misses on pointer chasing; runtime side, needs the lock-pages privilege and conflicts with write-watch).
+
+#### codegen-2 and later (13 Nov evening)
+- **cg2 measured** (window 8, 2 clean pairs vs cg1): neutral in town (main CPU hub -0.35 ms, street 0), arrivals unchanged, battle
+  fine. The cross-unit inlining copies give nothing measurable.
+- **zstd**: the game's ZSTD_decompressMultiFrame dominates exactly one loading frame per run (s3/s4/s5 frames 1720/1515/1596: 85-90 %
+  of main's samples, ~250 ms) and none of the arrival frames; with cg2 it runs natively (no lifted zstd left in the profile).
+- **Arrival frames (~290-350 ms after codegen-1)** are game logic, not decompression: in s3-s5's arrival frames the samples spread
+  over a deep tree (f_710180ad60 > f_7100657620 > ... > f_7100cc13e0 55 %, f_710108fc20 23 %), with ~14 % under main's allocator
+  wrapper (f_7100652310 -> nn::mem::StandardAllocator::Allocate) and no single hot routine. Only generic codegen speed helps them.
+- **PGO**: zig's clang is 22.1.8; its raw profiles (format 10) need llvm-profdata 22 (23 refuses them), and the LLVM 22 Windows
+  release's llvm-profdata has no zlib, so the instrumented build emits uncompressed names. The profile runtime is compiler-rt
+  22.1.8's lib/profile built with zig (codegen/pgo/rt). The instrumented compile of main/c_004 (the zstd unit) hung (>45 CPU-min);
+  that unit is built uninstrumented. pgogen exe: C:/Games/fefw-test-pgogen (300 MB). The PGO-use build must use the same game
+  folder as the instrumented one (static functions' profile names include the source path).
