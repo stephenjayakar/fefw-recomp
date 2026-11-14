@@ -2084,6 +2084,7 @@ struct DeferEnt {
     const DescriptorBinding* b = nullptr;
     Texture* t = nullptr;
     TexGpu* g = nullptr;                       // null: the dummy view and sampler
+    VkImageView view = VK_NULL_HANDLE;         // made on the render thread at capture (null: the dummy)
     TexResolved r;
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkImageView su_view = VK_NULL_HANDLE;      // the upscaled scene replaces the view (S14)
@@ -2154,9 +2155,8 @@ void x_defer_set(const uint8_t* p) {
     for (uint32_t i = 0; i < h->n; ++i) {
         const DeferEnt& e = ents[i];
         VkDescriptorImageInfo ii = {e.dsmp, e.dview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        if (e.g) {
-            const ViewRequest q = make_request(*e.b, e.r);
-            if (const VkImageView v = tex_view_on(e.g, e.t, q)) {
+        if (e.g && e.view) {
+            if (const VkImageView v = e.view) {
                 ii.imageView = v;
                 ii.imageLayout = e.layout;
                 if (e.r.has_sampler) ii.sampler = sampler_for(e.r.smp);
@@ -2165,6 +2165,16 @@ void x_defer_set(const uint8_t* p) {
                     ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 }
             }
+        }
+        if (!ii.imageView || !ii.sampler) {   // never hand the driver a null handle (render-7 phase 2 crashed on one): log what it was
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 20)
+                NXLOG_W("nvn.replay", "recorder set: null %s at set %u binding %u (texture %u, image %p, dummy view %p, dummy sampler %p): dummy bound",
+                        !ii.imageView ? "view" : "sampler", h->set, e.binding, e.t ? e.t->id : 0u, static_cast<void*>(e.g),
+                        reinterpret_cast<void*>(e.dview), reinterpret_cast<void*>(e.dsmp));
+            if (!ii.imageView) { ii.imageView = e.dview; ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
+            if (!ii.sampler) ii.sampler = e.dsmp;
+            if (!ii.imageView || !ii.sampler) return;   // nothing safe to write: leave the set unbound (the draw keeps the previous one)
         }
         infos[i] = ii;
         VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2270,6 +2280,7 @@ bool build_set_deferred(const ProgLayout& pl, uint32_t set) {
                 e->t = r.tex;
                 e->g = g;
                 e->r = r;
+                e->view = tex_view_on(g, r.tex, make_request(b, r));   // on this thread, in walk order, as build_set does
                 e->layout = tex_layout(r.tex) == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : tex_sampled_layout(r.tex);
                 if (r.tex == g_su_tex && g_su_view) e->su_view = g_su_view;
             }
