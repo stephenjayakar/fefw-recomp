@@ -50,7 +50,12 @@ constexpr const char* kTag = "nvn.gpu";
 constexpr uint32_t kSlots = 36;                  // about three frames of submissions (the game submits ~11 times a frame): with fewer, recording waits on
                                                  // the GPU for a submission of a recent frame and the CPU cannot get frames ahead
 constexpr uint32_t kGpMax = 1024;      // GPU pass profiler: timestamps per submission
-constexpr VkDeviceSize kUploadBytes = 8ull << 20;   // per slot; larger uploads get their own staging buffer
+VkDeviceSize slot_upload_bytes() {
+    static const VkDeviceSize bytes =
+        static_cast<VkDeviceSize>(std::clamp<int64_t>(nxrt::config_get_int("nvn", "slot_upload_mb", 8), 1, 64)) << 20;
+    return bytes;
+}
+nxrt::GaugeCounter g_upload_slot_overflows("nvn.upload.slot_overflows");
 
 // Live-count gauges of this file (leak monitor, nxrt/gauge.h).
 nxrt::GaugeCounter g_gauge_deferred("nvn.deferred_destroy");     // closures waiting for their submission to finish (defer_destroy, Frame::defer)
@@ -314,7 +319,7 @@ bool create_slot(Slot& s) {
     vk_gauge_command_buffers().add(1);
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-    if (d.create_buffer(kUploadBytes, usage, gfx::MemoryUse::Upload, &s.upload, "nvn upload") != VK_SUCCESS) return false;
+    if (d.create_buffer(slot_upload_bytes(), usage, gfx::MemoryUse::Upload, &s.upload, "nvn upload") != VK_SUCCESS) return false;
     return true;
 }
 
@@ -598,7 +603,7 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     Slot& s = *static_cast<Slot*>(slot);
     if (align == 0) align = 16;
     VkDeviceSize off = (s.upload_off + align - 1) & ~(align - 1);
-    if (off + size <= kUploadBytes) {
+    if (off + size <= slot_upload_bytes()) {
         s.upload_off = off + size;
         UploadAlloc a;
         a.buffer = s.upload.buffer;
@@ -607,6 +612,7 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
         a.size = size;
         return a;
     }
+    g_upload_slot_overflows.add(1);
     return staging(size + align);
 }
 
